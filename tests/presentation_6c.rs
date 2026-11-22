@@ -8588,35 +8588,6 @@ fn new67_gen_change_preserves_failed_epoch_through_follow_loop() {
             }
         }
     }
-    fn drain_err_fresh_until(
-        rx: &std::sync::mpsc::Receiver<(bool, String)>,
-        out_lines: &mut Vec<String>,
-        err_lines: &mut Vec<String>,
-        deadline: Instant,
-        fresh_from: usize,
-        want_err: &str,
-    ) {
-        loop {
-            if Instant::now() >= deadline {
-                panic!("timed out waiting for {want_err:?}; out={out_lines:?} err={err_lines:?}");
-            }
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok((is_out, line)) => {
-                    if is_out {
-                        out_lines.push(line);
-                    } else {
-                        err_lines.push(line);
-                    }
-                }
-                Err(_) => continue,
-            }
-            // Only lines received AFTER the settle satisfy the
-            // wait (P2fix12 NEW-65 — pre-prefix notes are stale).
-            if err_lines[fresh_from..].iter().any(|l| l.contains(want_err)) {
-                return;
-            }
-        }
-    }
     let mut child = OwnedChild(spawn());
     let stdout = child.0.stdout.take().unwrap();
     let stderr = child.0.stderr.take().unwrap();
@@ -8671,26 +8642,16 @@ fn new67_gen_change_preserves_failed_epoch_through_follow_loop() {
         serde_json::to_string(&win2).unwrap(),
     )
     .unwrap();
-    // Fresh-outage wait (P2fix12 NEW-65 — retrofitted: the
-    // note must come from a poll that OBSERVED the prefix —
-    // settle past two polls, then require a NEW note, so a
-    // generic pre-prefix note cannot satisfy the wait).
-    std::thread::sleep(Duration::from_millis(2200));
-    while let Ok((is_out, line)) = rx.try_recv() {
-        if is_out {
-            out_lines.push(line);
-        } else {
-            err_lines.push(line);
-        }
-    }
-    let fresh_from = err_lines.len();
-    drain_err_fresh_until(
+    // Exact-scan wait (P2fix13 NEW-78): two fresh
+    // tail-naming outage notes prove a scan folded the
+    // gen-1 prefix and rejected the tail in one scan (no
+    // elapsed-time substitution).
+    drain_until_exact_scan(
         &rx,
         &mut out_lines,
         &mut err_lines,
-        Instant::now() + Duration::from_secs(15),
-        fresh_from,
-        "retaining last-good",
+        Instant::now() + Duration::from_secs(20),
+        "service-window-v1",
     );
     assert!(
         child.0.try_wait().unwrap().is_none(),
@@ -8717,16 +8678,16 @@ fn new67_gen_change_preserves_failed_epoch_through_follow_loop() {
         child.0.try_wait().unwrap().is_none(),
         "follow keeps running after gen-changing recovery"
     );
-    // Settle: the uncertainty continuations trail the base
-    // line, so drain one more poll before indexing them.
-    std::thread::sleep(Duration::from_secs(2));
-    while let Ok((is_out, line)) = rx.try_recv() {
-        if is_out {
-            out_lines.push(line);
-        } else {
-            err_lines.push(line);
-        }
-    }
+    // The uncertainty continuations trail the base line in
+    // the same frame — drain until the last one lands
+    // before indexing them (no elapsed settle, NEW-78).
+    drain_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        "prev-unmeasured=[[",
+    );
     let at = out_lines
         .iter()
         .position(|l| l.contains("PREVIOUS EPOCH gen=1 "))
@@ -8946,40 +8907,16 @@ fn new67_gen_change_preserves_failed_epoch_through_follow_json() {
         serde_json::to_string(&win2).unwrap(),
     )
     .unwrap();
-    // Fresh-outage wait (P2fix12 NEW-65 — retrofitted:
-    // settle past two polls, then require a NEW note, so a
-    // generic pre-prefix note cannot satisfy the wait).
-    std::thread::sleep(Duration::from_millis(2200));
-    while let Ok((is_out, line)) = rx.try_recv() {
-        if is_out {
-            out_lines.push(line);
-        } else {
-            err_lines.push(line);
-        }
-    }
-    let fresh_from = err_lines.len();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if Instant::now() >= deadline {
-            panic!("timed out waiting for the outage note; err={err_lines:?}");
-        }
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok((is_out, line)) => {
-                if is_out {
-                    out_lines.push(line);
-                } else {
-                    err_lines.push(line);
-                }
-            }
-            Err(_) => continue,
-        }
-        if err_lines[fresh_from..]
-            .iter()
-            .any(|l| l.contains("retaining last-good"))
-        {
-            break;
-        }
-    }
+    // Exact-scan wait (P2fix13 NEW-78): two fresh
+    // tail-naming outage notes prove one scan folded the
+    // prefix and rejected the tail (no elapsed time).
+    drain_until_exact_scan(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(20),
+        "service-window-v1",
+    );
     assert!(
         child.0.try_wait().unwrap().is_none(),
         "follow must survive the rejected tail"
@@ -9162,40 +9099,16 @@ fn new67_same_generation_recovery_through_follow_loop() {
         serde_json::to_string(&win2).unwrap(),
     )
     .unwrap();
-    // Fresh-outage wait (P2fix12 NEW-65 — retrofitted:
-    // settle past two polls, then require a NEW note, so a
-    // generic pre-prefix note cannot satisfy the wait).
-    std::thread::sleep(Duration::from_millis(2200));
-    while let Ok((is_out, line)) = rx.try_recv() {
-        if is_out {
-            out_lines.push(line);
-        } else {
-            err_lines.push(line);
-        }
-    }
-    let fresh_from = err_lines.len();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if Instant::now() >= deadline {
-            panic!("timed out waiting for the outage note; err={err_lines:?}");
-        }
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok((is_out, line)) => {
-                if is_out {
-                    out_lines.push(line);
-                } else {
-                    err_lines.push(line);
-                }
-            }
-            Err(_) => continue,
-        }
-        if err_lines[fresh_from..]
-            .iter()
-            .any(|l| l.contains("retaining last-good"))
-        {
-            break;
-        }
-    }
+    // Exact-scan wait (P2fix13 NEW-78): two fresh
+    // tail-naming outage notes prove one scan folded the
+    // prefix and rejected the tail (no elapsed time).
+    drain_until_exact_scan(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(20),
+        "service-window-v1",
+    );
     assert!(
         child.0.try_wait().unwrap().is_none(),
         "follow must survive the rejected tail"
@@ -9219,16 +9132,16 @@ fn new67_same_generation_recovery_through_follow_loop() {
         child.0.try_wait().unwrap().is_none(),
         "follow keeps running after same-generation recovery"
     );
-    // Settle: the UNKNOWN section trails the TRACE section, so
-    // drain one more poll before asserting the flags.
-    std::thread::sleep(Duration::from_secs(2));
-    while let Ok((is_out, line)) = rx.try_recv() {
-        if is_out {
-            out_lines.push(line);
-        } else {
-            err_lines.push(line);
-        }
-    }
+    // The UNKNOWN section trails the TRACE section in the
+    // same frame — drain until the flags land (no elapsed
+    // settle, NEW-78).
+    drain_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        "unstable_snapshot",
+    );
     assert!(
         out_lines.iter().any(|l| l.contains("unstable_snapshot")),
         "recovery publishes the hole flags through the loop: {out_lines:?}"
@@ -10399,6 +10312,58 @@ fn envelope_raw_duplicate_trace_keys_reject() {
     assert!(!err.contains("`mode`"), "key must not echo: {err}");
 }
 
+/// Exact-scan synchronization (P2fix13 NEW-78 — supersedes
+/// the P2fix12 NEW-65 elapsed-time settle): wait until TWO
+/// fresh tail-outage notes naming the rejected tail
+/// (`want_err` + retaining last-good, same line) have
+/// arrived since entry. Soundness without elapsed time:
+/// the follow loop's polls are SEQUENTIAL (scan → print →
+/// sleep 1 s), and every staged file landed before this
+/// wait starts, so at most ONE in-flight scan can have
+/// enumerated a subset (one that started inside the
+/// landing window); every scan after it enumerated the
+/// full set. The second fresh note therefore proves its
+/// scan folded the exact accepted prefix AND rejected the
+/// tail in one scan — the state the recovery step below
+/// may now rely on. (A delayed single note can no longer
+/// satisfy the wait: codex R13's counterexample.)
+fn drain_until_exact_scan(
+    rx: &std::sync::mpsc::Receiver<(bool, String)>,
+    out_lines: &mut Vec<String>,
+    err_lines: &mut Vec<String>,
+    deadline: std::time::Instant,
+    want_err: &str,
+) {
+    let mut seen = 0usize;
+    let mut counted_from = err_lines.len();
+    loop {
+        for line in &err_lines[counted_from..] {
+            if line.contains(want_err) && line.contains("retaining last-good") {
+                seen += 1;
+            }
+        }
+        counted_from = err_lines.len();
+        if seen >= 2 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for two exact-scan tail notes ({want_err:?}); out={out_lines:?} err={err_lines:?}"
+            );
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok((is_out, line)) => {
+                if is_out {
+                    out_lines.push(line);
+                } else {
+                    err_lines.push(line);
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+}
+
 /// Atomic staged-window write (P2fix12 loop pins): tmp +
 /// rename, so a mid-staging poll never reads a torn prefix
 /// file (a torn read would fail on the prefix instead of the
@@ -10526,41 +10491,17 @@ fn new71_published_prefix_through_follow_loop() {
                 .as_bytes(),
         );
     }
-    // Fresh-outage wait (P2fix12 NEW-65 — the note must come
-    // from a poll that OBSERVED the prefix: settle past two
-    // polls, then require a NEW note naming the tail's error
-    // — a generic pre-prefix note cannot satisfy it).
-    std::thread::sleep(Duration::from_millis(2200));
-    while let Ok((is_out, line)) = rx.try_recv() {
-        if is_out {
-            out_lines.push(line);
-        } else {
-            err_lines.push(line);
-        }
-    }
-    let fresh_from = err_lines.len();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if Instant::now() >= deadline {
-            panic!("timed out waiting for the fresh tail outage; err={err_lines:?}");
-        }
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok((is_out, line)) => {
-                if is_out {
-                    out_lines.push(line);
-                } else {
-                    err_lines.push(line);
-                }
-            }
-            Err(_) => continue,
-        }
-        if err_lines[fresh_from..]
-            .iter()
-            .any(|l| l.contains("service-window-v1") && l.contains("retaining last-good"))
-        {
-            break;
-        }
-    }
+    // Exact-scan wait (P2fix13 NEW-78): two fresh
+    // tail-naming outage notes prove one scan folded the
+    // newer prefix and rejected the tail (no elapsed time —
+    // a single delayed pre-prefix note cannot satisfy it).
+    drain_until_exact_scan(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(20),
+        "service-window-v1",
+    );
     assert!(
         child.0.try_wait().unwrap().is_none(),
         "follow must survive the rejected tail"
@@ -10586,16 +10527,16 @@ fn new71_published_prefix_through_follow_loop() {
         child.0.try_wait().unwrap().is_none(),
         "follow keeps running after gen-changing recovery"
     );
-    // Settle: the uncertainty continuations trail the base
-    // line, so drain one more poll before indexing them.
-    std::thread::sleep(Duration::from_secs(2));
-    while let Ok((is_out, line)) = rx.try_recv() {
-        if is_out {
-            out_lines.push(line);
-        } else {
-            err_lines.push(line);
-        }
-    }
+    // The uncertainty continuations trail the base line in
+    // the same frame — drain until the last one lands
+    // before indexing them (no elapsed settle, NEW-78).
+    drain_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        "prev-unmeasured=[[",
+    );
     let at = out_lines
         .iter()
         .position(|l| l.contains("PREVIOUS EPOCH gen=0 "))
@@ -10814,39 +10755,16 @@ fn new71_published_prefix_through_follow_json() {
                 .as_bytes(),
         );
     }
-    // Fresh-outage wait (P2fix12 NEW-65): settle past two
-    // polls, then require a NEW note naming the tail.
-    std::thread::sleep(Duration::from_millis(2200));
-    while let Ok((is_out, line)) = rx.try_recv() {
-        if is_out {
-            out_lines.push(line);
-        } else {
-            err_lines.push(line);
-        }
-    }
-    let fresh_from = err_lines.len();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if Instant::now() >= deadline {
-            panic!("timed out waiting for the fresh tail outage; err={err_lines:?}");
-        }
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok((is_out, line)) => {
-                if is_out {
-                    out_lines.push(line);
-                } else {
-                    err_lines.push(line);
-                }
-            }
-            Err(_) => continue,
-        }
-        if err_lines[fresh_from..]
-            .iter()
-            .any(|l| l.contains("service-window-v1") && l.contains("retaining last-good"))
-        {
-            break;
-        }
-    }
+    // Exact-scan wait (P2fix13 NEW-78): two fresh
+    // tail-naming outage notes prove one scan folded the
+    // newer prefix and rejected the tail (no elapsed time).
+    drain_until_exact_scan(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(20),
+        "service-window-v1",
+    );
     assert!(
         child.0.try_wait().unwrap().is_none(),
         "follow must survive the rejected tail"
@@ -10905,6 +10823,471 @@ fn new71_published_prefix_through_follow_json() {
                 v["previous_epoch"]["generation"],
                 serde_json::json!(0),
                 "no mislabeled previous epoch: {v:?}"
+            );
+        }
+    }
+    let _ = child.0.kill();
+}
+
+#[test]
+fn new77_coalesced_resets_through_follow_loop() {
+    // P2fix13 NEW-77 (+ NEW-P2c-OPEN — human current-frame
+    // format): gen 0 published, a gen-1 prefix accepted
+    // before a rejected tail, then gen 2 AND gen 3 land for
+    // ONE recovery scan — the gen-3 frame's PREVIOUS EPOCH
+    // is gen 1 with its uncertainty (never stale gen 0,
+    // never dropped by the clean gen-2 reset). The outage
+    // wait is the exact-scan sync (NEW-78). Pre-fix: the
+    // second reset clears the record and the terminal
+    // shows gen 0 (RED — the gen=1 wait times out).
+    use std::io::BufRead;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+    let dir = out_dir("new77-follow-human");
+    let win0 =
+        snapshot::test_envelope_with_doc(0, 0, run.clone(), snapshot::test_document(3, "partial"));
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&win0).unwrap(),
+    )
+    .unwrap();
+    let spawn = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+            .args([
+                "watch",
+                "--out",
+                dir.to_str().unwrap(),
+                "--follow",
+                "--poll-seconds",
+                "1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = OwnedChild(spawn());
+    let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    let tx2 = tx.clone();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send((true, line)).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx2.send((false, line)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut out_lines: Vec<String> = vec![];
+    let mut err_lines: Vec<String> = vec![];
+    let drain_until = |rx: &std::sync::mpsc::Receiver<(bool, String)>,
+                       out_lines: &mut Vec<String>,
+                       err_lines: &mut Vec<String>,
+                       deadline: Instant,
+                       want_out: &str| {
+        loop {
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for {want_out:?}; out={out_lines:?} err={err_lines:?}");
+            }
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok((is_out, line)) => {
+                    if is_out {
+                        out_lines.push(line);
+                    } else {
+                        err_lines.push(line);
+                    }
+                }
+                Err(_) => continue,
+            }
+            if out_lines.iter().any(|l| l.contains(want_out)) {
+                return;
+            }
+        }
+    };
+    // Stage 1: gen-0 frame publishes (steady follow).
+    drain_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        "MARKER partial seq=0",
+    );
+    // Stage 2: bad gen-1 tail first, then the gen-1 prefix
+    // after the hole — the scan folds the prefix and
+    // rejects the tail (exact-scan sync).
+    let mut bad = snapshot::test_envelope(3, 1, run.clone(), 10);
+    bad["schema"] = serde_json::json!("service-window-v9");
+    write_atomic(
+        &dir.join("window-0000000003.json"),
+        serde_json::to_string(&bad).unwrap().as_bytes(),
+    );
+    write_atomic(
+        &dir.join("window-0000000002.json"),
+        serde_json::to_string(&snapshot::test_envelope(2, 1, run.clone(), 10))
+            .unwrap()
+            .as_bytes(),
+    );
+    drain_until_exact_scan(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(20),
+        "service-window-v1",
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "follow must survive the rejected tail"
+    );
+    // Stage 3: gen 2 AND gen 3 land (both before the tail
+    // is removed, so no intermediate scan can fold gen 2
+    // alone) — ONE recovery scan folds both resets.
+    write_atomic(
+        &dir.join("window-0000000004.json"),
+        serde_json::to_string(&snapshot::test_envelope(4, 2, run.clone(), 20))
+            .unwrap()
+            .as_bytes(),
+    );
+    write_atomic(
+        &dir.join("window-0000000005.json"),
+        serde_json::to_string(&snapshot::test_envelope(5, 3, run.clone(), 30))
+            .unwrap()
+            .as_bytes(),
+    );
+    std::fs::remove_file(dir.join("window-0000000003.json")).unwrap();
+    drain_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        "PREVIOUS EPOCH gen=1 ",
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "follow keeps running after coalesced recovery"
+    );
+    drain_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        "prev-unmeasured=[[",
+    );
+    let at = out_lines
+        .iter()
+        .position(|l| l.contains("PREVIOUS EPOCH gen=1 "))
+        .unwrap();
+    let prev = out_lines[at].clone();
+    assert!(
+        prev.contains("calls=10") && prev.contains("win=2"),
+        "the line reports gen 1's accepted prefix (never gen-0 stale): {prev:?}"
+    );
+    assert_eq!(
+        out_lines[at + 1],
+        "  prev-unstable=completeness.epoch_partial_by_class,counts.by_outcome,counts.calls_total,counts.lanes,histograms,loss.epoch_by_cause,members.retired_epoch,stream.drops",
+        "the tail reports gen 1's uncertainty flags"
+    );
+    assert_eq!(
+        out_lines[at + 2],
+        "  prev-unmeasured=[[1, 2]]",
+        "the tail reports gen 1's hole span"
+    );
+    assert!(
+        !out_lines.iter().any(|l| l.contains("PREVIOUS EPOCH gen=0")),
+        "gen 0 is never mislabeled as the previous epoch: {out_lines:?}"
+    );
+    assert!(
+        !out_lines.iter().any(|l| l.contains("PREVIOUS EPOCH gen=2")),
+        "the transient gen 2 never displaces gen 1: {out_lines:?}"
+    );
+    // The committed checkpoint persists gen 1.
+    let ckpt = ckpt_for(&dir);
+    let ckpt_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ckpt).unwrap()).unwrap();
+    assert_eq!(
+        ckpt_json["accumulators"]["previous_epoch"]["generation"],
+        serde_json::json!(1),
+        "the checkpoint persists gen 1"
+    );
+    // Stage 4: reopen — the first frame shows gen 1.
+    drop(child);
+    let mut child = OwnedChild(spawn());
+    let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    let tx2 = tx.clone();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send((true, line)).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx2.send((false, line)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut out_lines: Vec<String> = vec![];
+    let mut err_lines: Vec<String> = vec![];
+    drain_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        "PREVIOUS EPOCH gen=1 ",
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the reopened follow keeps running"
+    );
+    let at = out_lines
+        .iter()
+        .position(|l| l.contains("PREVIOUS EPOCH gen=1 "))
+        .unwrap();
+    assert!(
+        out_lines[at].contains("calls=10") && out_lines[at].contains("win=2"),
+        "the reopen shows gen 1: {:?}",
+        out_lines[at]
+    );
+    let _ = child.0.kill();
+}
+
+#[test]
+fn new77_coalesced_resets_through_follow_json() {
+    // P2fix13 NEW-77 (+ NEW-P2c-OPEN — JSON current-frame
+    // format): the same coalesced recovery (gen 2 + gen 3
+    // in one scan) in JSON mode — the gen-3 frame carries
+    // gen 1 as `previous_epoch` WITH its uncertainty, and
+    // no frame names any other predecessor. The outage
+    // wait is the exact-scan sync (NEW-78). Pre-fix: no
+    // gen-1 `previous_epoch` exists (RED).
+    use std::io::BufRead;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+    let dir = out_dir("new77-follow-json");
+    let win0 =
+        snapshot::test_envelope_with_doc(0, 0, run.clone(), snapshot::test_document(3, "partial"));
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&win0).unwrap(),
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "watch",
+            "--out",
+            dir.to_str().unwrap(),
+            "--follow",
+            "--poll-seconds",
+            "1",
+            "--format",
+            "json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = OwnedChild(child);
+    let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    let tx2 = tx.clone();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send((true, line)).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx2.send((false, line)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut out_lines: Vec<String> = vec![];
+    let mut err_lines: Vec<String> = vec![];
+    let frames_of = |lines: &[String]| -> Vec<serde_json::Value> {
+        let mut frames: Vec<serde_json::Value> = vec![];
+        let mut current: Vec<String> = vec![];
+        let mut seen_banner = false;
+        for line in lines {
+            if line.starts_with("--- frame") {
+                if seen_banner && !current.is_empty() {
+                    if let Ok(v) = serde_json::from_str(&current.join("\n")) {
+                        frames.push(v);
+                    }
+                }
+                current.clear();
+                seen_banner = true;
+                continue;
+            }
+            if seen_banner {
+                current.push(line.clone());
+            }
+        }
+        frames
+    };
+    let drain_frames_until = |rx: &std::sync::mpsc::Receiver<(bool, String)>,
+                              out_lines: &mut Vec<String>,
+                              err_lines: &mut Vec<String>,
+                              deadline: Instant,
+                              want: &dyn Fn(&serde_json::Value) -> bool,
+                              what: &str|
+     -> Vec<serde_json::Value> {
+        loop {
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for {what}; out={out_lines:?} err={err_lines:?}");
+            }
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok((is_out, line)) => {
+                    if is_out {
+                        out_lines.push(line);
+                    } else {
+                        err_lines.push(line);
+                    }
+                }
+                Err(_) => continue,
+            }
+            let frames = frames_of(out_lines);
+            if frames.iter().any(want) {
+                return frames;
+            }
+        }
+    };
+    // Stage 1: gen-0 JSON frame publishes.
+    drain_frames_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        &|v: &serde_json::Value| v["source"]["generation"] == serde_json::json!(0),
+        "a gen-0 JSON frame",
+    );
+    // Stage 2: bad gen-1 tail first, then the gen-1 prefix
+    // after the hole (exact-scan sync).
+    let mut bad = snapshot::test_envelope(3, 1, run.clone(), 10);
+    bad["schema"] = serde_json::json!("service-window-v9");
+    write_atomic(
+        &dir.join("window-0000000003.json"),
+        serde_json::to_string(&bad).unwrap().as_bytes(),
+    );
+    write_atomic(
+        &dir.join("window-0000000002.json"),
+        serde_json::to_string(&snapshot::test_envelope(2, 1, run.clone(), 10))
+            .unwrap()
+            .as_bytes(),
+    );
+    drain_until_exact_scan(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(20),
+        "service-window-v1",
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "follow must survive the rejected tail"
+    );
+    // Stage 3: gen 2 AND gen 3 land before the tail goes —
+    // one recovery scan folds both resets.
+    write_atomic(
+        &dir.join("window-0000000004.json"),
+        serde_json::to_string(&snapshot::test_envelope(4, 2, run.clone(), 20))
+            .unwrap()
+            .as_bytes(),
+    );
+    write_atomic(
+        &dir.join("window-0000000005.json"),
+        serde_json::to_string(&snapshot::test_envelope(5, 3, run.clone(), 30))
+            .unwrap()
+            .as_bytes(),
+    );
+    std::fs::remove_file(dir.join("window-0000000003.json")).unwrap();
+    let frames = drain_frames_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        &|v: &serde_json::Value| {
+            v["source"]["generation"] == serde_json::json!(3)
+                && v["previous_epoch"]["generation"] == serde_json::json!(1)
+        },
+        "a gen-3 JSON frame with preserved gen 1",
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "follow keeps running after coalesced recovery"
+    );
+    let frame = frames
+        .iter()
+        .find(|v| {
+            v["source"]["generation"] == serde_json::json!(3)
+                && v["previous_epoch"]["generation"] == serde_json::json!(1)
+        })
+        .unwrap();
+    assert_eq!(
+        frame["previous_epoch"]["calls_total"],
+        serde_json::json!(10),
+        "the JSON frame reports gen 1's accepted prefix: {frame:?}"
+    );
+    assert_eq!(
+        frame["previous_epoch"]["window_seq"],
+        serde_json::json!(2),
+        "the JSON frame reports gen 1's tip: {frame:?}"
+    );
+    assert_eq!(
+        frame["previous_epoch"]["lanes"],
+        serde_json::json!([10, 0, 0, 0]),
+        "the JSON frame reports gen 1's lanes: {frame:?}"
+    );
+    assert!(
+        frame["previous_epoch"]["unstable"]
+            .as_array()
+            .is_some_and(|flags| flags.len() == 8)
+            && frame["previous_epoch"]["unmeasured"] == serde_json::json!([[1, 2]]),
+        "the JSON frame reports gen 1's uncertainty: {frame:?}"
+    );
+    for v in frames.iter() {
+        if v.get("previous_epoch").is_some_and(|p| !p.is_null()) {
+            assert_eq!(
+                v["previous_epoch"]["generation"],
+                serde_json::json!(1),
+                "no mislabeled previous epoch (never gen 0 or gen 2): {v:?}"
             );
         }
     }
@@ -11053,40 +11436,18 @@ fn new65_same_generation_recovery_through_follow_json() {
         &dir.join("window-0000000002.json"),
         serde_json::to_string(&win2).unwrap().as_bytes(),
     );
-    // Fresh-outage wait: settle past two polls, then require
-    // a NEW note naming the tail (proving a post-prefix poll
-    // folded the prefix before rejecting the tail).
-    std::thread::sleep(Duration::from_millis(2200));
-    while let Ok((is_out, line)) = rx.try_recv() {
-        if is_out {
-            out_lines.push(line);
-        } else {
-            err_lines.push(line);
-        }
-    }
-    let fresh_from = err_lines.len();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if Instant::now() >= deadline {
-            panic!("timed out waiting for the fresh tail outage; err={err_lines:?}");
-        }
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok((is_out, line)) => {
-                if is_out {
-                    out_lines.push(line);
-                } else {
-                    err_lines.push(line);
-                }
-            }
-            Err(_) => continue,
-        }
-        if err_lines[fresh_from..]
-            .iter()
-            .any(|l| l.contains("service-window-v1") && l.contains("retaining last-good"))
-        {
-            break;
-        }
-    }
+    // Exact-scan wait (P2fix13 NEW-78): two fresh
+    // tail-naming outage notes prove one scan folded the
+    // exact accepted prefix and rejected the tail (no
+    // elapsed-time substitution — a delayed pre-prefix
+    // poll can account for at most the first note).
+    drain_until_exact_scan(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(20),
+        "service-window-v1",
+    );
     assert!(
         child.0.try_wait().unwrap().is_none(),
         "follow must survive the rejected tail"

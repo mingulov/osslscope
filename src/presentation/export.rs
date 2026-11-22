@@ -3500,16 +3500,21 @@ mod tests {
 
     #[test]
     fn new70_failed_refresh_then_retention_reopen_recovers() {
-        // P2fix12 NEW-70 (+ NEW-2/NEW-33-OPEN): a FAILED
-        // refresh (injected commit failure) followed by a
-        // restart AFTER retention removed already-folded
-        // windows (seq ≤ watermark — allowed) reopens on the
-        // last committed checkpoint and folds the retained
-        // suffix as best-prefix (gap flagged, ranges
-        // recorded — the §6C-1c retention contract). Guard
-        // (the behavior holds; the failed-refresh + retention
-        // + reopen sequence is the new coverage).
+        // P2fix12 NEW-70 (+ NEW-2/NEW-33-OPEN), real-failure
+        // arm P2fix13 NEW-75 (codex R13 NEW-22/NEW-33: the
+        // retention pin must reach the REAL late failure,
+        // not the `FAIL_NEXT_COMMIT` pre-write injection
+        // that returns before the flush is even attempted):
+        // a refresh whose joint checkpoint FLUSH actually
+        // fails inside `write_checkpoint` (read-only
+        // checkpoint dir — staging cannot create), followed
+        // by a restart AFTER retention removed already-folded
+        // windows (seq ≤ watermark — allowed), reopens on
+        // the exact prior committed transaction and folds
+        // the retained suffix as best-prefix (gap flagged,
+        // ranges recorded — the §6C-1c retention contract).
         use super::super::snapshot;
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = std::env::temp_dir().join(format!(
             "p2fix12-new70-retention-{}-{}",
             std::process::id(),
@@ -3527,7 +3532,11 @@ mod tests {
             )
             .unwrap();
         }
-        let ckpt = std::path::PathBuf::from(format!("{}.checkpoint.json", dir.display()));
+        // Sibling checkpoint dir (outside the out-DIR) so
+        // the real flush failure can gate on its writability.
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("ckpt.json");
         let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
         let mut state = RefreshState::default();
         refresh_once(&mut p, &mut state).expect("first refresh commits watermark 2");
@@ -3543,12 +3552,19 @@ mod tests {
             serde_json::to_string(&snapshot::test_envelope(4, 0, run, 10)).unwrap(),
         )
         .unwrap();
-        // The next refresh FAILS (injected) — the checkpoint
-        // file keeps the last committed bytes.
-        FAIL_NEXT_COMMIT.with(|f| f.set(true));
+        // The next refresh FAILS for real inside the joint
+        // flush (read-only checkpoint dir — the write is
+        // attempted and refused; no pre-write injection).
+        // The checkpoint file keeps the last committed bytes
+        // (publish-last: the target was never touched).
+        std::fs::set_permissions(&ckpt_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = refresh_once(&mut p, &mut state)
+            .err()
+            .expect("the real flush failure fails the refresh");
+        std::fs::set_permissions(&ckpt_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            refresh_once(&mut p, &mut state).is_err(),
-            "the injected failure fails the refresh"
+            err.contains("checkpoint flush") && !err.contains("injected"),
+            "the failure is the real flush, not an injection: {err}"
         );
         assert_eq!(
             std::fs::read(&ckpt).unwrap(),
@@ -3588,6 +3604,231 @@ mod tests {
             "the gap flags the epoch"
         );
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_file(&ckpt);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new75_late_flush_failure_keeps_live_transaction() {
+        // P2fix13 NEW-75 (+ NEW-16/NEW-70-OPEN): an ACTUAL
+        // late abort at the publish boundary (a FIFO
+        // substituted at the checkpoint target — the joint
+        // flush stages fully and refuses at the fused
+        // publish gate) leaves the LIVE export transaction
+        // untouched: the staged fold is discarded (no
+        // mid-fold resume, no double fold), and the next
+        // refresh after the substitution is removed commits
+        // the same transaction exactly once. Publish-last
+        // leaves no window where disk adopted bytes the live
+        // exporter never published (the pre-fix restore
+        // failure shape).
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix13-new75-late-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("ckpt.json");
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::default();
+        refresh_once(&mut p, &mut state).expect("first refresh commits watermark 0");
+        // A second window lands; substitute the FIFO.
+        std::fs::write(
+            dir.join("window-0000000001.json"),
+            serde_json::to_string(&snapshot::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(&ckpt).unwrap();
+        // SAFETY: mkfifo on a fresh private path.
+        assert_eq!(
+            unsafe {
+                libc::mkfifo(
+                    std::ffi::CString::new(ckpt.to_str().unwrap())
+                        .unwrap()
+                        .as_ptr(),
+                    0o600,
+                )
+            },
+            0
+        );
+        let err = refresh_once(&mut p, &mut state)
+            .err()
+            .expect("the publish gate refuses the FIFO target");
+        assert!(
+            err.contains("regular file"),
+            "the late abort names the target gate: {err}"
+        );
+        // Remove the substitution: the SAME transaction
+        // commits exactly once (calls 10+10, watermark 1 —
+        // a mid-fold resume would double-fold window 0).
+        std::fs::remove_file(&ckpt).unwrap();
+        let qp = refresh_once(&mut p, &mut state).expect("the transaction retries whole");
+        assert_eq!(qp.snap.source.window_seq, Some(1), "the tip advances once");
+        assert_eq!(qp.snap.source.generation, Some(0), "same generation");
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        assert_eq!(body["watermark_seq"], serde_json::json!(1));
+        assert_eq!(
+            body["accumulators"]["calls_total"],
+            serde_json::json!(20),
+            "exactly one fold of each window (no double fold past the abort)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new76_fifo_substitution_last_good_and_bounded_shutdown() {
+        // P2fix13 NEW-76 (serve arm): a FIFO substituted at
+        // the checkpoint target after a healthy start never
+        // stalls refresh or shutdown — last-good keeps
+        // serving scrapes promptly and shutdown completes
+        // bounded (the collector join returns; the shutdown
+        // flush failure reports via the NEW-70 arm). Pre-fix
+        // shape: the collector blocks in the flush's target
+        // read and the join never returns (the bounded join
+        // below convicts).
+        use super::super::snapshot;
+        use std::io::{Read as _, Write as _};
+        use std::sync::{Arc, atomic::AtomicBool};
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix13-new76-serve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let checkpoint = ckpt_dir.join("ckpt.json");
+        let checkpoint_sub = checkpoint.clone();
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            port
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let out = dir.clone();
+        let _ = super::take_shutdown_reports();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let code = serve_with_shutdown(
+                Options {
+                    out,
+                    listen: format!("127.0.0.1:{port}"),
+                    poll_secs: 1,
+                    otlp: None,
+                    checkpoint: Some(checkpoint),
+                },
+                stop2,
+                None,
+            );
+            let _ = tx.send(code);
+        });
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let scrape = |addr: &std::net::SocketAddr| -> String {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+                    addr,
+                    std::time::Duration::from_millis(200),
+                ) {
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .write_all(b"GET /metrics HTTP/1.0\r\nHost: x\r\n\r\n")
+                        .unwrap();
+                    let mut body = String::new();
+                    stream.read_to_string(&mut body).unwrap();
+                    return body;
+                }
+                assert!(std::time::Instant::now() < deadline, "listener accepts");
+            }
+        };
+        // Healthy start: a real snapshot serves.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let body = scrape(&addr);
+            if !body.contains("no snapshot yet") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first snapshot serves"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // Substitute the FIFO at the checkpoint target.
+        std::fs::remove_file(&checkpoint_sub).unwrap();
+        // SAFETY: mkfifo on a fresh private path.
+        assert_eq!(
+            unsafe {
+                libc::mkfifo(
+                    std::ffi::CString::new(checkpoint_sub.to_str().unwrap())
+                        .unwrap()
+                        .as_ptr(),
+                    0o600,
+                )
+            },
+            0
+        );
+        // Failed refresh ticks pass; last-good keeps serving
+        // promptly (the scrape read bound convicts a stall).
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        let body = scrape(&addr);
+        assert!(
+            !body.contains("no snapshot yet"),
+            "last-good serves through the substitution: {body:?}"
+        );
+        // Bounded shutdown: the join returns, serve exits
+        // SUCCESS (outage contract), and the flush failure
+        // reports loudly (NEW-70 arm preserved).
+        let stopped_at = std::time::Instant::now();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let code = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("shutdown completes within the bound (no collector stall)");
+        assert!(
+            stopped_at.elapsed() < std::time::Duration::from_secs(10),
+            "bounded shutdown"
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            code,
+            std::process::ExitCode::SUCCESS,
+            "outage-compatible exit"
+        );
+        let reports = super::take_shutdown_reports();
+        assert!(
+            reports
+                .iter()
+                .any(|l| l.contains("osslscope: shutdown checkpoint flush failed")),
+            "the shutdown flush failure reports: {reports:?}"
+        );
+        let _ = std::fs::remove_file(&checkpoint_sub);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
     }
 }

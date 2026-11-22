@@ -1878,6 +1878,32 @@ fn h5_t3_every_device_site_names_one_domain() {
             "let parent_id = (md.dev(), md.ino());",
             1,
         ),
+        // [p2fix13 NEW-74: placement tripwire — the ancestry
+        // chain cursor, its root detection (parent==self),
+        // and the watch-arming dedupe read native fstat
+        // (dev, ino) from the SAME opened-fd ancestry
+        // machinery, compared raw-vs-raw only to bind
+        // inotify watches to those inodes; still the single
+        // native domain, never joined to maps text or
+        // encoded devices.]
+        (
+            "src/presentation/snapshot.rs",
+            "raw",
+            "let cur_id = (cur_md.dev(), cur_md.ino());",
+            1,
+        ),
+        (
+            "src/presentation/snapshot.rs",
+            "raw",
+            "if (md.dev(), md.ino()) == cur_id {",
+            1,
+        ),
+        (
+            "src/presentation/snapshot.rs",
+            "raw",
+            "let id = (md.dev(), md.ino());",
+            1,
+        ),
     ];
     for (file, domain, _, _) in pinned {
         assert!(

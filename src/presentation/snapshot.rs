@@ -15,6 +15,13 @@ pub const SCHEMA: &str = "osslscope-presentation-v1";
 /// discard + replay through the designed migration below).
 pub const CHECKPOINT_SCHEMA: &str = "osslscope-presenter-checkpoint-v4";
 
+/// Bounded regular-file intake bound for the checkpoint file
+/// (P2fix13 NEW-76): writer output is budget-bounded
+/// accumulator state (kilobytes in practice); 64 MiB sits far
+/// above any admitted snapshot while keeping a substituted
+/// or garbage target from consuming unbounded memory at load.
+const CHECKPOINT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Flagged-entry note words (†, §6C-1d). These are NOTES, not
 /// reasons: they ride flagged entries' `note` field, never the
 /// reason word (the 9 frozen reasons live in [`is_reason`]).
@@ -1422,6 +1429,344 @@ fn opened_dir_is_outside(
     ))
 }
 
+/// Test-only tripwire observation probe (P2fix13 NEW-74):
+/// how many `IN_MOVE_SELF` events the placement guard drained
+/// since the last take (lets a pin prove a reversed move was
+/// DETECTED even when the ancestry ends outside again).
+/// Production never reads it.
+#[cfg(test)]
+pub(crate) mod tripwire_probe {
+    use std::cell::Cell;
+    thread_local! {
+        static MOVES: Cell<u64> = const { Cell::new(0) };
+    }
+    pub fn record(n: u64) {
+        MOVES.with(|m| m.set(m.get().saturating_add(n)));
+    }
+    pub fn take() -> u64 {
+        MOVES.with(|m| m.replace(0))
+    }
+}
+
+/// Placement precondition guard (P2fix13 NEW-74): the
+/// outside-the-producer precondition must HOLD THROUGH every
+/// mutation of the checkpoint write (staging, publish,
+/// cleanup), not merely sample true at instants. The guard
+/// arms an inotify watch (`IN_MOVE_SELF`/`IN_DELETE_SELF`)
+/// on the opened checkpoint parent and EVERY ancestor bound
+/// by fd (via `/proc/self/fd`, so the watch binds the
+/// opened inodes themselves, never a pathname resolution):
+/// any relocation of the chain during the write leaves a
+/// queued event even when it reverses before the next
+/// check, and queue overflow or chain destruction refuses
+/// (placement cannot be established). Every mutation runs
+/// fused behind `prove_before` (drain + link-count +
+/// fd-anchored ancestry) and major steps re-prove with
+/// `prove_after` (any event in the step's wake refuses —
+/// the mutation may have raced a move). A failed proof
+/// performs NO further mutation, cleanup included (an owned
+/// stage is left in place and reported, never unlinked on
+/// an fd that cannot be proven outside).
+struct PlacementGuard {
+    notify: std::fs::File,
+    /// Ancestor fds (parent first) kept open for the write's
+    /// duration (the watches bind their inodes).
+    _chain: Vec<std::fs::File>,
+}
+
+/// Placement refusal for `step` (P2fix13 NEW-74): every
+/// placement failure names the producer containment the same
+/// way the carried pins match on, with the step inline.
+fn placement_error(step: &str, reason: &str, display: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "osslscope: checkpoint dir no longer outside the producer out-DIR at {step} ({reason}; not {})",
+            display.display()
+        ),
+    )
+}
+
+/// Ancestor fds of an OPENED directory (P2fix13 NEW-74):
+/// the fd itself, then each `..` hop (fd-anchored, no
+/// pathname) up to the filesystem root (where `..` is
+/// self). Bounded (fail closed past the cap), mirroring
+/// `opened_dir_is_outside`.
+fn ancestry_chain(dir_fd: &std::fs::File, display: &Path) -> std::io::Result<Vec<std::fs::File>> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::io::AsRawFd as _;
+    let mut chain = vec![dir_fd.try_clone()?];
+    let dotdot = std::ffi::CString::new("..").expect("static");
+    for _ in 0..65536 {
+        let cur = chain.last().expect("nonempty chain");
+        let cur_md = cur.metadata()?;
+        let cur_id = (cur_md.dev(), cur_md.ino());
+        // SAFETY: cur is a live fd; ".." is a NUL-free name.
+        let fd = unsafe {
+            libc::openat(
+                cur.as_raw_fd(),
+                dotdot.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "osslscope: checkpoint dir ancestry unreadable at write: {} ({})",
+                    display.display(),
+                    std::io::Error::last_os_error()
+                ),
+            ));
+        }
+        // SAFETY: openat returned a fresh owned fd.
+        let parent = unsafe {
+            use std::os::fd::FromRawFd as _;
+            std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(fd))
+        };
+        let md = parent.metadata()?;
+        if (md.dev(), md.ino()) == cur_id {
+            return Ok(chain);
+        }
+        chain.push(parent);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "osslscope: checkpoint dir ancestry too deep at write: {}",
+            display.display()
+        ),
+    ))
+}
+
+/// Outcome of one tripwire drain (P2fix13 NEW-74).
+struct TripwireDrain {
+    /// Any queued event at all (a move, at minimum, was
+    /// observed — position changed sometime since the last
+    /// drain, even if it reversed since).
+    events: bool,
+}
+
+impl PlacementGuard {
+    const WATCH_MASK: u32 = libc::IN_MOVE_SELF | libc::IN_DELETE_SELF;
+
+    /// Arm the tripwire on the opened parent + ancestry
+    /// (P2fix13 NEW-74). Failure refuses BEFORE any mutation
+    /// (placement through the write cannot be established).
+    fn arm(dir_fd: &std::fs::File, display: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::io::AsRawFd as _;
+        let chain = ancestry_chain(dir_fd, display)?;
+        // SAFETY: no arguments to validate.
+        let notify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if notify_fd < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "osslscope: checkpoint placement watch could not be established (not {}): {}",
+                    display.display(),
+                    std::io::Error::last_os_error()
+                ),
+            ));
+        }
+        // SAFETY: inotify_init1 returned a fresh owned fd.
+        let notify = unsafe {
+            use std::os::fd::FromRawFd as _;
+            std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(notify_fd))
+        };
+        let mut watched: Vec<(u64, u64)> = Vec::new();
+        for dir in &chain {
+            let md = dir.metadata()?;
+            let id = (md.dev(), md.ino());
+            if watched.contains(&id) {
+                continue;
+            }
+            watched.push(id);
+            // Bind the watch to the OPENED inode via its
+            // /proc/self/fd magic link (never a pathname
+            // resolution through the movable tree).
+            let proc = std::ffi::CString::new(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+                .expect("static shape");
+            // SAFETY: notify + dir fds live; proc is NUL-free.
+            let wd = unsafe {
+                libc::inotify_add_watch(notify.as_raw_fd(), proc.as_ptr(), Self::WATCH_MASK)
+            };
+            if wd < 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "osslscope: checkpoint placement watch could not be established (not {}): {}",
+                        display.display(),
+                        std::io::Error::last_os_error()
+                    ),
+                ));
+            }
+        }
+        Ok(Self {
+            notify,
+            _chain: chain,
+        })
+    }
+
+    /// Drain queued tripwire events (P2fix13 NEW-74): queue
+    /// overflow or a destroyed chain link (delete/unmount/
+    /// ignored) means placement can no longer be established
+    /// for `step` and refuses; observed moves are recorded
+    /// (the ancestry re-proof decides the present position —
+    /// mutations are fused behind drains, so a move observed
+    /// here overlapped none).
+    fn drain(&self, step: &str, display: &Path) -> std::io::Result<TripwireDrain> {
+        use std::io::Read as _;
+        let mut notify = &self.notify;
+        let mut events = false;
+        let mut buf = [0u8; 4096];
+        loop {
+            match notify.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut at = 0usize;
+                    while at + 16 <= n {
+                        let wd =
+                            i32::from_ne_bytes(buf[at..at + 4].try_into().expect("header field"));
+                        let mask = u32::from_ne_bytes(
+                            buf[at + 4..at + 8].try_into().expect("header field"),
+                        );
+                        let len = u32::from_ne_bytes(
+                            buf[at + 12..at + 16].try_into().expect("header field"),
+                        ) as usize;
+                        if wd == -1 || mask & libc::IN_Q_OVERFLOW != 0 {
+                            return Err(placement_error(
+                                step,
+                                "placement could not be established: movement watch overflowed",
+                                display,
+                            ));
+                        }
+                        if mask & (libc::IN_DELETE_SELF | libc::IN_UNMOUNT | libc::IN_IGNORED) != 0
+                        {
+                            return Err(placement_error(
+                                step,
+                                "checkpoint dir ancestry destroyed during write",
+                                display,
+                            ));
+                        }
+                        events = true;
+                        #[cfg(test)]
+                        if mask & libc::IN_MOVE_SELF != 0 {
+                            tripwire_probe::record(1);
+                        }
+                        at += 16 + len;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(TripwireDrain { events })
+    }
+
+    /// Present-position proof shared by both envelopes
+    /// (P2fix13 NEW-74): the opened dir still linked (a
+    /// removed dir's `..` self-loop would otherwise read as
+    /// the filesystem root) and fd-anchored outside the
+    /// producer out-DIR right now.
+    fn prove_position(
+        &self,
+        dir_fd: &std::fs::File,
+        out_dir: &Path,
+        step: &str,
+        display: &Path,
+    ) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        if dir_fd.metadata()?.nlink() == 0 {
+            return Err(placement_error(
+                step,
+                "checkpoint dir unlinked during write",
+                display,
+            ));
+        }
+        if !opened_dir_is_outside(dir_fd, out_dir, display)? {
+            return Err(placement_error(step, "reparented during write", display));
+        }
+        Ok(())
+    }
+
+    /// Fused pre-mutation proof (P2fix13 NEW-74): drain the
+    /// tripwire (any move since the last drain overlapped no
+    /// mutation — mutations only ever follow this proof),
+    /// then prove the present position. The caller performs
+    /// its mutation immediately after this returns, with no
+    /// interposition between.
+    fn prove_before(
+        &self,
+        dir_fd: &std::fs::File,
+        out_dir: &Path,
+        step: &str,
+        display: &Path,
+    ) -> std::io::Result<()> {
+        let _ = self.drain(step, display)?;
+        self.prove_position(dir_fd, out_dir, step, display)
+    }
+
+    /// Post-mutation re-proof (P2fix13 NEW-74): an event in
+    /// the just-run step's wake means the mutation may have
+    /// raced a move — refuse before anything else mutates
+    /// (the publish gate below still withholds authority);
+    /// then prove the present position.
+    fn prove_after(
+        &self,
+        dir_fd: &std::fs::File,
+        out_dir: &Path,
+        step: &str,
+        display: &Path,
+    ) -> std::io::Result<()> {
+        let drained = self.drain(step, display)?;
+        if drained.events {
+            return Err(placement_error(step, "moved during write", display));
+        }
+        self.prove_position(dir_fd, out_dir, step, display)
+    }
+}
+
+/// Placement-gated owned-stage cleanup (P2fix13 NEW-74 —
+/// cleanup is a mutation like any other): the stage unlinks
+/// only behind a fresh placement proof; when placement
+/// cannot be established the stage is LEFT in place and the
+/// returned error says so loudly (the primary error leads).
+/// `primary` is always the returned failure.
+fn cleanup_stage(
+    guard: &PlacementGuard,
+    dir_fd: &std::fs::File,
+    stage_c: &std::ffi::CString,
+    out_dir: &Path,
+    display: &Path,
+    primary: std::io::Error,
+) -> std::io::Error {
+    match guard.prove_before(dir_fd, out_dir, "cleanup", display) {
+        Ok(()) => match unlink_checked(dir_fd, stage_c) {
+            Ok(()) => primary,
+            Err(cleanup) => with_stage_cleanup_note(primary, cleanup),
+        },
+        Err(_) => std::io::Error::new(
+            primary.kind(),
+            format!(
+                "{primary} (stage left in place: placement could not be established for cleanup — operator must intervene)"
+            ),
+        ),
+    }
+}
+
+/// Append the left-stage note to a placement refusal
+/// (P2fix13 NEW-74): a stage exists but placement failed,
+/// so no cleanup mutation runs — the residue is declared,
+/// never silently leaked.
+fn with_stage_left_note(placement: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        placement.kind(),
+        format!("{placement} (stage left in place — no cleanup without placement)"),
+    )
+}
+
 /// Test-only one-shot swap hook (P2fix8 NEW-50): armed by the
 /// pin, run once between the occupancy canonicalize and the
 /// metadata lookup (the fp-confirmed interleave — a path that
@@ -1573,13 +1918,14 @@ mod post_commit_check_hook {
     }
 }
 
-/// Test-only one-shot relocation hook (P2fix11 NEW-66): armed by
-/// the pin, run once AFTER the fused pre-creation ancestry
-/// proof SUCCEEDS and before the staging openat (proves
-/// placement holds THROUGH creation — a dir reparented under
-/// the producer tree after the last successful creation check
-/// must refuse with ZERO bytes staged). Inert unless armed;
-/// production never arms it.
+/// Test-only one-shot relocation hook (P2fix11 NEW-66,
+/// repositioned P2fix13 NEW-74): armed by the pin, run once
+/// at the creation envelope boundary — after the staging
+/// check succeeds, BEFORE the fused pre-creation proof (a
+/// dir reparented under the producer tree here must refuse
+/// at that proof with ZERO bytes staged and no creation at
+/// all; the proof→syscall gap itself carries no hook point).
+/// Inert unless armed; production never arms it.
 #[cfg(test)]
 mod post_create_check_hook {
     use std::cell::RefCell;
@@ -1604,8 +1950,9 @@ mod post_create_check_hook {
 /// stage and before its fsync (the TRUE mid-write pin — the
 /// stage is NON-empty here, unlike the pre-first-byte hook
 /// above; a dir reparented under the producer tree mid-write
-/// must refuse and roll the bytes back). Inert unless armed;
-/// production never arms it.
+/// must refuse at the post-write re-proof with the bytes
+/// never publishing and no further mutation). Inert unless
+/// armed; production never arms it.
 #[cfg(test)]
 mod mid_write_hook {
     use std::cell::RefCell;
@@ -1625,15 +1972,16 @@ mod mid_write_hook {
     }
 }
 
-/// Test-only one-shot relocation hook (P2fix11 NEW-66): armed by
-/// the pin, run once AFTER the fused pre-rename ancestry proof
-/// SUCCEEDS (the FINAL successful check on the mutation path)
-/// and before the commit renameat (proves placement holds
-/// THROUGH the commit — a dir reparented under the producer
-/// tree here must refuse with the just-committed target rolled
-/// back; an outside→outside move here must still commit —
-/// NEW-50 stabilization at the last instant). Inert unless
-/// armed; production never arms it.
+/// Test-only one-shot relocation hook (P2fix11 NEW-66,
+/// repositioned P2fix13 NEW-74/75): armed by the pin, run once
+/// at the publish envelope boundary — after the commit checks
+/// succeed, BEFORE the fused publish proof (a dir reparented
+/// under the producer tree here must refuse at that proof
+/// with the rename NEVER running and the previously
+/// committed bytes still authoritative; an outside→outside
+/// move here must still commit — NEW-50 stabilization at the
+/// last instant). Inert unless armed; production never
+/// arms it.
 #[cfg(test)]
 mod pre_rename_hook {
     use std::cell::RefCell;
@@ -1700,25 +2048,58 @@ fn with_stage_cleanup_note(primary: std::io::Error, cleanup: std::io::Error) -> 
     )
 }
 
-/// Snapshot the CURRENT checkpoint target bytes (P2fix12
-/// NEW-70 — dirfd-relative, no links followed): the
-/// preservation source for a post-commit refusal. Absent
-/// target ⇒ first commit (nothing to preserve). A
-/// present-but-unreadable target refuses BEFORE the rename
-/// (preservation is impossible — replacing the bytes would
-/// destroy them).
-fn read_checkpoint_target(
-    dir_fd: &std::fs::File,
-    target: &std::ffi::CString,
-    display: &Path,
-) -> std::io::Result<Option<Vec<u8>>> {
-    use std::os::unix::io::AsRawFd as _;
-    // SAFETY: dir_fd is live; the name is a NUL-free file name in it.
+/// Bounded regular-file checkpoint intake (P2fix13 NEW-76):
+/// the ONLY read of the checkpoint file contents. Stats
+/// WITHOUT following links first (a nonregular target —
+/// FIFO, directory, symlink, socket, device — refuses by
+/// KIND naming regularity, before any open is attempted, so
+/// no open can stall or touch the object); then opens
+/// nonblocking and re-proves the OPENED fd as regular (the
+/// stat→open race cannot bless a substituted object), and
+/// requires it within `CHECKPOINT_MAX_BYTES` (fstat + a
+/// capped read that still refuses a file growing past the
+/// bound). Absent ⇒ `None` (fresh start); any other
+/// failure refuses (an unreadable checkpoint must never
+/// silently reset state — torn CONTENT still takes the
+/// §6C-1c discard path above because those bytes were read
+/// successfully).
+fn read_checkpoint_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let lossy = path.display();
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "osslscope: checkpoint path is not a valid file name",
+        )
+    })?;
+    let not_regular = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("osslscope: checkpoint target is not a regular file (refusing intake; {lossy})"),
+        )
+    };
+    // SAFETY: zeroed stat is the C out-parameter idiom; the
+    // path is a NUL-free C string.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: st outlives the call.
+    if unsafe { libc::lstat(c.as_ptr(), &mut st as *mut libc::stat) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(std::io::Error::new(
+            e.kind(),
+            format!("osslscope: checkpoint unreadable at open ({lossy}): {e}"),
+        ));
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(not_regular());
+    }
+    // SAFETY: the path is a NUL-free C string.
     let fd = unsafe {
-        libc::openat(
-            dir_fd.as_raw_fd(),
-            target.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -1727,28 +2108,47 @@ fn read_checkpoint_target(
             return Ok(None);
         }
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "osslscope: checkpoint target unreadable — cannot preserve committed bytes across the commit (refusing before rename; not {}): {e}",
-                display.display()
-            ),
+            e.kind(),
+            format!("osslscope: checkpoint unreadable at open ({lossy}): {e}"),
         ));
     }
-    // SAFETY: openat returned a fresh owned fd.
+    // SAFETY: open returned a fresh owned fd.
     let mut file = unsafe {
         use std::os::fd::FromRawFd as _;
         std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(fd))
     };
-    let mut bytes = Vec::new();
-    use std::io::Read as _;
-    if let Err(e) = file.read_to_end(&mut bytes) {
+    let md = file.metadata()?;
+    if !md.is_file() {
+        return Err(not_regular());
+    }
+    if md.len() > CHECKPOINT_MAX_BYTES {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::InvalidData,
             format!(
-                "osslscope: checkpoint target unreadable — cannot preserve committed bytes across the commit (refusing before rename; not {}): {e}",
-                display.display()
+                "osslscope: checkpoint exceeds the intake bound ({CHECKPOINT_MAX_BYTES} bytes; {lossy})"
             ),
         ));
+    }
+    use std::io::Read as _;
+    let mut bytes = Vec::with_capacity(md.len() as usize);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                bytes.extend_from_slice(&chunk[..n]);
+                if bytes.len() as u64 > CHECKPOINT_MAX_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "osslscope: checkpoint exceeds the intake bound ({CHECKPOINT_MAX_BYTES} bytes; {lossy})"
+                        ),
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(Some(bytes))
 }
@@ -3164,11 +3564,18 @@ impl Presenter {
             // post-publication advance or failure clears any
             // older record (last-good covers it — P2fix12
             // NEW-71 keeps the clear there, and preserves the
-            // FINAL prefix + uncertainty otherwise); a clean
-            // unpublished outgoing epoch clears too (resets
-            // without failure keep existing behavior — the
-            // preserved record always describes the immediately
-            // previous epoch or nothing).
+            // FINAL prefix + uncertainty otherwise). A clean
+            // UNPUBLISHED outgoing epoch KEEPS any existing
+            // record (P2fix13 NEW-77): in a coalesced recovery
+            // scan another reset may have just preserved the
+            // immediately preceding accepted epoch (gen-1
+            // prefix-failed, then gen 2 folds clean and gen 3
+            // resets it in the same scan) — clearing there
+            // discards the accepted predecessor and the
+            // terminal falls back to a stale frame. The record
+            // is only ever replaced by a newer preserved epoch
+            // or cleared by a clean PUBLISHED tenure (whose
+            // last-good is exact and newer).
             if let Some(old) = self.generation {
                 if self.published_generation == Some(old) {
                     // Published tenure (P2fix12 NEW-71):
@@ -3184,7 +3591,10 @@ impl Presenter {
                     // published tip or the tenure failed since;
                     // only a tenure with no post-publication
                     // advance AND no failure clears (last-good
-                    // is exact there).
+                    // is exact there). With an advance/failure
+                    // but no usable preview, keep any existing
+                    // record (P2fix13 NEW-77 — never discard the
+                    // accepted predecessor on missing evidence).
                     let advanced = matches!(
                         (&self.epoch_preview, self.published_tip),
                         (Some(p), Some(t)) if p.generation == old && p.window_seq > t
@@ -3195,7 +3605,7 @@ impl Presenter {
                         && preview.generation == old
                     {
                         self.previous_epoch = Some(preview);
-                    } else {
+                    } else if !advanced && !failed {
                         self.previous_epoch = None;
                     }
                 } else if self.epoch_folded
@@ -3204,9 +3614,9 @@ impl Presenter {
                     && preview.generation == old
                 {
                     self.previous_epoch = Some(preview);
-                } else {
-                    self.previous_epoch = None;
                 }
+                // Else (clean unpublished outgoing): keep any
+                // existing record (P2fix13 NEW-77).
             }
             self.reset_epoch(generation);
         }
@@ -3799,7 +4209,10 @@ impl Presenter {
     /// Load the checkpoint (absent ⇒ fresh; torn ⇒ discard + replay
     /// with unstable-all; owner-busy ⇒ usage error).
     fn load_checkpoint(&mut self) -> std::io::Result<()> {
-        let Ok(body) = std::fs::read(&self.checkpoint_path) else {
+        // Bounded regular-file intake (P2fix13 NEW-76 — a
+        // nonregular or oversize target refuses the open
+        // loudly; absent stays a fresh start).
+        let Some(body) = read_checkpoint_file(&self.checkpoint_path)? else {
             return Ok(());
         };
         let v: serde_json::Value = match serde_json::from_slice(&body) {
@@ -4130,7 +4543,13 @@ impl Presenter {
         // hash-valid record with no current watermark, a
         // same-generation tag, a tip at-or-after the current
         // tip, or non-canonical uncertainty refuses loudly
-        // (never applied as earlier evidence).
+        // (never applied as earlier evidence). The writer's
+        // saturated lane-sum invariant binds too (P2fix13
+        // NEW-79): the fold keeps `calls_total` the saturated
+        // sum of the four lanes (each fold adds the window's
+        // lane sum saturated — proof in the fold drain), so a
+        // hash-valid record disagreeing with its own lanes is
+        // crafted content and refuses the same way.
         if let Some(p) = previous_epoch.as_ref() {
             let Some(wm) = watermark else {
                 return Err(bad("previous_epoch without watermark"));
@@ -4149,6 +4568,13 @@ impl Presenter {
             }
             if !preserved_ranges_canonical(&p.unmeasured) {
                 return Err(bad("previous_epoch ranges not canonical"));
+            }
+            if p.calls_total
+                != p.lanes
+                    .iter()
+                    .fold(0u64, |acc, &lane| acc.saturating_add(lane))
+            {
+                return Err(bad("previous_epoch calls_total"));
             }
         }
         // Validated: apply.
@@ -4227,134 +4653,78 @@ impl Presenter {
         Ok(dir_fd)
     }
 
-    /// Restore preserved target bytes (P2fix12 NEW-70): a fresh
-    /// exclusively-owned stage + write + fsync + rename over
-    /// the target, all dirfd-relative (the same object the
-    /// commit touched). Best-effort dir sync (carried parity).
-    fn restore_target(
+    /// Publish-fused target intake gate (P2fix13 NEW-76 —
+    /// the refresh arm): the publish rename may replace only
+    /// an absent or regular-file target. A substituted
+    /// nonregular target (FIFO, directory, symlink, device)
+    /// refuses WITHOUT opening it (a stat cannot stall), so
+    /// refresh and shutdown stay bounded after substitution
+    /// and the foreign object is never destroyed by the
+    /// rename.
+    fn check_target_replaceable(
         &self,
         dir_fd: &std::fs::File,
         target_c: &std::ffi::CString,
-        bytes: &[u8],
     ) -> std::io::Result<()> {
-        use std::os::fd::FromRawFd as _;
         use std::os::unix::io::AsRawFd as _;
-        let pid = std::process::id();
-        let seq = self.checkpoint_seq;
-        let target_lossy = target_c.to_string_lossy();
-        for attempt in 0..16u32 {
-            let name = format!("{target_lossy}.restore-{pid}-{seq}.{attempt}.tmp");
-            let stage_c = std::ffi::CString::new(name).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "osslscope: checkpoint path without a file name",
-                )
-            })?;
-            // SAFETY: dir_fd is a live open directory fd; the
-            // name is a NUL-free file name (it extends the
-            // target's own file name).
-            let fd = unsafe {
-                libc::openat(
-                    dir_fd.as_raw_fd(),
-                    stage_c.as_ptr(),
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-                    0o644,
-                )
-            };
-            if fd < 0 {
-                let e = std::io::Error::last_os_error();
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    continue;
-                }
-                return Err(e);
+        // SAFETY: zeroed stat is the C out-parameter idiom.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: dir_fd is live; the name is a NUL-free file
+        // name in it; st outlives the call.
+        let rc = unsafe {
+            libc::fstatat(
+                dir_fd.as_raw_fd(),
+                target_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
             }
-            // SAFETY: openat returned a fresh owned fd (O_EXCL
-            // created it — exclusively ours).
-            let mut file = unsafe { std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(fd)) };
-            let staged = (|| -> std::io::Result<()> {
-                use std::io::Write as _;
-                file.write_all(bytes)?;
-                file.sync_all()?;
-                // SAFETY: dir_fd is live; both names are
-                // NUL-free file names in it.
-                if unsafe {
-                    libc::renameat(
-                        dir_fd.as_raw_fd(),
-                        stage_c.as_ptr(),
-                        dir_fd.as_raw_fd(),
-                        target_c.as_ptr(),
-                    )
-                } != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            })();
-            if let Err(e) = staged {
-                if let Err(cleanup) = unlink_checked(dir_fd, &stage_c) {
-                    return Err(with_stage_cleanup_note(e, cleanup));
-                }
-                return Err(e);
-            }
-            let _ = dir_fd.sync_all();
-            return Ok(());
+            return Err(e);
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!(
-                "osslscope: checkpoint restore crowded (not {})",
-                self.checkpoint_path.display()
-            ),
-        ))
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "osslscope: checkpoint target is not a regular file (refusing to replace it; not {})",
+                    self.checkpoint_path.display()
+                ),
+            ));
+        }
+        Ok(())
     }
 
-    /// Post-commit refusal with durability preservation
-    /// (P2fix12 NEW-70): the commit rename already replaced the
-    /// target when the final re-proof failed — restore the last
-    /// COMMITTED bytes over the just-committed target (a
-    /// refusal must never unlink durability into
-    /// nonexistence). First commit (nothing preserved) ⇒
-    /// remove the just-committed target, CHECKED. Every
-    /// cleanup step is checked (P2fix12 NEW-69) — a failed
-    /// restore/unlink returns LOUDLY (the operator must know
-    /// durability is at risk). Always an error (the write
-    /// refused); the placement refusal leads.
-    fn rollback_post_commit(
-        &self,
-        dir_fd: &std::fs::File,
-        target_c: &std::ffi::CString,
-        preserved: Option<Vec<u8>>,
-        placement: std::io::Error,
-    ) -> std::io::Error {
-        match preserved {
-            Some(bytes) => match self.restore_target(dir_fd, target_c, &bytes) {
-                Ok(()) => std::io::Error::new(
-                    placement.kind(),
-                    format!("{placement} (previous committed checkpoint restored)"),
-                ),
-                Err(restore) => std::io::Error::new(
-                    placement.kind(),
-                    format!(
-                        "{placement} (RESTORE FAILED: {restore} — durability at risk; operator must intervene)"
-                    ),
-                ),
-            },
-            None => match unlink_checked(dir_fd, target_c) {
-                Ok(()) => std::io::Error::new(
-                    placement.kind(),
-                    format!("{placement} (no previous checkpoint; just-committed target removed)"),
-                ),
-                Err(cleanup) => std::io::Error::new(
-                    placement.kind(),
-                    format!(
-                        "{placement} (ROLLBACK UNLINK FAILED: {cleanup} — the just-committed bytes may persist; operator must intervene)"
-                    ),
-                ),
-            },
-        }
-    }
-
-    /// Atomic checkpoint write (tmp + fsync + rename + fsync dir).
+    /// Atomic checkpoint write (stage + fsync + publish
+    /// rename + dir sync), placement-held through every
+    /// mutation and publish-last (P2fix13 NEW-74/NEW-75 —
+    /// supersedes the P2fix11 enveloped-write + P2fix12
+    /// preservation/restore protocol):
+    ///
+    /// The placement precondition HOLDS THROUGH the write
+    /// (NEW-74): after the NEW-69 establishment, a
+    /// `PlacementGuard` tripwire watches the opened parent
+    /// and ancestry; every mutation (stage creation, byte
+    /// write, publish rename, stage cleanup) runs fused
+    /// behind a guard proof, and a failed proof performs
+    /// NO further mutation (an owned stage is left in
+    /// place and declared — never unlinked, restored over,
+    /// or renamed on an fd that cannot be proven outside).
+    /// The previously committed checkpoint stays the
+    /// durable authority until the commit SETTLES
+    /// (NEW-75): the target is never touched until the
+    /// publish rename, which runs only behind the final
+    /// fused proof + the NEW-76 target gate and is
+    /// followed only by the directory sync. There is no
+    /// post-commit refusal and nothing to restore — any
+    /// failure or process stop before the rename leaves
+    /// the prior bytes authoritative, and bytes past the
+    /// rename are a settled (proof-gated) publication
+    /// reopen may adopt. No in-memory-only preservation
+    /// window exists.
     fn write_checkpoint(&mut self) -> std::io::Result<()> {
         // Placement at every write (P2fix4 NEW-13/NEW-18): an
         // initially absent directory that became available after
@@ -4377,28 +4747,23 @@ impl Presenter {
             parent.to_path_buf()
         };
         let dir_fd = self.establish_write_precondition(&parent)?;
+        // Placement tripwire (P2fix13 NEW-74): arm the guard
+        // on the SAME opened directory before any mutation —
+        // refusal here is still zero-mutation.
+        let guard = PlacementGuard::arm(&dir_fd, &self.checkpoint_path)?;
         // Fault injection (P2fix8 NEW-50, test-only): run the
         // armed relocation after validation, before the first
         // staging write (placement must stabilize through the
         // validated fd — inert at zero).
         #[cfg(test)]
         post_validation_hook::take_and_run();
-        // Outside placement THROUGH staging (P2fix9 NEW-56):
-        // the opened dir itself may have been reparented after
-        // validation — re-prove fd-anchored ancestry on the SAME
-        // fd immediately before the first staging write.
-        // Occupancy is NOT re-checked (the NEW-50 outside-rename
-        // control requires proceeding when only the PATH moved).
-        // Refusal precedes ANY write (zero bytes land inside).
-        if !opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path)? {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "osslscope: checkpoint dir no longer outside the producer out-DIR at staging (reparented during write; not {})",
-                    self.checkpoint_path.display()
-                ),
-            ));
-        }
+        // Outside placement THROUGH staging (P2fix9 NEW-56,
+        // P2fix13 NEW-74): fused guard proof before the
+        // staging sequence begins. Ancestry-only (the NEW-50
+        // outside-rename control requires proceeding when
+        // only the PATH moved). Refusal precedes ANY write
+        // (zero bytes land inside, no stage exists yet).
+        guard.prove_before(&dir_fd, &self.out_dir, "staging", &self.checkpoint_path)?;
         let bad_name = |what: &str| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -4450,33 +4815,14 @@ impl Presenter {
         let mut attempt = 0u32;
         // Fault injection (P2fix10 NEW-61, test-only): run the
         // armed relocation AFTER the staging re-check SUCCEEDS,
-        // before stage creation (placement must hold THROUGH
-        // creation — inert at zero).
+        // before the creation envelope (placement must hold
+        // THROUGH creation — inert at zero).
         #[cfg(test)]
         post_staging_check_hook::take_and_run();
-        // Outside placement AT stage creation (P2fix10 NEW-61):
-        // re-prove fd-anchored ancestry on the SAME fd fused
-        // with the first staging mutation below (no hook point
-        // between this check and the openat — a relocation
-        // after this check has no deterministic pin; the pin
-        // relocates after the last SUCCESSFUL check, and THIS
-        // check is the one that fails). Ancestry-only (the
-        // NEW-50 outside-rename control requires proceeding when
-        // only the PATH moved). Refusal precedes ANY staging
-        // mutation (zero residue).
-        if !opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path)? {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "osslscope: checkpoint dir no longer outside the producer out-DIR at stage creation (reparented during write; not {})",
-                    self.checkpoint_path.display()
-                ),
-            ));
-        }
-        // Fault injection (P2fix11 NEW-66, test-only): run the
-        // armed relocation AFTER the fused pre-creation proof
-        // SUCCEEDS, before the staging openat (placement must
-        // hold THROUGH creation — inert at zero).
+        // Fault injection (P2fix11 NEW-66, repositioned P2fix13
+        // NEW-74, test-only): run the armed relocation at the
+        // creation envelope boundary, before the fused
+        // pre-creation proof (inert at zero).
         #[cfg(test)]
         post_create_check_hook::take_and_run();
         let (mut stage_file, stage_c) = loop {
@@ -4489,6 +4835,19 @@ impl Presenter {
                     ),
                 ));
             }
+            // Outside placement AT stage creation (P2fix10
+            // NEW-61, P2fix13 NEW-74): fused guard proof
+            // immediately before the openat (no hook point
+            // between this proof and the syscall — a
+            // relocation scheduled at the envelope boundary
+            // is caught HERE, before any staging mutation).
+            // Ancestry-only (same rule as above).
+            guard.prove_before(
+                &dir_fd,
+                &self.out_dir,
+                "stage creation",
+                &self.checkpoint_path,
+            )?;
             let mut name = std::ffi::OsString::from(target_name);
             name.push(format!(".staging-{pid}-{seq}.{attempt}.tmp"));
             let stage_c = std::ffi::CString::new(name.as_os_str().as_bytes())
@@ -4517,40 +4876,20 @@ impl Presenter {
             let file = unsafe { std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(fd)) };
             break (file, stage_c);
         };
-        // Outside placement AFTER stage creation (P2fix11 NEW-66):
-        // re-prove fd-anchored ancestry on the SAME fd fused with
-        // the openat above (no hook point between creation and
-        // this re-proof — a relocation after the pre-creation
-        // check, sequential or concurrent, is caught HERE,
-        // before any byte exists). The stage is EMPTY, so
-        // refusal + unlink stages ZERO bytes. Ancestry-only
-        // (same rule as above). An unreadable ancestry fails
-        // closed the same way (the owned stage unlinks on every
-        // re-proof failure — the NEW-66 enveloped protocol:
-        // PROVE → MUTATE → RE-PROVE at every step, rollback on
-        // any failure, so no write persists beneath the
-        // producer out-DIR).
-        match opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path) {
-            Ok(true) => {}
-            Ok(false) => {
-                let placement = std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "osslscope: checkpoint dir no longer outside the producer out-DIR at stage creation (post) (reparented during write; not {})",
-                        self.checkpoint_path.display()
-                    ),
-                );
-                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
-                    return Err(with_stage_cleanup_note(placement, cleanup));
-                }
-                return Err(placement);
-            }
-            Err(e) => {
-                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
-                    return Err(with_stage_cleanup_note(e, cleanup));
-                }
-                return Err(e);
-            }
+        // Outside placement AFTER stage creation (P2fix11
+        // NEW-66, P2fix13 NEW-74): immediate guard re-proof
+        // fused with the openat above (a true-concurrent move
+        // racing the creation trips here, before any byte
+        // exists). On failure the EMPTY owned stage is LEFT
+        // in place (placement gates cleanup too — no unlink
+        // runs on an unproven fd).
+        if let Err(e) = guard.prove_after(
+            &dir_fd,
+            &self.out_dir,
+            "stage creation (post)",
+            &self.checkpoint_path,
+        ) {
+            return Err(with_stage_left_note(e));
         }
         {
             use std::io::Write as _;
@@ -4567,175 +4906,121 @@ impl Presenter {
             // the first byte (inert at zero).
             #[cfg(test)]
             pre_first_write_hook::take_and_run();
-            let staged = (|| -> std::io::Result<()> {
-                // Outside placement AT the first byte (P2fix10
-                // NEW-61): re-prove fd-anchored ancestry on the
-                // SAME fd fused with the byte write below (no
-                // hook point between this check and write_all —
-                // a relocation after this check has no
-                // deterministic pin; the pin relocates after the
-                // last SUCCESSFUL check, and THIS check is the
-                // one that fails). The owned stage is EMPTY at
-                // this point, so refusal + unlink writes ZERO
-                // bytes (NEW-45 cleanup below unlinks on EVERY
-                // pre-commit failure, placement included).
-                // Ancestry-only (same rule as above).
-                if !opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path)? {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "osslscope: checkpoint dir no longer outside the producer out-DIR at first write (reparented during write; not {})",
-                            self.checkpoint_path.display()
-                        ),
-                    ));
-                }
+            // Outside placement AT the first byte (P2fix10
+            // NEW-61, P2fix13 NEW-74): fused guard proof
+            // immediately before write_all (no hook point
+            // between). The owned stage is EMPTY here, so a
+            // refusal writes ZERO bytes (and leaves the empty
+            // stage declared — cleanup needs placement too).
+            if let Err(e) =
+                guard.prove_before(&dir_fd, &self.out_dir, "first write", &self.checkpoint_path)
+            {
+                return Err(with_stage_left_note(e));
+            }
+            let written = (|| -> std::io::Result<()> {
                 if injected {
                     return Err(std::io::Error::from_raw_os_error(libc::EIO));
                 }
                 stage_file.write_all(&bytes)?;
-                // Fault injection (P2fix11 NEW-66, test-only):
-                // run the armed relocation AFTER the first bytes
-                // land (the owned stage is NON-empty here) and
-                // before the fsync (the TRUE mid-write pin —
-                // inert at zero).
-                #[cfg(test)]
-                mid_write_hook::take_and_run();
-                stage_file.sync_all()?;
-                // Outside placement AFTER the data write (P2fix11
-                // NEW-66): re-prove fd-anchored ancestry on the
-                // SAME fd fused with the write_all/sync_all above
-                // (no hook point between the bytes and this
-                // re-proof — a relocation after the pre-write
-                // check, sequential or concurrent, is caught
-                // HERE). Refusal returns Err through the NEW-45
-                // cleanup below (unlink — the bytes never
-                // persist). Ancestry-only (same rule as above).
-                if !opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path)? {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "osslscope: checkpoint dir no longer outside the producer out-DIR at first write (post) (reparented during write; not {})",
-                            self.checkpoint_path.display()
-                        ),
-                    ));
-                }
                 Ok(())
             })();
-            // Owned-stage cleanup on EVERY pre-commit failure
-            // (P2fix7 NEW-45 — write/sync, not just rename): the
-            // stage is exclusively ours (O_EXCL created it this
-            // call), so a failed write/sync unlinks it instead of
-            // leaking it — staged retries reuse the same
-            // committed sequence, and leaked names would exhaust
-            // the 16-attempt bound and wedge export offline after
-            // storage recovers.
-            if let Err(e) = staged {
-                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
-                    return Err(with_stage_cleanup_note(e, cleanup));
-                }
-                return Err(e);
+            if let Err(e) = written {
+                return Err(cleanup_stage(
+                    &guard,
+                    &dir_fd,
+                    &stage_c,
+                    &self.out_dir,
+                    &self.checkpoint_path,
+                    e,
+                ));
+            }
+            // Fault injection (P2fix11 NEW-66, test-only):
+            // run the armed relocation AFTER the first bytes
+            // land (the owned stage is NON-empty here) and
+            // before the fsync (the TRUE mid-write pin —
+            // inert at zero).
+            #[cfg(test)]
+            mid_write_hook::take_and_run();
+            // Outside placement AFTER the data write (P2fix11
+            // NEW-66, P2fix13 NEW-74): guard re-proof fused
+            // with the write above (a mid-write move refuses
+            // BEFORE the sync; the staged bytes never
+            // publish, and no further mutation runs).
+            if let Err(e) = guard.prove_after(
+                &dir_fd,
+                &self.out_dir,
+                "first write (post)",
+                &self.checkpoint_path,
+            ) {
+                return Err(with_stage_left_note(e));
+            }
+            if let Err(e) = stage_file.sync_all() {
+                return Err(cleanup_stage(
+                    &guard,
+                    &dir_fd,
+                    &stage_c,
+                    &self.out_dir,
+                    &self.checkpoint_path,
+                    e,
+                ));
             }
         }
         // Fault injection (P2fix9 NEW-56, test-only): run the
         // armed pre-commit relocation after the stage write,
-        // before the commit rename (placement must hold THROUGH
+        // before the commit proof (placement must hold THROUGH
         // the commit — inert at zero).
         #[cfg(test)]
         pre_commit_hook::take_and_run();
-        // Outside placement THROUGH the commit (P2fix9 NEW-56):
-        // re-prove fd-anchored ancestry on the SAME fd
-        // immediately before the rename — a dir reparented
-        // under the producer tree after staging must not
-        // commit there. The owned stage is unlinked on
-        // refusal (NEW-45 cleanup covers EVERY pre-commit
-        // failure, placement included).
-        match opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path) {
-            Ok(true) => {}
-            Ok(false) => {
-                let placement = std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "osslscope: checkpoint dir no longer outside the producer out-DIR at commit (reparented during write; not {})",
-                        self.checkpoint_path.display()
-                    ),
-                );
-                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
-                    return Err(with_stage_cleanup_note(placement, cleanup));
-                }
-                return Err(placement);
-            }
-            Err(e) => {
-                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
-                    return Err(with_stage_cleanup_note(e, cleanup));
-                }
-                return Err(e);
-            }
+        // Outside placement THROUGH the commit (P2fix9 NEW-56,
+        // P2fix13 NEW-74): fused guard proof — a dir
+        // reparented under the producer tree after staging
+        // must not commit there (the stage is left declared).
+        if let Err(e) = guard.prove_before(&dir_fd, &self.out_dir, "commit", &self.checkpoint_path)
+        {
+            return Err(with_stage_left_note(e));
         }
         // Fault injection (P2fix10 NEW-61, test-only): run the
         // armed relocation AFTER the commit re-check SUCCEEDS,
-        // before the commit rename (placement must hold THROUGH
-        // the rename — inert at zero).
+        // before the publish proof (placement must hold
+        // THROUGH the rename — inert at zero).
         #[cfg(test)]
         post_commit_check_hook::take_and_run();
-        // Outside placement AT the rename (P2fix10 NEW-61):
-        // re-prove fd-anchored ancestry on the SAME fd fused
-        // with the renameat below (no hook point between this
-        // check and the rename — a relocation after this check
-        // has no deterministic pin; the pin relocates after the
-        // last SUCCESSFUL check, and THIS check is the one that
-        // fails). The owned stage is unlinked on refusal
-        // (NEW-45 cleanup covers EVERY pre-commit failure,
-        // placement included). Ancestry-only (same rule as
-        // above).
-        match opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path) {
-            Ok(true) => {}
-            Ok(false) => {
-                let placement = std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "osslscope: checkpoint dir no longer outside the producer out-DIR at commit rename (reparented during write; not {})",
-                        self.checkpoint_path.display()
-                    ),
-                );
-                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
-                    return Err(with_stage_cleanup_note(placement, cleanup));
-                }
-                return Err(placement);
-            }
-            Err(e) => {
-                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
-                    return Err(with_stage_cleanup_note(e, cleanup));
-                }
-                return Err(e);
-            }
-        }
-        // Committed-bytes preservation read (P2fix12 NEW-70):
-        // snapshot the CURRENT target bytes BEFORE the commit
-        // rename (dirfd-relative — the same object the rename
-        // replaces), so a post-commit refusal restores them
-        // instead of unlinking durability into nonexistence.
-        // Absent target ⇒ first commit (nothing to preserve);
-        // present-but-unreadable ⇒ clean the owned stage
-        // (CHECKED) and refuse BEFORE the rename (preservation
-        // is impossible — replacing the bytes would destroy
-        // them).
-        let preserved_target =
-            match read_checkpoint_target(&dir_fd, &target_c, &self.checkpoint_path) {
-                Ok(preserved) => preserved,
-                Err(e) => {
-                    if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
-                        return Err(with_stage_cleanup_note(e, cleanup));
-                    }
-                    return Err(e);
-                }
-            };
-        // Fault injection (P2fix11 NEW-66, test-only): run the
-        // armed relocation AFTER the fused pre-rename proof
-        // SUCCEEDS (the FINAL successful check on the mutation
-        // path), before the commit renameat (placement must hold
-        // THROUGH the commit — inert at zero).
+        // Fault injection (P2fix11 NEW-66, repositioned P2fix13
+        // NEW-74/75, test-only): run the armed relocation at
+        // the publish envelope boundary, before the fused
+        // publish proof (inert at zero).
         #[cfg(test)]
         pre_rename_hook::take_and_run();
+        // PUBLISH proof (P2fix13 NEW-74/NEW-75 — the FINAL
+        // proof, fused with the target gate + renameat below;
+        // no hook point and no other work intervenes): a dir
+        // reparented under the producer tree refuses HERE,
+        // with the previously committed bytes still the
+        // durable authority (the target was never touched —
+        // no restore exists or is needed). Ancestry-only
+        // (the NEW-50 outside→outside move at the last
+        // instant still commits through the validated fd).
+        if let Err(e) = guard.prove_before(
+            &dir_fd,
+            &self.out_dir,
+            "commit rename",
+            &self.checkpoint_path,
+        ) {
+            return Err(with_stage_left_note(e));
+        }
+        // Target intake gate (P2fix13 NEW-76): fused between
+        // the publish proof and the rename (stat-only — a
+        // substituted FIFO refuses promptly and survives).
+        if let Err(e) = self.check_target_replaceable(&dir_fd, &target_c) {
+            return Err(cleanup_stage(
+                &guard,
+                &dir_fd,
+                &stage_c,
+                &self.out_dir,
+                &self.checkpoint_path,
+                e,
+            ));
+        }
         // SAFETY: dir_fd is live; both names are NUL-free file
         // names in it (the target extends no path).
         if unsafe {
@@ -4748,57 +5033,30 @@ impl Presenter {
         } != 0
         {
             let e = std::io::Error::last_os_error();
-            // Cleanup of OUR stage (exclusively owned — created
-            // this call, never shared, never another writer's),
-            // CHECKED (P2fix12 NEW-69).
-            if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
-                return Err(with_stage_cleanup_note(e, cleanup));
-            }
-            return Err(e);
+            // Cleanup of OUR stage (exclusively owned —
+            // created this call), placement-gated + CHECKED
+            // (P2fix13 NEW-74, P2fix12 NEW-69). The rename is
+            // atomic: on failure the target still holds the
+            // previously committed bytes (P2fix13 NEW-75).
+            return Err(cleanup_stage(
+                &guard,
+                &dir_fd,
+                &stage_c,
+                &self.out_dir,
+                &self.checkpoint_path,
+                e,
+            ));
         }
-        // Directory fsync BEFORE the final re-proof (P2fix12
-        // NEW-69): no placement-sensitive mutation follows the
-        // last proof — only fd-stable rollback cleanup (which
-        // is declared cleanup, never proof-covered mutation).
-        // Best-effort (carried parity — the stage file itself
-        // is fsynced above; a dir-sync failure must not fail
-        // the commit).
+        // Directory fsync settles the publication (P2fix13
+        // NEW-75): after the rename the new bytes ARE the
+        // committed checkpoint (a settled, proof-gated
+        // publication — reopen may adopt them); nothing
+        // remains that could refuse. Best-effort (carried
+        // parity — the stage file itself is fsynced above; a
+        // dir-sync failure must not fail the commit).
+        // Post-completion external renames of the directory
+        // are outside any writer's control.
         let _ = dir_fd.sync_all();
-        // Outside placement AFTER the commit (P2fix11 NEW-66):
-        // re-prove fd-anchored ancestry on the SAME fd fused with
-        // the renameat above (no hook point between the rename
-        // and this re-proof — a relocation after the fused
-        // pre-rename check, sequential or concurrent, is caught
-        // HERE). On failure the write refuses LOUDLY and the
-        // last COMMITTED bytes are restored over the
-        // just-committed target (P2fix12 NEW-70 — a refusal must
-        // never unlink durability into nonexistence);
-        // post-completion external renames are outside any
-        // writer's control. An unreadable ancestry fails closed
-        // the same way. Ancestry-only (same rule as above —
-        // the NEW-50 outside→outside move at the last instant
-        // still commits).
-        match opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path) {
-            Ok(true) => {}
-            Ok(false) => {
-                let placement = std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "osslscope: checkpoint dir no longer outside the producer out-DIR at commit (post) (reparented during write; not {})",
-                        self.checkpoint_path.display()
-                    ),
-                );
-                return Err(self.rollback_post_commit(
-                    &dir_fd,
-                    &target_c,
-                    preserved_target,
-                    placement,
-                ));
-            }
-            Err(e) => {
-                return Err(self.rollback_post_commit(&dir_fd, &target_c, preserved_target, e));
-            }
-        }
         Ok(())
     }
 
@@ -5994,6 +6252,28 @@ mod tests {
             .collect()
     }
 
+    /// The single declared stage left by a placement refusal
+    /// (P2fix13 NEW-74 — cleanup is placement-gated, so the
+    /// stage remains exactly as it stood when placement
+    /// failed): asserts exactly one residue entry and returns
+    /// (name, byte length, embedded `checkpoint_seq` when the
+    /// stage carries a parseable body — proving which write
+    /// it belonged to and that nothing mutated it since).
+    fn single_left_stage(dir: &Path) -> (String, u64, Option<u64>) {
+        let residue = staging_residue(dir);
+        assert_eq!(
+            residue.len(),
+            1,
+            "exactly one declared stage: {residue:?} in {}",
+            dir.display()
+        );
+        let bytes = std::fs::read(dir.join(&residue[0])).unwrap();
+        let seq = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("checkpoint_seq").and_then(|s| s.as_u64()));
+        (residue.into_iter().next().unwrap(), bytes.len() as u64, seq)
+    }
+
     #[test]
     fn new45_stage_cleaned_on_write_failure_recovers() {
         // P2fix7 NEW-45: 20 consecutive stage-write failures at a
@@ -6297,13 +6577,15 @@ mod tests {
 
     #[test]
     fn new56_reparent_between_staging_and_commit_refuses_commit() {
-        // P2fix9 NEW-56: outside placement holds THROUGH the
-        // commit — a dir reparented under the producer tree
-        // AFTER the stage write refuses the rename (the target
-        // name never appears there) and the owned stage is
-        // cleaned. Pre-fix: the rename commits inside (RED).
-        // Post-fix: the pre-commit ancestry re-check refuses
-        // (GREEN).
+        // P2fix9 NEW-56 (P2fix13 NEW-74 semantics): outside
+        // placement holds THROUGH the commit — a dir
+        // reparented under the producer tree AFTER the stage
+        // write refuses the rename (the target name never
+        // appears there) and NO further mutation runs: the
+        // owned stage is LEFT declared (cleanup is
+        // placement-gated — P2fix13 supersedes the P2fix9
+        // unlink-on-refusal expectation). Pre-fix: the
+        // rename commits inside (RED).
         let base = unique_dir("reparent-before-commit");
         let out = base.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -6345,10 +6627,20 @@ mod tests {
             before,
             "the commit never replaced the checkpoint"
         );
+        // No mutation after the move (P2fix13 NEW-74): the
+        // written stage stands exactly as staged (its body
+        // carries the refused write's bumped sequence), and
+        // the refusal declares it.
         assert!(
-            staging_residue(&target).is_empty(),
-            "the owned stage is cleaned on refusal: {:?}",
-            staging_residue(&target)
+            format!("{err:?}").contains("stage left in place"),
+            "the refusal declares the left stage: {err:?}"
+        );
+        let (_name, len, stage_seq) = single_left_stage(&target);
+        assert!(len > 0, "the staged bytes stand untouched");
+        assert_eq!(
+            stage_seq,
+            Some(presenter.checkpoint_seq),
+            "the left stage is the refused write's own"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -6412,10 +6704,12 @@ mod tests {
 
     #[test]
     fn new61_mid_write_move_refuses_with_zero_bytes() {
-        // P2fix10 NEW-61 mid-write pin: the hook fires after stage
-        // creation (the owned stage is EMPTY) and before the first
-        // byte — the fused pre-write check must refuse + unlink
-        // with ZERO bytes written (the hook records the stage
+        // P2fix10 NEW-61 mid-write pin (P2fix13 NEW-74
+        // semantics): the hook fires after stage creation (the
+        // owned stage is EMPTY) and before the first byte —
+        // the fused pre-write proof must refuse with ZERO
+        // bytes written and no cleanup mutation (the empty
+        // stage is left declared; the hook records the stage
         // size at move time: empty). Pre-fix: the bytes are
         // written + committed inside (RED).
         let base = unique_dir("mid-write-move");
@@ -6474,11 +6768,11 @@ mod tests {
             format!("{err:?}").contains("at first write"),
             "the refusal names the fused checkpoint: {err:?}"
         );
-        assert!(
-            staging_residue(&target).is_empty(),
-            "the empty stage is cleaned on refusal: {:?}",
-            staging_residue(&target)
-        );
+        // No cleanup mutation without placement (P2fix13
+        // NEW-74): the EMPTY stage stands exactly as created.
+        let (_name, len, stage_seq) = single_left_stage(&target);
+        assert_eq!(len, 0, "zero bytes were ever written");
+        assert_eq!(stage_seq, None, "an empty stage carries no body");
         assert_eq!(
             std::fs::read(target.join("ckpt.json")).unwrap(),
             before,
@@ -6489,12 +6783,12 @@ mod tests {
 
     #[test]
     fn new61_reparent_after_commit_check_refuses_rename() {
-        // P2fix10 NEW-61 (+ NEW-13/NEW-26/NEW-34/NEW-50/NEW-56-OPEN):
-        // the hook fires AFTER the commit re-check SUCCEEDS (after
-        // the last successful commit check) — the fused pre-rename
-        // check must refuse the rename + clean the owned stage
-        // (checkpoint bytes untouched, zero residue). Pre-fix: the
-        // rename commits inside (RED).
+        // P2fix10 NEW-61 (+ NEW-13/NEW-26/NEW-34/NEW-50/NEW-56-OPEN;
+        // P2fix13 NEW-74/75 publish): the hook fires AFTER the
+        // commit re-check SUCCEEDS — the fused publish proof
+        // must refuse with the rename NEVER running (checkpoint
+        // bytes untouched, the written stage left declared).
+        // Pre-fix: the rename commits inside (RED).
         let base = unique_dir("reparent-after-commit-check");
         let out = base.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -6536,10 +6830,14 @@ mod tests {
             before,
             "the commit never replaced the checkpoint"
         );
-        assert!(
-            staging_residue(&target).is_empty(),
-            "the owned stage is cleaned on refusal: {:?}",
-            staging_residue(&target)
+        // No mutation after the move (P2fix13 NEW-74): the
+        // written stage stands exactly as staged.
+        let (_name, len, stage_seq) = single_left_stage(&target);
+        assert!(len > 0, "the staged bytes stand untouched");
+        assert_eq!(
+            stage_seq,
+            Some(presenter.checkpoint_seq),
+            "the left stage is the refused write's own"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -6547,14 +6845,14 @@ mod tests {
     #[test]
     fn new66_reparent_after_create_check_refuses_with_zero_staged() {
         // P2fix11 NEW-66 (+ NEW-13/NEW-26/NEW-34/NEW-50/NEW-56/
-        // NEW-61-OPEN): the relocation hook fires AFTER the fused
-        // pre-creation proof SUCCEEDS (after the last successful
-        // creation check), before the staging openat — the
-        // POST-creation re-proof must refuse before ANY byte
-        // exists (zero residue, pre-existing bytes untouched).
-        // Pre-fix: the stage is created inside and the refusal
-        // lands late ("at first write") — the creation step has
-        // no re-proof (RED).
+        // NEW-61-OPEN; repositioned P2fix13 NEW-74): the
+        // relocation hook fires at the creation envelope
+        // boundary, before the fused pre-creation proof — the
+        // proof itself must refuse with NO creation at all
+        // (absence of the inside mutation, not a created-then-
+        // rolled-back stage: zero residue, pre-existing bytes
+        // untouched). Pre-fix: the stage is created inside and
+        // the refusal lands late (RED).
         let base = unique_dir("reparent-after-create-check");
         let out = base.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -6588,12 +6886,13 @@ mod tests {
             "the relocation hook ran after the creation check"
         );
         assert!(
-            format!("{err:?}").contains("at stage creation (post)"),
-            "the refusal names the post-creation re-proof: {err:?}"
+            format!("{err:?}").contains("at stage creation")
+                && !format!("{err:?}").contains("(post)"),
+            "the refusal names the fused pre-creation proof (no creation ran): {err:?}"
         );
         assert!(
             staging_residue(&target).is_empty(),
-            "no stage file persists inside: {:?}",
+            "no stage file was created inside: {:?}",
             staging_residue(&target)
         );
         assert_eq!(
@@ -6605,15 +6904,18 @@ mod tests {
     }
 
     #[test]
-    fn new66_true_mid_write_move_refuses_with_rollback() {
+    fn new66_true_mid_write_move_refuses_without_further_mutation() {
         // P2fix11 NEW-66 (+ NEW-61-OPEN — the TRUE mid-write
-        // pin): the hook fires AFTER the first bytes land in
-        // the owned stage (NON-empty — recorded as the proof)
-        // and before the fsync — the POST-write re-proof must
-        // refuse + unlink (zero residue, pre-existing bytes
-        // untouched). Pre-fix: the bytes sit inside through
-        // the sync and the refusal lands late ("at commit") —
-        // the write step has no re-proof (RED).
+        // pin; P2fix13 NEW-74 semantics, supersedes the
+        // refusal-with-rollback shape): the hook fires AFTER
+        // the first bytes land in the owned stage (NON-empty
+        // — recorded as the proof) and before the fsync — the
+        // post-write re-proof must refuse with NO further
+        // mutation (no sync, no unlink, no rename: the stage
+        // stands byte-identical to its state at move time,
+        // pre-existing bytes untouched, nothing publishes).
+        // Pre-fix: the bytes sit inside through the sync and
+        // the refusal lands late (RED).
         let base = unique_dir("true-mid-write-move");
         let out = base.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -6669,10 +6971,19 @@ mod tests {
             format!("{err:?}").contains("at first write (post)"),
             "the refusal names the post-write re-proof: {err:?}"
         );
-        assert!(
-            staging_residue(&target).is_empty(),
-            "the written stage is rolled back on refusal: {:?}",
-            staging_residue(&target)
+        // No mutation after the move (P2fix13 NEW-74): the
+        // stage stands at EXACTLY its move-time size and
+        // carries the refused write's sequence.
+        let (_name, len, stage_seq) = single_left_stage(&target);
+        assert_eq!(
+            len,
+            size_at_move.load(std::sync::atomic::Ordering::Relaxed),
+            "no byte landed or left after the move"
+        );
+        assert_eq!(
+            stage_seq,
+            Some(presenter.checkpoint_seq),
+            "the left stage is the refused write's own"
         );
         assert_eq!(
             std::fs::read(target.join("ckpt.json")).unwrap(),
@@ -6683,21 +6994,23 @@ mod tests {
     }
 
     #[test]
-    fn new70_post_rename_refusal_preserves_committed_bytes() {
-        // P2fix12 NEW-70 (+ NEW-2/NEW-9/NEW-16/NEW-22/NEW-33/
-        // NEW-50/NEW-56/NEW-66-OPEN — SUPERSEDES the P2fix11
-        // NEW-66 rollback-to-nonexistence pin: codex R12
-        // rejects destroying the durable checkpoint on
-        // refusal). The hook fires AFTER the fused pre-rename
-        // proof SUCCEEDS (the FINAL successful check on the
-        // mutation path), before the commit renameat — the
-        // POST-commit re-proof must refuse AND the last
-        // COMMITTED bytes must survive (restored over the
-        // just-committed target — a refusal must never unlink
-        // the durable checkpoint into nonexistence); zero
-        // stage residue. Pre-fix: the target is unlinked
-        // (missing — restart continuity destroyed) (RED).
-        let base = unique_dir("reparent-after-final-check");
+    fn new75_late_abort_never_replaces_committed_bytes() {
+        // P2fix13 NEW-75 (+ NEW-2/NEW-9/NEW-16/NEW-22/NEW-33/
+        // NEW-50/NEW-56/NEW-66/NEW-70-OPEN — SUPERSEDES the
+        // P2fix12 NEW-70 post-rename-restore pin: codex R13
+        // rejects overwriting + syncing the target before
+        // placement resolves with the prior bytes held only
+        // in memory). Publish-last: the relocation hook
+        // fires at the publish envelope boundary (after the
+        // commit checks, before the fused publish proof) —
+        // the proof refuses with the rename NEVER running:
+        // the last COMMITTED bytes remain the durable
+        // authority (never replaced, so nothing needs
+        // restoring and no restore file is ever written),
+        // the written stage is left declared, and a reopen
+        // after the dir is returned outside adopts the prior
+        // transaction exactly.
+        let base = unique_dir("late-abort-authority");
         let out = base.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
@@ -6713,6 +7026,7 @@ mod tests {
             Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
         presenter.build_service().expect("first fold commits");
         let before = std::fs::read(&ckpt).unwrap();
+        let before_seq = presenter.checkpoint_seq;
         let target = out.join("p-moved");
         let (p2, target2) = (p.clone(), target.clone());
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -6723,26 +7037,62 @@ mod tests {
         });
         let err = presenter
             .flush_checkpoint()
-            .expect_err("reparent after the final check must refuse");
+            .expect_err("reparent at the publish boundary must refuse");
         super::pre_rename_hook::disarm();
         assert!(
             ran.load(std::sync::atomic::Ordering::Relaxed),
-            "the relocation hook ran after the final check"
+            "the relocation hook ran at the publish boundary"
         );
         assert!(
-            format!("{err:?}").contains("at commit (post)"),
-            "the refusal names the post-commit re-proof: {err:?}"
+            format!("{err:?}").contains("at commit rename"),
+            "the refusal names the fused publish proof: {err:?}"
         );
         assert_eq!(
             std::fs::read(target.join("ckpt.json")).unwrap(),
             before,
-            "the last COMMITTED bytes survive the refusal (restored, never unlinked into nonexistence)"
+            "the last COMMITTED bytes were never replaced (publish-last — no restore needed)"
+        );
+        // No inside mutations of any kind (P2fix13 NEW-74):
+        // the moved dir holds EXACTLY the pre-existing
+        // checkpoint + the declared stage (no restore file,
+        // no second stage, no replacement).
+        let entries: Vec<String> = std::fs::read_dir(&target)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            2,
+            "only the committed checkpoint + the declared stage: {entries:?}"
         );
         assert!(
-            staging_residue(&target).is_empty(),
-            "zero stage residue on refusal: {:?}",
-            staging_residue(&target)
+            entries.iter().all(|n| !n.contains(".restore-")),
+            "no restore write ever ran beneath the producer: {entries:?}"
         );
+        let (_name, len, stage_seq) = single_left_stage(&target);
+        assert!(len > 0, "the staged bytes stand untouched");
+        assert_eq!(
+            stage_seq,
+            Some(presenter.checkpoint_seq),
+            "the left stage is the refused write's own (bumped past the authority)"
+        );
+        assert!(
+            stage_seq > Some(before_seq),
+            "premise: the refused stage is NEWER than the authority"
+        );
+        // Reopen adopts the prior transaction exactly (the
+        // dir returned outside first — a checkpoint inside
+        // the producer tree refuses at open by placement).
+        let back = base.join("p-back");
+        std::fs::rename(&target, &back).unwrap();
+        let q = Presenter::open_with_checkpoint(&out, &back.join("ckpt.json"), 1, "export")
+            .expect("reopen on the prior committed checkpoint");
+        assert_eq!(
+            q.checkpoint_seq, before_seq,
+            "reopen adopts the prior committed sequence, never the refused stage"
+        );
+        assert_eq!(q.watermark, Some(0), "the prior watermark stands");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -6809,12 +7159,13 @@ mod tests {
         // attempts commit, parked-inside attempts cannot resolve
         // (open race, accounted), and storm attempts race the
         // move mid-flight. EVERY attempt is accounted (committed
-        // / post-bump placement-refused / other); no `.staging-`
-        // file persists ANYWHERE afterwards; every surviving
+        // / post-bump placement-refused / other); every surviving
         // checkpoint carries a committed sequence (never a
-        // refused one). (The hook pins above carry the RED→GREEN;
-        // this pin proves the end-to-end invariant holds its
-        // accounting under real races.)
+        // refused one) and every persisting stage belongs to an
+        // uncommitted attempt (P2fix13 NEW-74 — placement-gated
+        // cleanup leaves declared stages). (The hook pins above
+        // carry the RED→GREEN; this pin proves the end-to-end
+        // invariant holds its accounting under real races.)
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
         let base = unique_dir("reparent-storm");
@@ -6944,15 +7295,30 @@ mod tests {
             committed.len() >= 4,
             "parked attempts commit (storm progress not required)"
         );
-        // No staging file persists ANYWHERE (both placements).
+        // Stage residue accounting (P2fix13 NEW-74 —
+        // placement-gated cleanup legitimately LEAVES stages
+        // whose placement failed mid-flight; supersedes the
+        // zero-residue expectation): every persisting stage
+        // belongs to an UNCOMMITTED attempt (its filename
+        // sequence was never committed), and no residue is
+        // ever a checkpoint (adoption reads the target name
+        // only — the surviving-checkpoint audit below binds).
         for dir in [&p, &ps] {
             if dir.is_dir() {
-                let residue = staging_residue(dir);
-                assert!(
-                    residue.is_empty(),
-                    "zero stage residue in {}: {residue:?}",
-                    dir.display(),
-                );
+                for name in staging_residue(dir) {
+                    // `{target}.staging-{pid}-{seq}.{attempt}.tmp`
+                    let seq: u64 = name
+                        .rsplit(".staging-")
+                        .next()
+                        .and_then(|rest| rest.split('-').nth(1))
+                        .and_then(|s| s.split('.').next())
+                        .and_then(|s| s.parse().ok())
+                        .expect("stage name carries its sequence");
+                    assert!(
+                        !committed.contains(&seq),
+                        "residue stage seq {seq} never committed ({name})"
+                    );
+                }
             }
         }
         // Every surviving checkpoint carries a COMMITTED
@@ -7409,14 +7775,18 @@ mod tests {
     }
 
     #[test]
-    fn new70_unreadable_target_refuses_before_rename() {
-        // P2fix12 NEW-70 (+ NEW-22/NEW-56-OPEN): preservation
-        // must be POSSIBLE before the commit rename runs — a
-        // pre-existing checkpoint target that cannot be read
-        // back (EACCES) refuses BEFORE the rename (its bytes
-        // cannot be preserved, so replacing them is durability
-        // loss). Pre-fix: the flush succeeds and the
-        // unreadable bytes are destroyed (RED).
+    fn new75_unreadable_regular_target_replaced_without_read() {
+        // P2fix13 NEW-75 (supersedes the P2fix12 NEW-70
+        // preservation-readability pin): publish-last removed
+        // the preservation read — the write path never reads
+        // the target, so an UNREADABLE regular target no
+        // longer blocks the commit (durability on refusal no
+        // longer depends on reading the bytes back: a refusal
+        // never replaces them in the first place). The flush
+        // replaces it through the ordinary rename (directory
+        // write permission governs) and the fresh checkpoint
+        // reloads. (Startup INTAKE unreadability is NEW-76's
+        // refusal, pinned separately.)
         use std::os::unix::fs::PermissionsExt as _;
         let base = unique_dir("unreadable-target");
         let out = base.join("out");
@@ -7434,23 +7804,24 @@ mod tests {
             Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
         presenter.build_service().expect("first fold commits");
         let before = std::fs::read(&ckpt).unwrap();
+        let seq_before = presenter.checkpoint_seq;
         std::fs::set_permissions(&ckpt, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let err = presenter
+        presenter
             .flush_checkpoint()
-            .expect_err("an unreadable target must refuse before the rename");
-        assert!(
-            format!("{err:?}").contains("preserve"),
-            "the refusal names preservation: {err:?}"
-        );
-        std::fs::set_permissions(&ckpt, std::fs::Permissions::from_mode(0o644)).unwrap();
+            .expect("the write path never reads the target (publish-last)");
+        let after = std::fs::read(&ckpt).unwrap();
+        assert_ne!(after, before, "the commit replaced the unreadable target");
+        let v: serde_json::Value = serde_json::from_slice(&after).unwrap();
         assert_eq!(
-            std::fs::read(&ckpt).unwrap(),
-            before,
-            "the unreadable target is never replaced"
+            v["checkpoint_seq"],
+            serde_json::json!(seq_before + 1),
+            "the replacement carries the new sequence"
         );
+        Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("the fresh checkpoint reloads");
         assert!(
             staging_residue(&p).is_empty(),
-            "zero stage residue on pre-rename refusal: {:?}",
+            "zero stage residue after the commit: {:?}",
             staging_residue(&p)
         );
         let _ = std::fs::remove_dir_all(&base);
@@ -7516,14 +7887,19 @@ mod tests {
     #[test]
     fn new69_movement_within_mutation_interval_accounted() {
         // P2fix12 NEW-69 (+ NEW-13/NEW-26/NEW-34/NEW-50/NEW-56/
-        // NEW-61/NEW-66-OPEN): movement scheduled at EVERY
-        // hook point WITHIN the mutation interval refuses
-        // with zero stage residue and the last committed
-        // bytes intact — establishment-phase moves refuse
-        // BEFORE any mutation; the final-gap move (after the
-        // last proof) refuses with the committed bytes
-        // restored (NEW-70). Pre-fix: the final-gap schedule
-        // unlinks the checkpoint into nonexistence (RED).
+        // NEW-61/NEW-66-OPEN; P2fix13 NEW-74/75 semantics —
+        // supersedes the zero-residue/final-gap-restore shape):
+        // movement scheduled at EVERY hook point WITHIN the
+        // mutation interval refuses with the last committed
+        // bytes intact (never replaced — publish-last) and NO
+        // inside mutation attributable to the writer: moves
+        // before stage creation leave no stage at all; a move
+        // at/after creation leaves exactly the stage as it
+        // stood when placement failed (cleanup is
+        // placement-gated, so nothing unlinks/renames/writes
+        // after the move). Pre-fix: late schedules mutate
+        // beneath the producer and the final gap restores
+        // from memory (RED).
         let points = [
             "post_validation",
             "post_staging_check",
@@ -7593,18 +7969,291 @@ mod tests {
                 format!("{err:?}").contains("outside the producer out-DIR"),
                 "the {point} refusal names placement: {err:?}"
             );
+            // Absence of inside mutations per point (P2fix13
+            // NEW-74): pre-creation envelopes left no stage;
+            // later points left exactly the stage as it stood
+            // (nothing unlinked/renamed/wrote after the move);
+            // no restore file ever appears.
+            let entries: Vec<String> = std::fs::read_dir(&target)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
             assert!(
-                staging_residue(&target).is_empty(),
-                "zero stage residue after a {point} move: {:?}",
-                staging_residue(&target)
+                entries.iter().all(|n| !n.contains(".restore-")),
+                "no restore write after a {point} move: {entries:?}"
             );
+            match point {
+                "post_validation" | "post_staging_check" | "post_create_check" => {
+                    assert!(
+                        staging_residue(&target).is_empty(),
+                        "no stage was created before a {point} refusal: {:?}",
+                        staging_residue(&target)
+                    );
+                }
+                "pre_first_write" => {
+                    let (_n, len, _s) = single_left_stage(&target);
+                    assert_eq!(len, 0, "the {point} stage stands empty");
+                }
+                _ => {
+                    let (_n, len, stage_seq) = single_left_stage(&target);
+                    assert!(len > 0, "the {point} stage stands as staged");
+                    assert_eq!(
+                        stage_seq,
+                        Some(presenter.checkpoint_seq),
+                        "the {point} stage is the refused write's own"
+                    );
+                }
+            }
             assert_eq!(
                 std::fs::read(target.join("ckpt.json")).unwrap(),
                 before,
-                "the committed bytes survive a {point} move"
+                "the committed bytes survive a {point} move (never replaced)"
             );
             let _ = std::fs::remove_dir_all(&base);
         }
+    }
+
+    #[test]
+    fn new76_socket_checkpoint_refuses_by_kind() {
+        // P2fix13 NEW-76 (socket arm — promoted from the
+        // Tier-1 probe that found the ENXIO path bypassed
+        // the regularity wording): a unix-domain SOCKET at
+        // the checkpoint path refuses by KIND naming
+        // regularity, before any open is attempted (the
+        // open itself would refuse ENXIO without touching
+        // the object, so a connect attempt can never stall
+        // intake).
+        use std::os::unix::net::UnixListener;
+        let base = unique_dir("intake-socket");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let ckpt = base.join("ckpt.json");
+        let _sock = UnixListener::bind(&ckpt).expect("bind the socket");
+        let err = open_bounded(&out, &ckpt, 10).expect("a socket refuses promptly");
+        assert!(
+            err.contains("regular file"),
+            "the socket refusal names regularity: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new74_tripwire_observes_move_self_and_delete_via_fd_watch() {
+        // P2fix13 NEW-74 (mechanism premise): the guard's
+        // fd-bound inotify watch observes the OPENED
+        // directory's own relocation (through its
+        // `/proc/self/fd` binding, never a pathname
+        // resolution) — including a move that REVERSES
+        // between drains — and chain destruction refuses.
+        let base = unique_dir("tripwire-mechanism");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let display = p.join("ckpt.json");
+        let fd = std::fs::File::open(&p).unwrap();
+        let guard = super::PlacementGuard::arm(&fd, &display).expect("the guard arms");
+        // Still + outside: both envelopes prove.
+        guard
+            .prove_before(&fd, &out, "staging", &display)
+            .expect("stationary outside proves");
+        guard
+            .prove_after(&fd, &out, "staging", &display)
+            .expect("no wake events while stationary");
+        // Move inside and BACK between drains: the movement
+        // is observed (move_self recorded), the pre-mutation
+        // envelope still proves on present position (no
+        // mutation overlapped the excursion), and the
+        // post-mutation envelope refuses a step whose wake
+        // contains a move.
+        assert_eq!(super::tripwire_probe::take(), 0);
+        let inside = out.join("p-in");
+        let back = base.join("p-back");
+        std::fs::rename(&p, &inside).unwrap();
+        std::fs::rename(&inside, &back).unwrap();
+        guard
+            .prove_before(&fd, &out, "commit", &display)
+            .expect("reversed excursion: present position outside proves");
+        assert!(
+            super::tripwire_probe::take() >= 1,
+            "the reversed move was DETECTED by the tripwire"
+        );
+        // A move in a step's wake refuses that step.
+        std::fs::rename(&back, &p).unwrap();
+        guard
+            .prove_before(&fd, &out, "first write", &display)
+            .expect("drain the scheduling move");
+        let moved = base.join("p-moved");
+        std::fs::rename(&p, &moved).unwrap();
+        assert!(
+            guard
+                .prove_after(&fd, &out, "first write (post)", &display)
+                .is_err(),
+            "a move in the step's wake refuses"
+        );
+        // Parked inside: present position refuses.
+        let inside2 = out.join("p-in2");
+        std::fs::rename(&moved, &inside2).unwrap();
+        assert!(
+            guard
+                .prove_before(&fd, &out, "commit rename", &display)
+                .is_err(),
+            "inside placement refuses"
+        );
+        // Chain destruction refuses (watch destroyed/unlinked).
+        std::fs::remove_dir_all(&inside2).unwrap();
+        assert!(
+            guard.prove_before(&fd, &out, "cleanup", &display).is_err(),
+            "a destroyed ancestry refuses"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new74_reverse_move_detected_with_no_inside_mutation() {
+        // P2fix13 NEW-74 (reverse schedule): a relocation
+        // that moves the checkpoint dir UNDER the producer
+        // and back outside again BETWEEN envelopes (it
+        // reverses before the next check) cannot produce an
+        // inside mutation: every mutation is fused behind a
+        // tripwire drain + ancestry proof, the excursion is
+        // DETECTED (probe), the commit lands through the
+        // validated fd at its outside destination, and the
+        // producer tree is left with exactly what it held
+        // before (no stage, no checkpoint, no new entry).
+        // Two arms: reversal to a DIFFERENT outside path,
+        // and reversal to the ORIGINAL path (ancestry
+        // indistinguishable — the tripwire is the detector).
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        for (tag, back_to_original) in [("reverse-relocated", false), ("reverse-original", true)] {
+            let base = unique_dir(tag);
+            let out = base.join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(
+                out.join("window-0000000000.json"),
+                serde_json::to_string(&test_envelope(0, 0, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+            let out_before: Vec<String> = std::fs::read_dir(&out)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            let p = base.join("p");
+            std::fs::create_dir_all(&p).unwrap();
+            let ckpt = p.join("ckpt.json");
+            let mut presenter =
+                Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+            presenter.build_service().expect("first fold commits");
+            let seq_before = presenter.checkpoint_seq;
+            let inside = out.join("p-inside");
+            let dest = if back_to_original {
+                p.clone()
+            } else {
+                base.join("p-relocated")
+            };
+            let (p2, in2, dest2) = (p.clone(), inside.clone(), dest.clone());
+            let _ = super::tripwire_probe::take();
+            // ONE hook invocation performs the whole
+            // excursion (inside + back) between envelopes.
+            super::pre_commit_hook::arm(move || {
+                std::fs::rename(&p2, &in2).unwrap();
+                std::fs::rename(&in2, &dest2).unwrap();
+            });
+            presenter
+                .flush_checkpoint()
+                .expect("the reversed excursion overlaps no mutation; the commit lands");
+            super::pre_commit_hook::disarm();
+            assert!(
+                super::tripwire_probe::take() >= 1,
+                "{tag}: the excursion was DETECTED by the tripwire"
+            );
+            // The producer tree is byte-for-byte the same
+            // population as before (no writer entry persisted
+            // inside at any observable point after the write).
+            let out_after: Vec<String> = std::fs::read_dir(&out)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                out_after, out_before,
+                "{tag}: no writer mutation persisted beneath the producer"
+            );
+            // The commit landed through the fd at its outside
+            // destination with the bumped sequence.
+            let landed = dest.join("ckpt.json");
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&landed).unwrap()).unwrap();
+            assert_eq!(
+                v["checkpoint_seq"],
+                serde_json::json!(seq_before + 1),
+                "{tag}: the new commit settled outside"
+            );
+            Presenter::open_with_checkpoint(&out, &landed, 1, "export")
+                .expect("the landed checkpoint reloads");
+            assert!(
+                staging_residue(&dest).is_empty(),
+                "{tag}: no residue after a settled commit"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    #[test]
+    fn new75_stage_residue_never_adopted_on_reopen() {
+        // P2fix13 NEW-75 (process-stop shape): a stage left
+        // by a stopped/aborted write — even one carrying a
+        // valid body with a HIGHER sequence than the
+        // committed target — is never adopted on reopen:
+        // authority is the target name only. With NO target,
+        // a lone stage reopens FRESH (the unpublished
+        // checkpoint does not exist as far as reopen is
+        // concerned).
+        let base = unique_dir("stage-never-adopted");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let committed_seq = presenter.checkpoint_seq;
+        drop(presenter);
+        // Forge a "newer" stage beside the target (valid
+        // body, bumped sequence, rehashed).
+        let mut forged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        forged["checkpoint_seq"] = serde_json::json!(committed_seq + 41);
+        rehash_checkpoint(&mut forged);
+        let stage = p.join(format!(
+            "ckpt.json.staging-{}-{}.0.tmp",
+            999,
+            committed_seq + 41
+        ));
+        std::fs::write(&stage, serde_json::to_vec(&forged).unwrap()).unwrap();
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("reopen on the committed target");
+        assert_eq!(
+            q.checkpoint_seq, committed_seq,
+            "the committed target is authoritative, never the newer stage"
+        );
+        drop(q);
+        // Lone-stage shape: no target at all.
+        std::fs::remove_file(&ckpt).unwrap();
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("a lone stage reopens fresh");
+        assert_eq!(q.checkpoint_seq, 0, "no sequence adopted from a stage");
+        assert_eq!(q.watermark, None, "no watermark adopted from a stage");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Re-hash a mutated checkpoint body (P2fix12 NEW-72
@@ -7888,6 +8537,226 @@ mod tests {
         let _ = std::fs::remove_dir_all(out.parent().unwrap());
     }
 
+    /// Open a presenter on a thread with a hard bound
+    /// (P2fix13 NEW-76 pins): a blocked open (the pre-fix
+    /// FIFO stall) fails the pin in bounded time instead of
+    /// wedging the harness. Returns the open's error text, or
+    /// `None` when the open succeeded.
+    fn open_bounded(out: &Path, ckpt: &Path, secs: u64) -> Option<String> {
+        let (out, ckpt) = (out.to_path_buf(), ckpt.to_path_buf());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                match Presenter::open_with_checkpoint(&out, &ckpt, 1, "export") {
+                    Ok(_) => None,
+                    Err(e) => Some(format!("{e:?}")),
+                },
+            );
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs))
+            .expect("the open returns within the bound (no intake stall)")
+    }
+
+    fn mkfifo_at(path: &Path) {
+        // SAFETY: mkfifo on a fresh private path.
+        assert_eq!(
+            unsafe {
+                libc::mkfifo(
+                    std::ffi::CString::new(path.to_str().unwrap())
+                        .unwrap()
+                        .as_ptr(),
+                    0o600,
+                )
+            },
+            0,
+            "mkfifo succeeds"
+        );
+    }
+
+    #[test]
+    fn new76_nonregular_checkpoint_refuses_at_startup() {
+        // P2fix13 NEW-76 (startup arm): checkpoint intake is a
+        // BOUNDED regular-file read — a FIFO at the checkpoint
+        // path refuses promptly (pre-fix: the blocking
+        // `fs::read` open stalls forever — the bounded-open
+        // harness convicts), a directory or symlink refuses,
+        // and an oversize regular file refuses past the intake
+        // bound. A valid checkpoint still opens (guard).
+        // Healthy control first: a real checkpoint opens.
+        let (out, ckpt, _) = scenario_checkpoint_with_record("intake-control");
+        assert_eq!(
+            open_bounded(&out, &ckpt, 10),
+            None,
+            "a valid checkpoint opens"
+        );
+        let valid_bytes = std::fs::read(&ckpt).unwrap();
+        // FIFO at the target path.
+        std::fs::remove_file(&ckpt).unwrap();
+        mkfifo_at(&ckpt);
+        let err = open_bounded(&out, &ckpt, 10).expect("the FIFO refuses promptly");
+        assert!(
+            err.contains("regular file"),
+            "the FIFO refusal names regularity: {err}"
+        );
+        // Directory at the target path.
+        std::fs::remove_file(&ckpt).unwrap();
+        std::fs::create_dir_all(&ckpt).unwrap();
+        let err = open_bounded(&out, &ckpt, 10).expect("a directory refuses");
+        assert!(
+            err.contains("regular file"),
+            "the directory refusal names regularity: {err}"
+        );
+        std::fs::remove_dir_all(&ckpt).unwrap();
+        // Symlink to a VALID checkpoint (substitution class —
+        // the write side never follows target links either).
+        let real = out.parent().unwrap().join("real-ckpt.json");
+        std::fs::write(&real, &valid_bytes).unwrap();
+        std::os::unix::fs::symlink(&real, &ckpt).unwrap();
+        let err = open_bounded(&out, &ckpt, 10).expect("a symlink refuses");
+        assert!(
+            err.contains("checkpoint"),
+            "the symlink refusal names the checkpoint: {err}"
+        );
+        std::fs::remove_file(&ckpt).unwrap();
+        // Oversize regular file (past the intake bound).
+        let big = std::fs::File::create(&ckpt).unwrap();
+        big.set_len(super::CHECKPOINT_MAX_BYTES + 1).unwrap();
+        drop(big);
+        let err = open_bounded(&out, &ckpt, 10).expect("an oversize target refuses");
+        assert!(
+            err.contains("intake bound"),
+            "the oversize refusal names the bound: {err}"
+        );
+        let _ = std::fs::remove_dir_all(out.parent().unwrap());
+    }
+
+    #[test]
+    fn new76_fifo_substituted_target_refuses_at_refresh() {
+        // P2fix13 NEW-76 (refresh arm): a FIFO substituted at
+        // the checkpoint target after a healthy start refuses
+        // the next flush PROMPTLY (pre-fix: the preservation
+        // read blocks on the FIFO open — the bounded-flush
+        // harness convicts) without touching the FIFO; once
+        // the substitution is removed the flush recovers.
+        let base = unique_dir("intake-refresh");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p_dir = base.join("p");
+        std::fs::create_dir_all(&p_dir).unwrap();
+        let ckpt = p_dir.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("healthy commit");
+        // Substitute the FIFO.
+        std::fs::remove_file(&ckpt).unwrap();
+        mkfifo_at(&ckpt);
+        // Flush on a thread with a hard bound.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut moved = presenter;
+        let handle = std::thread::spawn(move || {
+            let result = moved.flush_checkpoint().map_err(|e| format!("{e:?}"));
+            let _ = tx.send((moved, result));
+        });
+        let (mut presenter, result) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the flush returns within the bound (no refresh stall)");
+        handle.join().unwrap();
+        let err = result.expect_err("the FIFO target refuses the flush");
+        assert!(
+            err.contains("regular file"),
+            "the refresh refusal names regularity: {err}"
+        );
+        // The FIFO is untouched (still a FIFO) and no stage
+        // residue persists (placement held — cleanup ran).
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(
+            std::fs::metadata(&ckpt).unwrap().file_type().is_fifo(),
+            "the substituted FIFO is never replaced by the refused flush"
+        );
+        assert!(
+            staging_residue(&p_dir).is_empty(),
+            "zero stage residue: {:?}",
+            staging_residue(&p_dir)
+        );
+        // Recovery: remove the substitution; the flush commits.
+        std::fs::remove_file(&ckpt).unwrap();
+        presenter
+            .flush_checkpoint()
+            .expect("post-substitution flush");
+        Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("the recovered checkpoint reloads");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new79_hash_valid_previous_epoch_lane_sum_binds() {
+        // P2fix13 NEW-79: a HASH-VALID restored `previous_epoch`
+        // must satisfy the writer's saturated lane-sum invariant
+        // (`calls_total` == saturated sum of the four lanes) —
+        // a hash-valid disagreement refuses loudly (never
+        // reaches the terminal/JSON previous-epoch payloads).
+        // Pre-fix: the reader type-checks both and the gate
+        // accepts the contradiction (RED).
+        let (out, ckpt, prev) = scenario_checkpoint_with_record("restore-lane-sum");
+        let live: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        let lane_sum: u64 = prev.lanes.iter().fold(0u64, |a, &l| a.saturating_add(l));
+        assert_eq!(
+            prev.calls_total, lane_sum,
+            "premise: the writer record satisfies the invariant"
+        );
+        assert!(lane_sum > 0, "premise: nonzero lanes to disagree with");
+        // Negative controls: every disagreement refuses naming
+        // the record.
+        let mismatches: Vec<(&str, [u64; 4], u64)> = vec![
+            ("sum-minus-one", prev.lanes, lane_sum - 1),
+            ("sum-plus-one", prev.lanes, lane_sum + 1),
+            ("zero-calls", prev.lanes, 0),
+            // The WRAPPING sum of saturated lanes is not the
+            // saturated sum (MAX + MAX wraps to MAX-1; the
+            // writer saturates to MAX).
+            ("wrapped-sum", [u64::MAX, u64::MAX, 0, 0], u64::MAX - 1),
+            ("saturated-lanes-low-calls", [u64::MAX, 1, 0, 0], 7),
+        ];
+        for (name, lanes, calls) in mismatches {
+            let mut crafted = live.clone();
+            crafted["accumulators"]["previous_epoch"]["lanes"] = serde_json::json!(lanes);
+            crafted["accumulators"]["previous_epoch"]["calls_total"] = serde_json::json!(calls);
+            rehash_checkpoint(&mut crafted);
+            std::fs::write(&ckpt, serde_json::to_vec(&crafted).unwrap()).unwrap();
+            let err = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+                .expect_err(&format!("{name}: a lane-sum mismatch must refuse"));
+            assert!(
+                format!("{err:?}").contains("previous_epoch"),
+                "{name}: the refusal names the record: {err:?}"
+            );
+        }
+        // Positive guards: the untouched writer record reopens
+        // (the new72 guard covers it too), and an exactly
+        // SATURATED sum opens (the writer saturates — MAX with
+        // lanes summing past MAX is writer-legit).
+        let mut saturated = live.clone();
+        saturated["accumulators"]["previous_epoch"]["lanes"] =
+            serde_json::json!([u64::MAX, 1, 0, 0]);
+        saturated["accumulators"]["previous_epoch"]["calls_total"] = serde_json::json!(u64::MAX);
+        rehash_checkpoint(&mut saturated);
+        std::fs::write(&ckpt, serde_json::to_vec(&saturated).unwrap()).unwrap();
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("an exactly saturated lane sum opens");
+        assert_eq!(
+            q.previous_epoch().map(|p| p.calls_total),
+            Some(u64::MAX),
+            "the saturated record restores verbatim"
+        );
+        let _ = std::fs::remove_dir_all(out.parent().unwrap());
+    }
+
     #[test]
     fn new71_published_prefix_and_uncertainty_survive_reset() {
         // P2fix12 NEW-71 (+ NEW-P2c/NEW-67-OPEN): publish an
@@ -8054,6 +8923,153 @@ mod tests {
                 q.previous_epoch(),
                 Some(prev),
                 "the failed prefix survives the reopen"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    #[test]
+    fn new77_coalesced_resets_keep_accepted_predecessor() {
+        // P2fix13 NEW-77 (+ NEW-P2c/NEW-67-OPEN): gen 0
+        // published, a gen-1 prefix accepted before a rejected
+        // tail, then gen 2 AND gen 3 folded in ONE recovery
+        // scan — the preserved predecessor is gen 1 (with its
+        // uncertainty), never stale gen 0 and never dropped.
+        // Pre-fix: the second reset (clean unpublished gen 2)
+        // clears the record (RED). Schedule B guards the
+        // published-clean clear (an outgoing epoch that
+        // published cleanly still supersedes an older record
+        // exactly).
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        // Schedule A: two generation changes in one recovery scan.
+        {
+            let base = unique_dir("coalesced-resets");
+            let out = base.join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(
+                out.join("window-0000000000.json"),
+                serde_json::to_string(&test_envelope(0, 0, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+            let ckpt = base.join("ckpt.json");
+            let mut presenter =
+                Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+            presenter.build_service().expect("gen 0 publishes");
+            // Gen-1 prefix after a hole, then a rejected tail.
+            std::fs::write(
+                out.join("window-0000000002.json"),
+                serde_json::to_string(&test_envelope(2, 1, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+            let mut bad = test_envelope(3, 1, run.clone(), 10);
+            bad["schema"] = serde_json::json!("service-window-v9");
+            std::fs::write(
+                out.join("window-0000000003.json"),
+                serde_json::to_string(&bad).unwrap(),
+            )
+            .unwrap();
+            presenter
+                .build_service()
+                .expect_err("the rejected gen-1 tail fails the scan");
+            // The EXACT failed gen-1 prefix, observed BEFORE
+            // advancing (the record the reset must keep).
+            assert_eq!(presenter.generation, Some(1));
+            assert_eq!(presenter.watermark, Some(2));
+            assert_eq!(presenter.calls_total, 10);
+            assert_eq!(presenter.lanes, [10, 0, 0, 0]);
+            assert_eq!(presenter.failed_generation, Some(1));
+            // Recovery: gen 2 and gen 3 in ONE scan.
+            std::fs::remove_file(out.join("window-0000000003.json")).unwrap();
+            std::fs::write(
+                out.join("window-0000000004.json"),
+                serde_json::to_string(&test_envelope(4, 2, run.clone(), 20)).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                out.join("window-0000000005.json"),
+                serde_json::to_string(&test_envelope(5, 3, run.clone(), 30)).unwrap(),
+            )
+            .unwrap();
+            let snap = presenter.build_service().expect("recovery builds");
+            assert_eq!(snap.source.generation, Some(3), "gen 3 is current");
+            let prev = presenter
+                .previous_epoch()
+                .expect("the coalesced resets keep the gen-1 predecessor");
+            assert_eq!(prev.generation, 1, "predecessor is gen 1, never gen 0");
+            assert_eq!(prev.window_seq, 2);
+            assert_eq!(prev.calls_total, 10);
+            assert_eq!(prev.lanes, [10, 0, 0, 0]);
+            assert_eq!(prev.unstable.len(), 8, "gen 1 uncertainty survives");
+            assert_eq!(prev.unmeasured, vec![[1u64, 2u64]]);
+            // Persist + reopen (two generation changes in one
+            // recovery scan survive the checkpoint round trip).
+            let ckpt_json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&ckpt).unwrap()).unwrap();
+            assert_eq!(
+                ckpt_json["accumulators"]["previous_epoch"]["generation"],
+                serde_json::json!(1),
+                "the checkpoint persists gen 1"
+            );
+            drop(presenter);
+            let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+                .expect("the recovery checkpoint reloads");
+            assert_eq!(q.previous_epoch(), Some(prev), "gen 1 survives reopen");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+        // Schedule B (guard): gen 2 PUBLISHES cleanly between
+        // the scans — the later gen-3 reset clears the older
+        // record (last-good covers the clean published epoch
+        // exactly; the keep must not resurrect gen 1 past it).
+        {
+            let base = unique_dir("coalesced-published-clear");
+            let out = base.join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(
+                out.join("window-0000000000.json"),
+                serde_json::to_string(&test_envelope(0, 0, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+            let ckpt = base.join("ckpt.json");
+            let mut presenter =
+                Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+            presenter.build_service().expect("gen 0 publishes");
+            std::fs::write(
+                out.join("window-0000000002.json"),
+                serde_json::to_string(&test_envelope(2, 1, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+            let mut bad = test_envelope(3, 1, run.clone(), 10);
+            bad["schema"] = serde_json::json!("service-window-v9");
+            std::fs::write(
+                out.join("window-0000000003.json"),
+                serde_json::to_string(&bad).unwrap(),
+            )
+            .unwrap();
+            presenter
+                .build_service()
+                .expect_err("the rejected gen-1 tail fails the scan");
+            std::fs::remove_file(out.join("window-0000000003.json")).unwrap();
+            std::fs::write(
+                out.join("window-0000000004.json"),
+                serde_json::to_string(&test_envelope(4, 2, run.clone(), 20)).unwrap(),
+            )
+            .unwrap();
+            presenter.build_service().expect("gen 2 publishes");
+            assert_eq!(
+                presenter.previous_epoch().map(|p| p.generation),
+                Some(1),
+                "premise: gen 1 preserved under published gen 2"
+            );
+            std::fs::write(
+                out.join("window-0000000005.json"),
+                serde_json::to_string(&test_envelope(5, 3, run.clone(), 30)).unwrap(),
+            )
+            .unwrap();
+            presenter.build_service().expect("gen 3 builds");
+            assert_eq!(
+                presenter.previous_epoch(),
+                None,
+                "a clean published epoch supersedes the older record"
             );
             let _ = std::fs::remove_dir_all(&base);
         }
