@@ -90,12 +90,42 @@ pub fn render_frame(snap: &OperatorSnapshot) -> String {
     render_frame_with_prev(snap, None, 0, &snap.markers)
 }
 
+/// Previous-epoch payload for the §6C-3 tail: either the last
+/// published frame (a normal generation change — the legacy
+/// line, byte-identical) or the preserved failed-unpublished
+/// epoch (P2fix11 NEW-67 — the TRUE previous epoch WITH its
+/// uncertainty, preferred over last-good).
+pub enum PrevEpoch<'a> {
+    Snapshot(&'a OperatorSnapshot),
+    Preserved(&'a super::snapshot::PreservedEpoch),
+}
+
+/// Splice a compact `previous_epoch` object behind the opening
+/// brace of a pretty-printed follow frame (P2fix11 NEW-67): the
+/// frame's own bytes survive untouched (a flattened re-wrap
+/// would re-emit every key through a map and reorder them), so
+/// frames without preservation are byte-identical to before and
+/// preserved frames differ only by this leading key.
+fn splice_previous_epoch(frame: &[u8], prev: &super::snapshot::PreservedEpoch) -> Option<Vec<u8>> {
+    if frame.first() != Some(&b'{') {
+        return None;
+    }
+    let compact = serde_json::to_vec(prev).ok()?;
+    let mut out = Vec::with_capacity(frame.len() + compact.len() + 24);
+    out.push(b'{');
+    out.extend_from_slice(b"\n  \"previous_epoch\": ");
+    out.extend_from_slice(&compact);
+    out.push(b',');
+    out.extend_from_slice(&frame[1..]);
+    Some(out)
+}
+
 /// Render one frame with an optional previous-epoch tail (§6C-3
 /// `PREVIOUS EPOCH` line, retained by the watch loop across a
 /// generation change until the first new-epoch window finalizes).
 pub fn render_frame_with_prev(
     snap: &OperatorSnapshot,
-    prev: Option<&OperatorSnapshot>,
+    prev: Option<PrevEpoch<'_>>,
     coalesced: u64,
     markers: &[String],
 ) -> String {
@@ -129,19 +159,42 @@ pub fn render_frame_with_prev(
         coalesced,
         if snap.health.stale { " STALE" } else { "" },
     ));
-    if let Some(p) = prev {
-        lines.push(format!(
-            "PREVIOUS EPOCH gen={} calls={} win={}",
-            p.source
-                .generation
-                .map(|g| g.to_string())
-                .unwrap_or_else(|| "?".to_string()),
-            p.counts.calls_total,
-            p.source
-                .window_seq
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "?".to_string()),
-        ));
+    match prev {
+        Some(PrevEpoch::Snapshot(p)) => {
+            lines.push(format!(
+                "PREVIOUS EPOCH gen={} calls={} win={}",
+                p.source
+                    .generation
+                    .map(|g| g.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                p.counts.calls_total,
+                p.source
+                    .window_seq
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+            ));
+        }
+        Some(PrevEpoch::Preserved(p)) => {
+            // The preserved finals WITH their uncertainty
+            // (P2fix11 NEW-67): the base line stays short (the
+            // C-17 200-char bound would truncate a single-line
+            // tail and DROP the uncertainty), so the flags
+            // (sorted comma-joined, `-` when certain) and the
+            // ranges (Debug-spelled, matching the TRACE
+            // `unmeasured=` lines) ride two continuation lines.
+            lines.push(format!(
+                "PREVIOUS EPOCH gen={} calls={} win={}",
+                p.generation, p.calls_total, p.window_seq,
+            ));
+            let unstable = if p.unstable.is_empty() {
+                "-".to_string()
+            } else {
+                p.unstable.join(",")
+            };
+            lines.push(format!("  prev-unstable={unstable}"));
+            lines.push(format!("  prev-unmeasured={:?}", p.unmeasured));
+        }
+        None => {}
     }
     // (2) WINDOW.
     match snap.window.as_ref() {
@@ -448,14 +501,30 @@ pub fn run(args: &[String]) -> ExitCode {
             Ok(snap) => {
                 built_once = true;
                 let generation = snap.source.generation;
-                // First frame of a new generation shows the old
-                // epoch's final values exactly once (§6C-3); markers
-                // clear at the epoch boundary (generation-bound,
-                // P2fix2 item 13).
-                let show_prev = if last_gen.is_some() && generation != last_gen {
-                    last_built.as_ref()
+                // Previous-epoch tail (P2fix11 NEW-67): the
+                // preserved failed-unpublished epoch wins over
+                // last-good (it is the TRUE previous epoch);
+                // last-good covers normal generation changes.
+                // Shown exactly once: on the first frame of a new
+                // generation, or on the very first frame when a
+                // restored preservation exists. Markers clear at
+                // the epoch boundary (generation-bound, P2fix2
+                // item 13).
+                let preserved = presenter.previous_epoch();
+                let gen_changed = last_gen.is_some() && generation != last_gen;
+                let show_prev = if gen_changed {
+                    preserved
+                        .as_ref()
+                        .map(PrevEpoch::Preserved)
+                        .or_else(|| last_built.as_ref().map(PrevEpoch::Snapshot))
+                } else if last_gen.is_none() {
+                    preserved.as_ref().map(PrevEpoch::Preserved)
                 } else {
                     None
+                };
+                let show_preserved_json = match &show_prev {
+                    Some(PrevEpoch::Preserved(p)) => Some(*p),
+                    _ => None,
                 };
                 if generation != last_gen {
                     markers.clear();
@@ -490,11 +559,19 @@ pub fn run(args: &[String]) -> ExitCode {
                 if opts.format_json {
                     // Same generation-bound facts as the human frame
                     // (P2fix3 NEW-P2h — the sticky marker set, not
-                    // just this build's).
+                    // just this build's) + the preserved previous
+                    // epoch exactly when the human tail would show
+                    // it (P2fix11 NEW-67 — spliced behind the
+                    // opening brace; the frame's own bytes are
+                    // untouched).
                     let mut out = snap.clone();
                     out.markers = markers.clone();
                     match serde_json::to_vec_pretty(&out) {
-                        Ok(mut bytes) => {
+                        Ok(pretty) => {
+                            let mut bytes = match show_preserved_json {
+                                Some(p) => splice_previous_epoch(&pretty, p).unwrap_or(pretty),
+                                None => pretty,
+                            };
                             bytes.push(b'\n');
                             let _ = std::io::Write::write_all(&mut std::io::stdout(), &bytes);
                         }
