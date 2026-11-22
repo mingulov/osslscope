@@ -4,8 +4,9 @@
 Build the v0.6.0 automatic observation candidate for Linux x86-64 using pinned host/BPF
 toolchains and locked dependencies. Compilation and pure object preparation
 are separate from installed verifier/runtime qualification; see the
-[release qualification procedure](release-v0.4.0.md) (latest qualification
-record; no v0.5.0 or v0.6.0 record exists yet). The historical exact-profile
+[release qualification procedure](release-v0.4.0.md) (latest
+versioned qualification record file; 0.5.0/0.6.0 status lives in
+the [CHANGELOG](../CHANGELOG.md) and the README lane). The historical exact-profile
 diagnostic is selected only with `--libcrypto`.
 
 The host/common, BPF programs and independent BPF contract have distinct terms
@@ -266,7 +267,7 @@ host tests nor object-shape success establish runtime/platform qualification.
 
 ## OpenSSL compatibility controls
 
-The v0.5 test matrix includes OpenSSL 3.0.x, 3.5.x and 4.x. Each lane uses its
+The test matrix (first qualified in the v0.5 lane, carried into 0.6.0) includes OpenSSL 3.0.x, 3.5.x and 4.x. Each lane uses its
 matching CLI, libraries and provider modules. These are test inputs, not a
 version or algorithm admission list. An absent newer API or algorithm is a
 capability limit; it does not exclude the library from discovery or testing.

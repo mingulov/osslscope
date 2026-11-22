@@ -30,9 +30,10 @@ The runtime stage is slim Debian with `openssl` (the demo workload
 — the Job manifest's default args run `openssl dgst`), the prefix,
 `cap_bpf,cap_perfmon=ep` file caps on the root-owned binary, and
 the `osslscope` user (stable uid 65532). `libcap2-bin` exists only
-for the one `setcap` at build time and is purged after. 0.x images
-ship no signatures, SLSA provenance, or SBOM — verify by digest
-after pinning. Build from a real
+for the one `setcap` at build time and is purged after. Published
+0.x images and release assets carry Sigstore build-provenance
+attestations (verify with `gh attestation verify`); checksums
+stay unsigned and no SBOM ships in 0.x — pin by digest as well. Build from a real
 checkout: a linked `git worktree` ships a `.git` pointer file whose
 target lies outside the build context, which yields an
 unknown-source install that tracing refuses (build-identity

@@ -51,8 +51,13 @@ window open?) then `check` (does the rule evaluate?).
 
 ## Failing-check to remediation map
 
-`doctor` prints one line per check plus a `remediate:` line on
-failure and exits 4. The checks, in the order to fix them:
+Sectioned/profiled `doctor` prints one line per check plus a
+`remediate:` line on failure and exits 4 (fail-closed). That is
+only one doctor route: focused/discovery `doctor` reports
+capabilities and exits 3 when unavailable (no 4), and bare
+`doctor --libcrypto` exits 0/2/4 only — see the route split in
+[usage](usage.md#execution-report-and-check). The checks below
+are the sectioned route's, in the order to fix them:
 
 | Failing check | Cause | Remediation |
 |---|---|---|
@@ -65,7 +70,7 @@ failure and exits 4. The checks, in the order to fix them:
 | `pidns` | Observer and target are in different pid namespaces. | Observe from the target's pid namespace (see [staging deploy](staging-deploy.md)). |
 | `libcrypto-found` | Target maps no readable libcrypto (wrong path, `ENOENT`, `(deleted)` after upgrade, or a static binary). | Fix the path; for static binaries see below. |
 | `arch` | Non-x86-64 target (including 32-bit). | Current observation is x86-64-only; observe an admitted x86-64 build. |
-| `flavor` | Not OpenSSL 3.x/4.x (BoringSSL/AWS-LC lookalike, unrecognized bytes, or path confusion such as pointing `--libcrypto` at a static server binary). | Point at a real OpenSSL libcrypto, or use `--builtin` provider mode with an enrolled build. |
+| `flavor` | Not OpenSSL 3.x/4.x (BoringSSL/AWS-LC lookalike, unrecognized bytes, or path confusion such as pointing `--libcrypto` at a static server binary). | Point at a real OpenSSL libcrypto. There is no `--builtin` provider mode on the current surface (the flag is parse-then-refused); for stripped/unknown builds vet the anchor per [the built-in runbook](builtin-runbook.md) and observe with automatic discovery. |
 | `build-id` / `dispatch-anchor` | An unknown id alone is informational when a supported symtab route resolves. The current table has eleven exact builds; unknown stripped builds lack that route. Rebuilds can change ids/offsets. | Read the anchor/admission verdict. Recheck exact bytes after rebuild; explicitly enroll unknown stripped builds per [the built-in runbook](builtin-runbook.md), using the same table on doctor and capture. |
 | `btf` | Kernel BTF absent: provider observation cannot resolve the incarnation-stamp offset and refuses to load (`BpfUnavailable`). | Install kernel BTF (`apt install linux-headers-$(uname -r)` on Debian/Ubuntu, `dnf install kernel-devel` on RHEL) or move to a kernel that ships `/sys/kernel/btf/vmlinux`. |
 | `token-support` / `perf` rows | Informational only. | Nothing required. |
@@ -79,14 +84,18 @@ failure and exits 4. The checks, in the order to fix them:
 - **Static binary as `--libcrypto`:** sectioned vetting
   (`doctor --libcrypto PATH` with a vetting flag, as above)
   exits 4 with a flavor/path-confusion failure -- a static
-  server is not a library. Observe it in `--builtin` provider
-  mode instead (see [the static-target
-  recipe](staging-deploy.md#observe)); a *stripped* unknown
-  static binary needs explicit enrollment for report/check;
-  inspect may expose disclosed zero-row blindness.
+  server is not a library. There is no `--builtin` provider
+  mode to reroute to: observe the *process* with automatic
+  discovery instead (`inspect`/`report` by PID or `run --`),
+  accepting that static/vendored crypto with no libcrypto
+  mapping stays blind with an explicit gap, never an inferred
+  claim. Doctor-side anchor enrollment for stripped builds is
+  vetting only (see [the built-in runbook](builtin-runbook.md));
+  live `report`/`check` neither consume it nor gate on it.
 - **Static target under `doctor --pid`:** `no libcrypto.so
-  mapped in target` is the designed refusal; same `--builtin`
-  path applies.
+  mapped in target` is the designed refusal; the same
+  automatic-discovery route (and the same blindness limit)
+  applies.
 - **FIPS libcrypto unknown to the build-id table:** observe it with
   automatic discovery per [the FIPS interim rule](fips-interim.md) —
   `report`/`check` accept no provider-selection flag (`--provider`

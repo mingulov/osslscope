@@ -42,7 +42,10 @@ exit=0
 This page exercises passive discovery only. Tracing needs a
 qualified host with the dev build, a root-owned install, and file
 capabilities — see [build](build.md) and [install](install.md).
-0.6.0 binary packages are not published yet.
+0.6.0 binary packages (prefix tarball, DEB, RPM) are published
+with the 0.6.0 release; the source build below is the
+no-install route this page drills. For the package route, see
+[install a release package](install.md#install-a-release-package).
 
 ## 2. Doctor: this host fails loud, discovery still works
 
@@ -65,11 +68,53 @@ osslscope doctor: capability unavailable: bpf(denied), count_load(unavailable), 
 `bpf: denied` means this observer may not load BPF here, so the
 companion loads stay `unavailable` and the rest goes unchecked —
 exit 3 with the reason on stderr, never silent success. Passive
-discovery below is unaffected. On a qualified host every
+discovery below is unaffected: continue with step 3, which
+starts with a file inspection that needs no privilege at all.
+On a qualified host every
 capability reads `available` with exit 0 — see the drilled
 transcripts in [container](container.md).
 
-## 3. Scan: one process reads as rows
+## 3. Inspect a file first, then scan one process
+
+Start with the step that works for every unprivileged user:
+inspect the system `libcrypto` file itself. No target process,
+no privilege, and no claim about any process is involved:
+
+```sh
+LIBCRYPTO=$(ldd "$(command -v openssl)" | awk '/libcrypto/ {print $3; exit}')
+osslscope inspect --module "$LIBCRYPTO"
+echo "exit=$?"
+```
+
+```text
+Passive inventory: ELF exports and mappings do not prove activation or execution.
+Provider activation/interfaces: unknown; execution: not_observed.
+kinds: openssl_compatible=<exports-recognized-api> provider_module=<exports-ossl_provider_init> openssl_consumer=<depends-or-imports-openssl> other=<counted-not-listed>
+  openssl_compatible sha256=5385f0436ac2 size=6386528 path=(operator-supplied: /usr/lib/x86_64-linux-gnu/libcrypto.so.3) version=OpenSSL 3.5.5 27 Jan 2026
+errors: 0
+exit=0
+```
+
+Exit 0: the file inventory completed with no errors. The
+`path=` labels the operator-supplied spelling — inspecting a
+file makes no claim any process maps it, let alone executes it.
+
+Scanning a process is next, and it has a privilege condition
+the file step does not: on a stock host
+(`kernel.yama.ptrace_scope=1`), an unprivileged observer
+generally cannot read other users' `/proc/<pid>/maps`, so the
+target-finding command below prints nothing and process scans
+come back `PARTIAL` (exit 3) or wholly unavailable (exit 4)
+with a `re-run as root` hint on stderr. That is the expected
+unprivileged outcome, not a failure of the file step above.
+To follow the process transcripts on this page, either pick a
+process you own that maps OpenSSL, or re-run the process steps
+as root (the supported path to a complete inventory — see
+[usage](usage.md#privilege)). If the command below prints
+nothing, you have no readable target as this user: use
+`sudo grep -l 'libcrypto\|libssl' /proc/[0-9]*/maps 2>/dev/null | head`
+to find one, then run the `scan --pid` steps with the same
+privilege.
 
 Pick a target mapping OpenSSL (yours prints your own PIDs):
 
@@ -261,7 +306,7 @@ uncertainty. Stop a foreground watch with Ctrl-C: one stderr
 ack, the end record, exit 3, and the workload keeps running
 (see [usage](usage.md#interrupt-contract)).
 
-## 8. Inspect: one process, one file
+## 8. Inspect: one process
 
 ```sh
 osslscope inspect --pid $T
@@ -269,26 +314,10 @@ echo "exit=$?"
 ```
 
 stdout is byte-for-byte the step-3 inventory for that PID
-(verified with `diff`), exit 3. For a file on disk:
-
-```sh
-LIBCRYPTO=$(ldd "$(command -v openssl)" | awk '/libcrypto/ {print $3; exit}')
-osslscope inspect --module "$LIBCRYPTO"
-echo "exit=$?"
-```
-
-```text
-Passive inventory: ELF exports and mappings do not prove activation or execution.
-Provider activation/interfaces: unknown; execution: not_observed.
-kinds: openssl_compatible=<exports-recognized-api> provider_module=<exports-ossl_provider_init> openssl_consumer=<depends-or-imports-openssl> other=<counted-not-listed>
-  openssl_compatible sha256=5385f0436ac2 size=6386528 path=(operator-supplied: /usr/lib/x86_64-linux-gnu/libcrypto.so.3) version=OpenSSL 3.5.5 27 Jan 2026
-errors: 0
-exit=0
-```
-
-Exit 0: the file inventory completed with no errors. The
-`path=` labels the operator-supplied spelling — inspecting a
-file makes no claim any process maps it, let alone executes it.
+(verified with `diff`), exit 3. The file form
+(`inspect --module`) is the unprivileged first step in
+step 3; it makes no claim any process maps the inspected
+file, let alone executes it.
 
 ## 9. Containers: the same scans behind caps
 
@@ -387,7 +416,7 @@ Discovery exits, each shown on this page:
 
 | Code | Meaning | Shown in |
 | --- | --- | --- |
-| 0 | Complete inventory, no access/resource failure | steps 8–9 |
+| 0 | Complete inventory, no access/resource failure | steps 3, 9 |
 | 1 | Output/internal failure | below |
 | 2 | Invalid arguments | below |
 | 3 | Useful partial inventory | steps 2–7, 9 |

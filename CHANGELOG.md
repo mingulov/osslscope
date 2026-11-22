@@ -225,11 +225,11 @@ features. The scoped0.2.0 workflow and its qualification are described above.
   live/service reload and exact-package qualification remain open. See
   [policy files](docs/usage.md#reusable-policy-files).
 
-- Current report/check emits `observed-crypto-v2.2`: conserved
+- At that stage report/check emitted `observed-crypto-v2.2`: conserved
   physical-site counts, candidate uncertainty, typed coverage/loss/
   window gaps, argv redaction, and three-valued policy rules with
-  site and optional ENGINE evidence. See
-  [the current contract](docs/observed-crypto-v2.md).
+  site and optional ENGINE evidence. For the live contract see
+  [observed-crypto-v2](docs/observed-crypto-v2.md).
 - Development count completion uses one prepared resource owner,
   checked count-link closes, explicit partial reads and one retained
   terminal result. v2.2 preserves programmed admission separately from

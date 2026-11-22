@@ -16,9 +16,12 @@ definite algorithm/provider count or CBOM asset is claimed. Start with
 the [quickstart](docs/quickstart.md). The [v0.4.0 alpha
 notes](docs/release-v0.4.0.md) and the [v0.3.0 release
 record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0)
-retain their historical artifact-specific scope.
+retain their historical artifact-specific scope. The next release,
+v0.7.0 (interim), is a Phase 1+2 aggregate-only close-out — not
+the feature-complete milestone once planned under that number;
+see the [roadmap](ROADMAP.md).
 
-## Support matrix (0.5.0 lane)
+## Support matrix (0.6.0 lane)
 
 | Requirement | Lane |
 | --- | --- |
@@ -55,8 +58,13 @@ is claimed.
 ## Discover, select, observe
 
 Build the host CLI with `cargo build --locked --bin osslscope` for passive
-inventory. Tracing additionally needs the source-built BPF companions and
-BPF/perf privileges; follow [build](docs/build.md) and [install](docs/install.md).
+inventory (host-only route; the pinned toolchain in
+`rust-toolchain.toml` applies — the [quickstart](docs/quickstart.md)
+spells it as `cargo +1.88.0 build --locked`). Tracing additionally
+needs the full source build (`./scripts/build-dev.sh`, host plus five
+BPF companions) and BPF/perf privileges; follow [build](docs/build.md)
+and [install](docs/install.md). Published binary packages are the
+third route; see [install a release package](docs/install.md#install-a-release-package).
 Use actual host-visible PIDs and file paths:
 
 ```sh
@@ -85,7 +93,11 @@ bounded public lifecycle/query observation. Report/check automatically use the
 installed `osslscope-provider-observation` and `osslscope-focused-count` pair.
 Doctor checks inventory, namespace and companion integrity and performs
 scanner-owned functional BPF load/self-attachment controls. Target attachment
-and access remain scope dependent.
+and access remain scope dependent. For continuous operation,
+`service` writes bounded windows to an out-DIR, `export` serves
+Prometheus exposition (and optional OTLP push) from that out-DIR,
+and `watch` renders one operator frame from it; see
+[continuous operation](docs/usage.md#continuous-operation-service-export-watch).
 
 ## Interpret the evidence
 
@@ -137,7 +149,7 @@ with tracing disabled; it does not establish broad performance limits.
 - [v0.3 release notes](docs/release-v0.3.0.md), [roadmap](ROADMAP.md), [documentation index](docs/README.md)
 - [Output contract](docs/observed-crypto-v2.md), [observation meaning](docs/what-it-proves.md)
 
-Permanent boundaries: no keys, passwords, plaintext or application payload
+Permanent boundaries — what it will NOT do: no keys, passwords, plaintext or application payload
 capture; no TLS interception, interposition or target environment/argv readers.
 
 ## Uninstall
@@ -181,12 +193,15 @@ Full path: [install — uninstall](docs/install.md#uninstall).
 ## Documented CLI limits
 
 Accepted-but-undocumented surface, stated here instead of left
-silent. `report`/`check` additionally accept manual/legacy flags not
-shown in their usage lines (`--object`, `--members-object`,
+silent. `report`/`check` recognize manual/legacy flags not shown
+in their usage lines (`--object`, `--members-object`,
 `--dev-bundle`, `--provider`, `--builtin`, `--settle`,
-`--image-digest`, `--force-offset`); `--table`/`--provider-table`
-are accepted and then refused (`table enrollment is deferred beyond
-v0.2`). The normal workflow needs none of them. `doctor --pid PID`
+`--image-digest`, `--force-offset`) only to refuse them on the
+normal route (`legacy discovery/enrollment flags require explicit
+--libcrypto diagnostics`, exit 2); they enable no normal
+workflow. `--table`/`--provider-table` likewise parse and then
+refuse (`table enrollment is deferred beyond v0.2`). The normal
+workflow needs none of them. `doctor --pid PID`
 and `doctor --exe PATH` select a sectioned foreign preflight (named in
 the top-level help, not in `doctor --help`); that route needs
 install-package metadata and refuses with exit 4 where the image

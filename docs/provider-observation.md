@@ -7,6 +7,7 @@ passive file-backed inventory:
 ```sh
 osslscope scan --pid 1234 --observe-providers --watch --duration 10 --json
 osslscope inspect --pid 1234 --observe-providers
+osslscope scan --pid 1234 --observe-providers --trace metadata --json
 osslscope doctor --discovery --json
 ```
 
@@ -69,6 +70,23 @@ v2.8 `request_evidence` section in `observed-crypto-v2.md`).
 Fetch, load, and query facts never mean the fetched object was
 used: the section names no serving provider, winner, or used
 implementation, and carries no property-query strings.
+
+`--trace MODE` programs pairing on this route:
+`off|metadata|latency|status|all` (default `off`; aggregate
+capture stays default-on in all modes).
+`--trace-histogram-by-api` adds per-API latency distributions
+and needs `--trace latency|all`.
+`OSSLSCOPE_TRACE_FALLBACK=aggregate-only` enforces the
+aggregate-only fallback. While latency acceptance (C023) is
+OPEN, operational modes (`latency|status|all`) degrade on
+public paths to that fallback with a note on stderr; `off`
+and `metadata` proceed as aggregates. No latency, duration,
+wall-clock or rate qualification is claimed while OPEN. Trace
+evidence changes none of the meaning above: advertisements
+still do not prove execution, and execution remains
+`not_observed` on this plane. The wire shape of the folded
+summary is specified in
+[observed-crypto-v2](observed-crypto-v2.md).
 
 The event loop drains cooperatively at a 100 ms cadence while it has control.
 Bounded synchronous snapshots and ELF reads can delay draining. Queue loss,

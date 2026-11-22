@@ -63,10 +63,11 @@ in force. These acceptance checks do not declare release readiness.
   independently; verify delivery and retain diagnostics when a
   destination fails. Keep workload logs under appropriate access
   controls.
-- [ ] **Installed journey qualified.** Current package builders
-  contain the host binary and install documentation only. A local
-  development triple/receipt is not acceptance of a forthcoming
-  matched redistributable host+BPF package; see [install](install.md).
+- [ ] **Installed journey qualified.** Current packages ship the
+  host binary, all five BPF roles and the matching receipt (see
+  [CI recipes](ci-recipes.md) and [install](install.md)). A local
+  development build/receipt is not acceptance of the packaged
+  install: qualify the exact packaged artifact on the target.
 - [ ] **Gate-disable procedure known.** Use approved
   warn-plus-artifacts handling while triaging a blocking gate;
   retain collection per [staging deploy](staging-deploy.md#gate-disable-procedure).

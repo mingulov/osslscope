@@ -5,10 +5,12 @@ The v0.6.0 observer starts with passive discovery, optionally observes
 public provider interfaces, and counts learned physical callback entries for
 one selected process. The supported lane (x86-64, 6.9+ feature-probed
 kernel, BTF, cgroup v2, stock OpenSSL 3.5.x) is in the
-[README support matrix](../README.md#support-matrix-050-lane); start with the
+[README support matrix](../README.md#support-matrix-060-lane); start with the
 [quickstart](quickstart.md). Installed/platform qualification is separate
-from source behavior; the latest qualification record is
-[v0.4.0](release-v0.4.0.md) (no v0.5.0 or v0.6.0 record exists yet).
+from source behavior; the latest versioned qualification record
+file is [v0.4.0](release-v0.4.0.md) (0.5.0/0.6.0 status lives in
+the [CHANGELOG](../CHANGELOG.md) and the README lane — neither
+re-qualifies deferred platform cells).
 
 ## Automatic crypto watch
 
@@ -83,9 +85,9 @@ useful discovery-only output. Invalid grammar exits 2; output failure exits 1.
 ## Passive discovery
 
 ```sh
-osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json] [--resolve-paths]
-osslscope inspect --pid PID [--json] [--resolve-paths]
-osslscope inspect --module PATH [--module PATH ...] [--json] [--resolve-paths]
+osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json] [--resolve-paths] [-v]
+osslscope inspect --pid PID [--json] [--resolve-paths] [-v]
+osslscope inspect --module PATH [--module PATH ...] [--json] [--resolve-paths] [-v]
 ```
 
 With no selectors, `scan` inventories visible numeric entries in the observer's
@@ -322,10 +324,10 @@ Reader break: v0.5 `deny_unknown_fields` readers reject v0.6 documents;
 v0.6 readers accept v0.5 documents. No raw symbol strings or mapping
 addresses enter either output or discovery diagnostics; target path and
 identity strings enter machine JSON as documented above. Machine
-consumers must parse `--json`/NDJSON only: the human stdout shape is
-owned by the human-surface plan
-(`docs/superpowers/plans/2026-11-11-v060-human-surface.md`), which splits
-stdout by mode (human rows by default, pure JSON under `--json`).
+consumers must parse `--json`/NDJSON only: stdout splits by mode
+(human rows by default, pure JSON under `--json`); the human row
+shapes are specified under [Human output](#human-output) below
+and are not a machine contract.
 
 Module metadata describes a SHA-256, numeric device/inode/size, architecture,
 finite recognized exports and dependency flags. The interface classifications
@@ -625,6 +627,31 @@ setup gap plus the `focused.attach_refused_quarantined` loss
 counter (see
 [kernel-quarantine-note](kernel-quarantine-note.md)).
 
+### Trace options (`--trace`, `--trace-histogram-by-api`)
+
+The documented trace surface is the provider-observation route
+(`scan --observe-providers`, `inspect --pid … --observe-providers`):
+
+```sh
+osslscope scan --pid 1234 --observe-providers --trace off --json
+osslscope scan --pid 1234 --observe-providers --trace metadata --json
+```
+
+`--trace MODE` programs pairing: `off|metadata|latency|status|all`
+(default `off`; aggregate capture stays default-on in all modes).
+`--trace-histogram-by-api` adds per-API latency distributions and
+needs `--trace latency|all`.
+`OSSLSCOPE_TRACE_FALLBACK=aggregate-only` enforces the
+aggregate-only fallback explicitly. While latency acceptance
+(C023) is OPEN, the operational modes (`latency`, `status`,
+`all`) degrade on public paths to that aggregate-only fallback
+with a note on stderr; `off` and `metadata` proceed as
+aggregates. No latency, duration-distribution, wall-clock or
+rate qualification is claimed while OPEN — treat any trace
+output as aggregate evidence only. Fetch/load/query facts in
+this plane still never mean the fetched object was used (see
+[provider observation](provider-observation.md)).
+
 ## Execution report and check
 
 ```sh
@@ -671,6 +698,19 @@ functional program/map loading and self-attachment. Its JSON distinguishes
 available, denied, unavailable and not-checked capabilities; an available
 self-control does not establish target-specific access or observation success.
 `doctor --discovery --json` retains the discovery-only capability route.
+Doctor exit codes are route-dependent — there is no single doctor
+failure code:
+
+- Focused (`doctor`, `doctor --discovery`): 0 available, 1 output
+  failure, 2 invalid arguments, 3 capabilities unavailable (no 4).
+- Sectioned (`doctor --pid`/`--exe`/`--object…` vetting): 0 passed,
+  1 internal failure, 2 invalid arguments, 4 checks failed or
+  package admission refused, fail-closed (no 3).
+- Profiled (bare `doctor --libcrypto`): 0 preflight passed,
+  2 invalid arguments, 4 preflight failed, fail-closed (no 1, no 3).
+
+Each route's `--help` names its own exits; gate automation on the
+route you actually run.
 
 | Option | Meaning |
 | --- | --- |
@@ -793,8 +833,8 @@ release can strand a stopped child and requires external cleanup.
 | 0 | COMPLETE report window, or satisfied definite policy on one (schema case; normal runs are PARTIAL, exit 3). |
 | 1 | Child failure, artifact delivery failure or runtime failure (with or without usable observation). |
 | 2 | Invalid arguments/policy or invalid explicit companion. |
-| 3 | PARTIAL report or doctor unavailable/denied capability. |
-| 4 | Report/check setup/environment refusal without usable observation. |
+| 3 | PARTIAL report; or focused/discovery doctor unavailable/denied capability (those doctor routes emit no 4). |
+| 4 | Report/check setup/environment refusal without usable observation; or sectioned/profiled doctor fail-closed refusal (those doctor routes emit no PARTIAL 3). |
 | 10 | Definite policy violation, taking precedence over other usable-result failures. |
 | 11 | Policy inconclusive; normal Unknown-only candidate evidence cannot satisfy definite algorithm rules. |
 
@@ -804,13 +844,28 @@ when interpreting failure; successful stimulus alone proves no observation.
 
 ### Accepted-but-undocumented surface (documented limits)
 
-Stated here instead of left silent. `report`/`check` accept
-manual/legacy flags not shown in their usage lines: `--object`,
+Stated here instead of left silent. `report`/`check` recognize
+manual/legacy flags not shown in their usage lines (`--object`,
 `--members-object`, `--dev-bundle`, `--provider`, `--builtin`,
-`--settle`, `--image-digest` and `--force-offset`. `--table` and
-`--provider-table` parse and then refuse (`table enrollment is deferred
-beyond v0.2`). The normal workflow needs none of these; explicit object
-overrides stay operator-trusted as described above.
+`--settle`, `--image-digest` and `--force-offset`) only to refuse
+them on the normal route (`legacy discovery/enrollment flags
+require explicit --libcrypto diagnostics`, exit 2); with
+`--libcrypto` only the legacy count-only `run --` diagnostic
+runs and the other modes stay deferred. `--table` and
+`--provider-table` likewise parse and then refuse (`table
+enrollment is deferred beyond v0.2`). None of these tokens is an
+unknown-flag error and none enables a normal workflow. The
+normal workflow needs none of these; explicit object overrides
+(`--observation-object`/`--count-object`, shown in the usage
+lines) stay operator-trusted as described above.
+
+`report`/`check` also parse `--trace MODE` and
+`--trace-histogram-by-api` (same words as the provider route),
+but their usage lines and `--help` omit them. That parser surface
+is internal/undocumented and is not a supported workflow; use
+the documented provider-observation trace surface above. There
+are no `diagnostics`, `manifest` or `policy` subcommands; those
+words correctly return `unknown subcommand` (exit 2).
 
 `doctor --pid PID` and `doctor --exe PATH` select a sectioned
 foreign-backing/target preflight. That route is named in the top-level
@@ -828,6 +883,124 @@ for verdict adjudication and are not operator tools.
 Name collision: `osslscope inspect` (this page's process/module
 inventory) is unrelated to `docker inspect` (container config; the
 container page uses it to verify `Privileged=false` and the cap set).
+
+## Continuous operation: service, export, watch
+
+Three shipped top-level commands cover continuous operation.
+`service` is the producer; `export` and `watch` are presenters
+over the directory it writes. They are documented here at the
+level their `--help` specifies; run `<command> --help` for the
+exact current surface.
+
+```sh
+osslscope service --help
+osslscope export --help
+osslscope watch --help
+```
+
+### `service` — bounded-window producer
+
+```text
+usage: osslscope service --out DIR [--pid PID ...] [--module PATH ...] [--cgroup PATH]
+       [--window S] [--interval S] [--timeout S] [--grace S] [--format json|human]
+       [--queue-bytes N] [--queue-events N] [--rotate-bytes N] [--rotate-interval S]
+       [--retain-windows N] [--retain-bytes N] [--policy FILE] [--stream PATH]
+       [--config FILE] [--reset-sequence]
+```
+
+`--out DIR` is required (bare `service` refuses with
+`service requires --out DIR`, exit 2), and at least one
+`--pid`/`--cgroup` target selection is required — the stock
+installed config selects none and therefore refuses loudly at
+startup instead of observing nothing. A minimal foreground run:
+
+```sh
+osslscope service --out ./windows --pid 1234
+```
+
+`--window`/`--interval` set the bounded window cadence;
+`--queue-bytes`/`--queue-events`, `--rotate-bytes`/`--rotate-interval`
+and `--retain-windows`/`--retain-bytes` bound queueing, stream
+rotation and retention; `--policy FILE` and `--stream PATH` add
+policy evaluation and a stream tap; `--config FILE` loads the
+service config (the installed DEB unit runs
+`service --config /etc/osslscope/service.toml` — see
+[installed service](install.md#installed-service-deb)).
+`--reset-sequence` is refused while the out-DIR holds windows.
+Startup/admission refusals exit 2 before any window opens (see
+[install](install.md#installed-service-deb) for the unit's
+restart posture). The service help lists no exit table; do not
+gate automation on codes beyond those documented here and in
+`install.md`.
+
+Honest limits: the service slice is present but not
+production-qualified. No clean-COMPLETE bootstrap, daemon
+readiness or soak claim is made, and operational per-call trace
+is deferred in this slice (aggregate evidence only, as above).
+
+### `export` — Prometheus scrape + optional OTLP push
+
+```text
+usage: osslscope export --out DIR [--listen ADDR] [--poll-seconds S] [--otlp-enable] [--otlp-endpoint URL] [--otlp-push-seconds S] [--checkpoint PATH]
+```
+
+`export` serves Prometheus exposition on `GET /metrics`
+(default listen `127.0.0.1:9464`) from a service out-DIR and can
+optionally push OTLP/HTTP metrics (`--otlp-enable`,
+`--otlp-endpoint URL`, `--otlp-push-seconds S`); push is off
+unless enabled. It is read-only on the out-DIR and is not a
+standalone observer: with no service windows there is nothing
+to present.
+
+```sh
+osslscope export --out ./windows
+curl -s http://127.0.0.1:9464/metrics
+```
+
+`--listen ADDR` binds exactly as given and the help documents
+no authentication flag: anyone who can reach the address can
+read the host's crypto-activity counters. Keep the loopback
+default, or place a widened bind behind your own access
+control. Treat scraped/pushed payloads as production telemetry
+(finite-vocabulary counters — never keys, payloads or target
+strings; see the [privacy allowlist](privacy/allowlist-v1.md)).
+
+### `watch` — one operator frame
+
+```text
+usage: osslscope watch --out DIR [--poll-seconds S] [--format human|json] [--checkpoint PATH] [--follow]
+```
+
+`watch` renders one operator frame from a service out-DIR
+(read-only on that directory). Non-TTY renders exactly one
+frame and exits 0; `--follow` keeps rendering, `--format`
+selects human or JSON, `--poll-seconds` sets the poll cadence.
+
+```sh
+osslscope watch --out ./windows
+osslscope watch --out ./windows --format json
+```
+
+Both presenters maintain a checkpoint file
+(`--checkpoint PATH` overrides its location): "read-only"
+covers the out-DIR itself, so ensure the checkpoint location
+is writable. Bare `export`/`watch` print their usage and exit
+2. Neither presenter proves the service is qualified; they
+only present what the producer finalized, including its
+PARTIAL/Unknown labeling.
+
+### `alias-audit` — offline harvest grouping
+
+```text
+usage: osslscope alias-audit [--in FILE] < doc.json
+```
+
+`alias-audit` groups a harvest document's rows by shared
+`addr_hash`, reporting addresses claimed by several triples.
+Input is a harvest JSON document on stdin, or `--in FILE`;
+empty input refuses (`empty input (want a harvest doc)`,
+exit 2). It is an offline analysis tool: its input does not
+become new runtime evidence and it observes no process.
 
 ## Legacy foreground diagnostic
 

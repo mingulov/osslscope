@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Staging deploy
 
-> HISTORICAL / developer runbook — not part of the 0.5.0 supported
+> HISTORICAL / developer runbook — not part of the 0.6.0 supported
 > journey (see `docs/quickstart.md`). Its privileged debug fallback
-> predates the 0.5.0 no-privileged posture and is UNSUPPORTED as a
+> predates the no-privileged posture and is UNSUPPORTED as a
 > release recipe.
 
 CI gates with `run --`. Staging observes already-running
@@ -30,9 +30,10 @@ Requirements for the ephemeral container:
   full privilege as the documented fallback.
 - Carries the matching osslscope binary and the
   observation/focused-count companion pair (explicit
-  `--observation-object`, `--count-object`). Current package
-  builders do not supply BPF; implicit selection requires a trusted
-  install with matching receipt, not loose files.
+  `--observation-object`, `--count-object`). Current packages do
+  supply all five BPF roles with a matching receipt; implicit
+  selection still requires a trusted install whose receipt checks
+  pass, not loose files.
 
 Example (Kubernetes; plain-docker equivalent uses
 `--pid container:<name> --privileged --rm`):
@@ -71,7 +72,8 @@ improves custody without guaranteeing startup/first-call coverage.
 
 For a statically linked target, observe the process the same
 way: the current surface has no provider-selection flags (the
-v0.2 `--provider`/`--builtin` flags are removed).
+v0.2 `--provider`/`--builtin` flags are parse-then-refused on
+the normal route — see [usage](usage.md#execution-report-and-check)).
 Stripped-binary offset enrollment (`--force-offset`/`--table`)
 is deferred-by-design on `report`/`check` (see [the built-in
 runbook](builtin-runbook.md)). For a FIPS provider module,

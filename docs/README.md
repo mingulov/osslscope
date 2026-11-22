@@ -17,7 +17,8 @@ this tree or removes attribution, startup or completeness gaps.
 - `build.md` - reproducible source build (host + BPF), manifests, lockfiles
 - `licensing.md` - component terms and the BPF object/load license boundary
 - `install.md` - local prefix and package install, doctor-first verify, uninstall
-- `usage.md` - discovery, watch, provider observation, PID/run reports and policy
+- `usage.md` - discovery, watch, provider observation, PID/run reports,
+  policy, and continuous operation (`service`/`export`/`watch`)
 - `what-it-proves.md` - claim chain, non-goals, who-should-NOT-adopt
 - `observation-contract.md` - public query forwarding, authority and attribution limits
 - `release-v0.4.0.md` - automatic observation candidate and artifact-specific limits
@@ -32,14 +33,24 @@ this tree or removes attribution, startup or completeness gaps.
 - `staging-deploy.md` - staging deploy for already-running targets
 - `fips-interim.md` - FIPS interim rule (no KAT discriminator)
 - `promotion-checklist.md` - staging-to-production promotion checklist
-- `builtin-runbook.md` - stripped/unknown-libcrypto recipe for
-  `--builtin` inventory
+- `builtin-runbook.md` - stripped/unknown-libcrypto doctor vetting
+  (anchor ladder; no `--builtin` mode on the current CLI)
 - `trace-gap.md` - OpenSSL tracing and external observation compared
 - `observed-crypto-v2.md` - v2 report/check JSON, human and CBOM contract
+- `provider-observation.md` - public provider-API observation,
+  fetch evidence and `--trace` options
+- `engine-observations.md` - typed ENGINE tripwire observations
+- `id-map.md` - frozen operation/function/API id registry (display aids)
+- `kernel-quarantine-note.md` - API-21 kernel-panic quarantine residuals
+- `lifecycle-producer.md` - report/check lifecycle runtime init contract
+- `live-seal-checklist.md` - live-run sealed-evidence checklist
 - `privacy/allowlist-v1.md` - capture allowlist: what may be observed
 - `privacy/residuals.md` - privacy residuals beyond the allowlist
+- `privacy/value-capture-gate.md` - approval gate for any future value capture
 
-Older auditor stories, deployment/runbooks, `--builtin` examples, package and
-service references retain their historical/developer scope. They do not expand
-the current CLI or qualify deferred features; use current usage/release notes
-when an example disagrees.
+Older auditor stories and deployment/runbooks retain their
+historical/developer scope. They do not expand the current CLI
+or qualify deferred features; use current usage/release notes
+when an example disagrees. Current continuous-operation
+commands (`service`/`export`/`watch`) are documented in
+[usage](usage.md#continuous-operation-service-export-watch).

@@ -11,7 +11,7 @@ or supply an arbitrary application's missing integration. See the official
 [trace channel API](https://docs.openssl.org/3.5/man3/OSSL_trace_set_channel/)
 and [CLI setup](https://github.com/openssl/openssl/blob/openssl-3.5.5/apps/openssl.c).
 
-| Aspect | OpenSSL tracing | osslscope v0.3 |
+| Aspect | OpenSSL tracing | osslscope 0.6.0 |
 | --- | --- | --- |
 | Activation | Trace-enabled build and configured category channels/callbacks | External process/file access; tracing additionally needs installed BPF companions and privileges |
 | Application cooperation | The CLI already provides integration; other apps vary | No injection, application changes or interposition |
@@ -22,13 +22,13 @@ and [CLI setup](https://github.com/openssl/openssl/blob/openssl-3.5.5/apps/opens
 
 OpenSSL includes ENGINE selection/reference diagnostic categories. Diagnostic
 messages about loading, selection or references do not establish a universal
-per-operation execution counter. Likewise, osslscope's ordinary v0.3 path does
+per-operation execution counter. Likewise, osslscope's ordinary current path does
 not promise general low-level/ENGINE coverage. Older diagnostic fixtures retain
 their own scope; they do not qualify the normal scanner.
 
 A provider advertisement or fetch is not callback execution. A counted entry
 does not establish crypto/application success, FIPS state or a complete
-inventory. Normal v0.3 reports remain PARTIAL, algorithm policy is inconclusive,
+inventory. Normal reports remain PARTIAL, algorithm policy is inconclusive,
 and default-provider activity may produce no learned callback rows. Read
 [observation limits](what-it-proves.md) before interpreting a zero result.
 

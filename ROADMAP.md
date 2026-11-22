@@ -8,8 +8,13 @@ algorithm or exact-build admission list on the normal path.
 
 v0.3.0 is published. The v0.4.0 automatic-observation state is published as a
 current-state alpha, with its finite installed qualification and known limits
-described in [the alpha notes](docs/release-v0.4.0.md).
-The milestones below are planned capabilities, not claims about the current app.
+described in [the alpha notes](docs/release-v0.4.0.md). v0.6.0 is the
+current release. The next release, v0.7.0 (interim), is re-scoped below
+as a Phase 1+2 aggregate-only close-out; it is explicitly **not** the
+feature-complete milestone once planned under the v0.7 number (see
+"Beyond v0.7.0" below).
+The milestones below are planned capabilities, not claims about the current app,
+except where a status paragraph says otherwise.
 
 ## v0.5.0: useful execution answers and practical installation
 
@@ -55,6 +60,15 @@ refusal alone does not complete the intended active workflow.
 
 ## v0.6.0: continuous operation and deeper investigation
 
+**0.6.0 status (shipped).** 0.6.0 ships the usability slice over
+0.5.0 described in the [README](README.md) and
+[CHANGELOG](CHANGELOG.md): row-shaped discovery, pure `--json`
+stdout, file-path/identity/version evidence, and the interrupt
+contract — still honest PARTIAL on the one declared lane. The
+continuous-operation plan below was only partly realized in
+0.6.0; remaining items carry into the interim v0.7.0 section
+with their honest limits stated there.
+
 - Follow selected process lifecycles and fork/exec transitions with explicit
   identity, loss and fair resource admission.
 - Add continuous service operation with bounded windows, policy reload,
@@ -69,7 +83,58 @@ refusal alone does not complete the intended active workflow.
 - Support useful before/after migration comparison and qualify operational
   performance, privacy and package lifecycle together.
 
-## v0.7.0: complete the known feature set
+## v0.7.0 (interim): Phase 1+2 aggregate-only close-out
+
+**Naming note (read first).** This section supersedes the earlier
+"v0.7.0: complete the known feature set" plan. The interim v0.7.0
+is a Phase 2 completion release only; the former feature-complete
+scope moves to "Beyond v0.7.0" below under a later version to be
+chosen by the owner. Do not read any feature-complete claim
+(ARM64, OpenSSL 1.1.1, RHEL/Secure Boot, broad matrix, p11scope
+correlation, human acceptance) into the v0.7.0 number.
+
+In scope for interim v0.7.0, on the one declared lane (Linux
+x86-64, 6.9+ feature-probed kernel, BTF, cgroup v2, stock
+OpenSSL 3.5.x):
+
+- Passive discovery (`scan`/`inspect`, sampled `--watch`) and
+  public provider-API observation (`--observe-providers`) with
+  expanded fetch/load/query request evidence. Fetch evidence is
+  request evidence only: it never proves the fetched object was
+  used, which provider served a call, or that crypto executed;
+  execution remains `not_observed` on that plane.
+- Focused per-window `report`/`check` physical callback counts
+  for one process incarnation (or one owned `run --`), with
+  late-cut withholding. Normal reports stay PARTIAL, candidates
+  stay Unknown, and no definite algorithm/provider count or
+  definite CBOM asset is claimed from normal runs.
+- Bounded-window continuous operation as shipped commands:
+  `service` (windows to an out-DIR), `export` (Prometheus
+  `GET /metrics` plus optional OTLP push from that out-DIR) and
+  `watch` (one operator frame). The service slice is present
+  but not production-qualified: no clean-COMPLETE bootstrap and
+  no operational per-call trace in the service slice are claimed.
+- Aggregate trace only. `--trace off|metadata` proceed as
+  aggregates; operational modes (`latency|status|all`) and
+  `--trace-histogram-by-api` degrade to the aggregate-only
+  fallback on public paths while latency/rate acceptance (C023)
+  remains OPEN. C023 results publish as measurements, not as a
+  latency, wall-clock or rate qualification.
+
+Explicitly deferred out of interim v0.7.0: definite
+algorithm/provider execution attribution and per-call serving
+provider/algorithm; operational per-call trace, durations and
+histograms as supported output; latency/rate qualification;
+COMPLETE-window claims; fork/exec following and cross-process
+totals as qualified claims; and every item under "Beyond
+v0.7.0" below.
+
+## Beyond v0.7.0: feature-complete milestone (not in v0.7.0)
+
+The former v0.7 plan, preserved verbatim as deferred scope. An
+unfinished requirement keeps feature completion open rather than
+silently moving to a later version; assigning it a version
+number is an owner decision at re-planning time.
 
 - Broaden the tested OpenSSL 3/4, kernel, libc and provider matrix, including
   default, legacy, FIPS and third-party providers.
@@ -86,12 +151,9 @@ refusal alone does not complete the intended active workflow.
 - Complete package channels, consumer compatibility, remaining correctness and
   privacy work, and real operator/practitioner acceptance before feature freeze.
 
-Known selected features belong in this milestone. An unfinished requirement
-keeps feature completion open rather than silently moving to a later version.
-
 ## Toward 1.0: stabilization
 
-After v0.7, focus on correctness, security, performance, usability, documentation
+After the feature-complete milestone, focus on correctness, security, performance, usability, documentation
 and deployment fixes. Qualify the integrated packages across the supported
 matrix, continuous-operation soak, useful consumer imports and real operator
 journeys. Stable CLI/schema behavior and reproducible release artifacts matter

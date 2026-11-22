@@ -111,7 +111,8 @@ Notes:
 - Observation covers the target process with the automatically
   selected companions; the current surface has no
   provider-selection flags (the v0.2 `--provider`/`--builtin`
-  flags are removed — see [usage](usage.md#execution-report-and-check)).
+  flags are parse-then-refused on the normal route — see
+  [usage](usage.md#execution-report-and-check)).
 - `--workload-out workload.log` captures the workload's own
   stdout/stderr to a file; without it the workload output goes
   to /dev/null and observer stdout stays a pure artifact

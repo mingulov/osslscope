@@ -26,7 +26,7 @@ tells you, but it cannot qualify what it cannot observe:
 ## Historical v0.3 discovery and observation
 
 The remainder of this section was written for v0.3 and is frozen
-history in a v0.5.0 tree: do not read it as current coverage.
+history in a 0.6.0 tree: do not read it as current coverage.
 For the live contract see [the v2 document
 reference](observed-crypto-v2.md), [the PARTIAL
 runbook](partial-runbook.md), and [the v0.4.0 current-state alpha
@@ -48,8 +48,10 @@ facts; none establishes crypto/application success or FIPS/HSM state.
 Ordinary built-in default-provider initialization/query may bypass the exported
 hooks, so an actively computing application can yield zero callback counts.
 Warm/cached state, short startup, polling, invalidation and final-tail gaps also
-remain. Zero counts are not non-use. The [next-version plan](../ROADMAP.md#v040-automatic-observation)
-targets automatic table discovery and these ordinary workload paths.
+remain. Zero counts are not non-use. Automatic table discovery
+for these ordinary workload paths shipped as the
+[v0.4.0 alpha](release-v0.4.0.md); forward scope is in the
+[roadmap](../ROADMAP.md).
 
 Inventory can cover multiple processes/cgroups; execution reports do not follow
 children or membership. Permission/namespace/backing/resource failures stay
@@ -151,5 +153,7 @@ injection and privileged process/FD tampering are outside the preview model.
 
 See [usage](usage.md#exit-codes), [catalogue provenance](../profiles/README.md)
 and the [later roadmap](../ROADMAP.md) before applying broader developer
-references. General providers, foreign attach, services, tracing/export,
-stronger completeness guarantees and broader platforms are later work.
+references. General providers and foreign attach exist on the
+current surface with the limits in [usage](usage.md), as do the
+`service`/`export`/`watch` presenters; stronger completeness
+guarantees and broader platforms remain later work.

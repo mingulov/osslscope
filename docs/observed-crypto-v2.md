@@ -549,11 +549,14 @@ Candidate lines never carry counts (the site total is shared, not
 per-alias). Offsets are decimal file offsets, explicitly labeled;
 numeric offsets and addresses never render `0x`-shaped
 (`output_contract` scans for address-shaped bytes). That
-guarantee covers numeric formatting only: arbitrary
-`--image-digest` text passes through control neutralization
-(`safe_display` maps control/display-control characters to `?`)
-but is otherwise preserved byte-for-byte, so operator-supplied
-text may contain `0x`.
+guarantee covers numeric formatting only: where `--image-digest`
+is admitted (the legacy `--libcrypto` route only — the normal
+route refuses the flag), its text passes through control
+neutralization (`safe_display` maps control/display-control
+characters to `?`) but is otherwise preserved byte-for-byte, so
+operator-supplied text may contain `0x`. The v0.2-era note that
+nonempty values were rejected describes that preview's
+validation, not the current route split above.
 
 The three context lines after the header always render
 (`src/report.rs` `render_human`): `duration` derives from the

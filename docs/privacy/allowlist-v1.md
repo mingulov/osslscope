@@ -184,9 +184,9 @@ Non-target provenance:
 - `target.comm`: `/proc/<pid>/comm` task name.
 - `target.argv_redacted`: unconditional `true`. Raw argv/cmdline
   has no carrier anywhere; where a cmdline-shaped string must
-  render, the fixed `(argv-redacted)` placeholder is used
-  (`inspect --marker` matches `/proc` cmdline at admission and
-  likewise emits nothing).
+  render, the fixed `(argv-redacted)` placeholder is used. (No
+  `--marker` flag exists on the current CLI; discovery never
+  matches or emits `/proc` cmdline.)
 - traversal tids: `/proc/<pid>/task` entry names (numeric tids for
   BIRTH registration; the backend reads directory names only —
   no target memory, and its map I/O touches only the §4
