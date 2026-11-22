@@ -1743,17 +1743,6 @@ fn with_stage_left_note(primary: std::io::Error) -> std::io::Error {
     )
 }
 
-/// Append the own-bytes withdrawal note to a placement
-/// refusal (P2fix14 NEW-80): the stage verified as ours and
-/// was removed (the refusal carries the proof — no bytes of
-/// ours remain beneath the possibly-moved directory).
-fn with_stage_withdrawn_note(placement: std::io::Error) -> std::io::Error {
-    std::io::Error::new(
-        placement.kind(),
-        format!("{placement} (owned stage withdrawn: verified our own and removed)"),
-    )
-}
-
 /// `renameat2` flags (Linux UAPI — libc 0.2.189 exposes the
 /// syscall on gnu but not these constants).
 const RENAME_NOREPLACE: libc::c_uint = 1;
@@ -1767,6 +1756,8 @@ fn renameat2_result(
     flags: libc::c_uint,
 ) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd as _;
+    #[cfg(test)]
+    publish_probe::record();
     // SAFETY: dir_fd is live; both are NUL-free file names in it.
     if unsafe {
         libc::renameat2(
@@ -1917,41 +1908,136 @@ fn name_refers_to(dir_fd: &std::fs::File, name: &std::ffi::CString, id: (u64, u6
     (st.st_dev, st.st_ino) == id
 }
 
+/// Identity-conditional owned removal (P2fix15 NEW-87 —
+/// verification-then-`unlinkat` is CONFIRMED, not trusted):
+/// remove `name` ONLY IF it refers to `expect`. An `O_PATH`
+/// open pins the inode across the call; `fstat` verifies it
+/// (mismatch ⇒ `Ok(false)` — left declared, never a blind
+/// unlink); `unlinkat` removes the name; then the STILL-OPEN
+/// fd confirms OUR inode lost its link (its link count
+/// dropped by exactly one) and the name is gone. A rebind
+/// between verify and use is DETECTED (our link count
+/// intact while the name went away ⇒ a foreign object was
+/// unlinked instead — declared loudly, never success).
+/// True prevention is unexpressible (no conditional-unlink
+/// syscall exists); moves cannot rebind entries, so only
+/// true-concurrent DIRECT entry manipulation reaches the
+/// residual window (hostile-only — the move threat model
+/// never does). `Err` is a failed unlink or a detected
+/// rebound; `Ok(true)` removed-and-confirmed our own entry.
+fn unlink_owned(
+    dir_fd: &std::fs::File,
+    name: &std::ffi::CString,
+    expect: (u64, u64),
+) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd as _;
+    // SAFETY: dir_fd is live; the name is a NUL-free file
+    // name in it (`O_PATH` never follows, never stalls —
+    // FIFOs, symlinks, and directories open uniformly and
+    // fail the identity compare below).
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Ok(false);
+    }
+    // SAFETY: openat returned a fresh owned fd.
+    let pinned = unsafe {
+        use std::os::fd::FromRawFd as _;
+        std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(fd))
+    };
+    let mut before: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: pinned is live; `before` outlives the call.
+    if unsafe { libc::fstat(pinned.as_raw_fd(), &mut before) } != 0 {
+        return Ok(false);
+    }
+    if (before.st_dev, before.st_ino) != expect {
+        return Ok(false);
+    }
+    let links_before = before.st_nlink;
+    // Fault injection (P2fix15 NEW-87, test-only): run the
+    // armed entry hook between verification and use (the
+    // verify→unlink interval — inert at zero).
+    #[cfg(test)]
+    unlink_hook::take_and_run();
+    unlink_checked(dir_fd, name)?;
+    // Confirm: OUR inode lost exactly one link and the name
+    // is gone (a rebound name removed a FOREIGN object —
+    // our count intact — and must be declared loudly).
+    let mut after: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: pinned is live; `after` outlives the call.
+    if unsafe { libc::fstat(pinned.as_raw_fd(), &mut after) } != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "osslscope: owned removal unconfirmable (lost our own entry tracking — operator must inspect)",
+        ));
+    }
+    if after.st_nlink != links_before.saturating_sub(1) || name_id(dir_fd, name).is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "osslscope: owned removal hit a rebound name (the name went away but our own entry still stands — a foreign object may have been unlinked instead; operator must inspect)",
+        ));
+    }
+    Ok(true)
+}
+
 /// Attempt the identity-verified own-stage removal (P2fix14
-/// NEW-80): `Ok(true)` removed our own stage, `Ok(false)`
-/// means the name no longer refers to our own stage inode
-/// (left declared — never a blind unlink), `Err` is a failed
-/// unlink of a verified-own stage.
+/// NEW-80, confirmed P2fix15 NEW-87): `Ok(true)` removed
+/// our own stage (confirmed), `Ok(false)` means the name no
+/// longer refers to our own stage inode (left declared —
+/// never a blind unlink), `Err` is a failed unlink of a
+/// verified-own stage or a detected rebound.
 fn try_withdraw_stage(
     dir_fd: &std::fs::File,
     stage_c: &std::ffi::CString,
     own_id: (u64, u64),
 ) -> std::io::Result<bool> {
-    if !name_refers_to(dir_fd, stage_c, own_id) {
-        return Ok(false);
-    }
-    unlink_checked(dir_fd, stage_c)?;
-    Ok(true)
+    unlink_owned(dir_fd, stage_c, own_id)
+}
+
+/// Append the placement-bound leave note to a refused write
+/// (P2fix15 NEW-87 — withdrawal is PLACEMENT-BOUND): the
+/// owned stage is NOT unlinked beneath an unproven directory
+/// (a removal there is itself an inside mutation) — it
+/// stands declared instead (never published, never silent —
+/// operator must intervene).
+fn with_stage_left_unproven_note(primary: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        primary.kind(),
+        format!(
+            "{primary} (stage left in place: placement unproven — no removal beneath the producer; operator must intervene)"
+        ),
+    )
 }
 
 /// Withdraw the owned stage after a refused write (P2fix14
-/// NEW-80 — supersedes the P2fix13 placement-gated
-/// `cleanup_stage`): the stage is exclusively ours (O_EXCL
-/// this call) — remove it by identity-verified unlink and
-/// return `primary` UNCHANGED on success (raw error
-/// preserved — the EIO pin). Removal restores the placement
-/// invariant (it can only ever remove bytes we wrote — never
-/// a placement-affecting write), so it is NOT
-/// placement-gated: gating it would leave our bytes beneath a
-/// possibly-inside directory. On identity mismatch (or unlink
-/// failure) the residue is declared loudly (the primary
-/// leads).
+/// NEW-80, placement-bound P2fix15 NEW-87): the stage is
+/// exclusively ours (O_EXCL this call) — re-prove placement
+/// IMMEDIATELY before the removal (a concurrent move since
+/// the last proof leaves the stage standing declared
+/// instead — no unlink beneath the producer), then remove it
+/// by identity-confirmed unlink and return `primary`
+/// UNCHANGED on success (raw error preserved — the EIO
+/// pin). On identity mismatch (or unlink failure) the
+/// residue is declared loudly (the primary leads).
+#[allow(clippy::too_many_arguments)]
 fn withdraw_stage(
+    guard: &PlacementGuard,
     dir_fd: &std::fs::File,
+    out_dir: &Path,
+    step: &str,
+    display: &Path,
     stage_c: &std::ffi::CString,
     own_id: (u64, u64),
     primary: std::io::Error,
 ) -> std::io::Error {
+    if guard.prove_before(dir_fd, out_dir, step, display).is_err() {
+        return with_stage_left_unproven_note(primary);
+    }
     match try_withdraw_stage(dir_fd, stage_c, own_id) {
         Ok(true) => primary,
         Ok(false) => with_stage_left_note(primary),
@@ -1959,22 +2045,16 @@ fn withdraw_stage(
     }
 }
 
-/// Withdraw the owned stage after a placement refusal
-/// (P2fix14 NEW-80): like `withdraw_stage`, but a verified
-/// removal is DECLARED on the refusal (the proof that no
-/// bytes of ours remain beneath the possibly-moved
-/// directory).
-fn refuse_withdrawn(
-    dir_fd: &std::fs::File,
-    stage_c: &std::ffi::CString,
-    own_id: (u64, u64),
-    placement: std::io::Error,
-) -> std::io::Error {
-    match try_withdraw_stage(dir_fd, stage_c, own_id) {
-        Ok(true) => with_stage_withdrawn_note(placement),
-        Ok(false) => with_stage_left_note(placement),
-        Err(cleanup) => with_stage_cleanup_note(placement, cleanup),
-    }
+/// Refuse after a placement proof failed (P2fix15 NEW-87 —
+/// supersedes the P2fix14 NEW-80 `refuse_withdrawn`): the
+/// owned stage is LEFT standing and DECLARED (never
+/// unlinked — withdrawal is placement-bound, and a removal
+/// beneath an unproven directory is itself an inside
+/// mutation). The stage never published, so authority is
+/// unaffected — but the bytes stand declared, never
+/// silently leaked.
+fn refuse_leaving_stage(placement: std::io::Error) -> std::io::Error {
+    with_stage_left_unproven_note(placement)
 }
 
 /// Raw dirfd-relative target stat (P2fix14 NEW-80 — no
@@ -2027,8 +2107,228 @@ fn not_regular_target(display: &Path) -> std::io::Error {
     )
 }
 
+/// Outcome of a settled checkpoint flush (P2fix15 NEW-89):
+/// the commit is DURABLE when this returns (the caller
+/// advances live state); `residue` names post-settlement
+/// cleanup leftovers that report SEPARATELY — never as
+/// flush failure (live already advanced past them) and
+/// never silently (the caller surfaces each entry to the
+/// operator). Empty on a clean commit.
+#[derive(Debug, Clone, Default)]
+pub struct FlushOutcome {
+    /// Declared cleanup residue (stage names / notes).
+    pub residue: Vec<String>,
+}
+
+impl FlushOutcome {
+    /// A commit with no residue.
+    pub fn clean() -> Self {
+        Self::default()
+    }
+
+    /// True when the commit left no residue.
+    pub fn is_clean(&self) -> bool {
+        self.residue.is_empty()
+    }
+}
+
+/// Settlement-record schema (P2fix15 NEW-88 — the durable
+/// settlement discriminator: which checkpoint bytes the last
+/// write SETTLED, so reopen tells a settled target from an
+/// unconfirmed replacement after interruption).
+const SETTLED_SCHEMA: &str = "osslscope-checkpoint-settled-v1";
+
+/// Sibling settlement-record path for a checkpoint path
+/// (P2fix15 NEW-88 — `<target>.settled` beside the target).
+fn settled_path(checkpoint: &Path) -> PathBuf {
+    let mut name = checkpoint
+        .file_name()
+        .map(|n| n.to_owned())
+        .unwrap_or_default();
+    name.push(".settled");
+    match checkpoint.parent() {
+        Some(parent) => parent.join(&name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// The parsed settlement record (P2fix15 NEW-88): the
+/// content identity the last write settled.
+pub(crate) struct SettledRecord {
+    /// Embedded `sha256` of the SETTLED checkpoint bytes.
+    pub(crate) target_sha256: String,
+    /// `checkpoint_seq` the settling write stamped.
+    pub(crate) checkpoint_seq: u64,
+}
+
+/// Render a settlement record's canonical bytes (P2fix15
+/// NEW-88 — struct field order is fixed, so re-rendering
+/// restores content-identical records).
+fn render_settlement_record(rec: &SettledRecord) -> Vec<u8> {
+    let mut body = serde_json::json!({
+        "schema": SETTLED_SCHEMA,
+        "target_sha256": rec.target_sha256,
+        "checkpoint_seq": rec.checkpoint_seq,
+    });
+    let bytes = serde_json::to_vec(&body).unwrap_or_default();
+    let hash = sha256_hex(&bytes);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("sha256".to_string(), serde_json::json!(hash));
+    }
+    serde_json::to_vec(&body).unwrap_or_default()
+}
+
+/// Parse settlement-record bytes (P2fix15 NEW-88): schema +
+/// 64-hex target identity + sequence + self-hash — `Err`
+/// names the defect (torn or foreign content never parses).
+fn parse_settlement_record(bytes: &[u8]) -> Result<SettledRecord, &'static str> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| "unparseable")?;
+    if str_at(&v, "schema") != Some(SETTLED_SCHEMA) {
+        return Err("foreign schema");
+    }
+    let target_sha256 = str_at(&v, "target_sha256").ok_or("missing target identity")?;
+    if target_sha256.len() != 64 || !target_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("malformed target identity");
+    }
+    let checkpoint_seq = u64_at(&v, "checkpoint_seq").ok_or("missing sequence")?;
+    let want = str_at(&v, "sha256").ok_or("missing hash")?;
+    let mut bare = v.clone();
+    if let Some(obj) = bare.as_object_mut() {
+        obj.remove("sha256");
+    }
+    let bare_bytes = serde_json::to_vec(&bare).unwrap_or_default();
+    if sha256_hex(&bare_bytes) != want {
+        return Err("hash mismatch");
+    }
+    Ok(SettledRecord {
+        target_sha256: target_sha256.to_string(),
+        checkpoint_seq,
+    })
+}
+
+/// Read the settlement record beside a checkpoint (P2fix15
+/// NEW-88): `None` when absent (legacy checkpoints and
+/// never-settled dirs adopt the target exactly as before —
+/// no silent behavior change); `Err` when anything stands
+/// that is not OUR valid record (torn, foreign, nonregular,
+/// or unreadable — reopen refuses past it loudly, never
+/// adopting around it). Bounded regular-file intake (the
+/// checkpoint intake — a substituted FIFO never stalls).
+fn read_settlement_record(checkpoint: &Path) -> std::io::Result<Option<SettledRecord>> {
+    let path = settled_path(checkpoint);
+    let Some(bytes) = read_checkpoint_file(&path).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "osslscope: checkpoint settlement record unreadable ({path}): {e} (operator must inspect; refusing — never adopt past it)",
+                path = path.display()
+            ),
+        )
+    })?
+    else {
+        return Ok(None);
+    };
+    parse_settlement_record(&bytes)
+        .map(Some)
+        .map_err(|defect| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "osslscope: checkpoint settlement record invalid ({defect}): {} (operator must inspect; refusing — never adopt past it)",
+                    path.display()
+                ),
+            )
+        })
+}
+
+/// Scan the checkpoint directory for a stage carrying the
+/// SETTLED bytes (P2fix15 NEW-88): after interruption the
+/// marker-bound prior stands under a `<target>.staging-*`
+/// name — return its hash-verified bytes when one matches
+/// `want_sha256` (`None` when none does — junk entries
+/// skip quietly; the flush residue scan declares them).
+/// Bounded (regular files only, intake-capped, never
+/// following links) and count-capped (fail closed past 64
+/// candidates — operator intervenes).
+fn scan_settled_stage(checkpoint: &Path, want_sha256: &str) -> std::io::Result<Option<Vec<u8>>> {
+    let parent = checkpoint.parent().unwrap_or_else(|| Path::new(""));
+    let parent = if parent.as_os_str().is_empty() {
+        std::env::current_dir().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "osslscope: checkpoint dir unresolvable during settlement recovery ({e}; not {})",
+                    checkpoint.display()
+                ),
+            )
+        })?
+    } else {
+        parent.to_path_buf()
+    };
+    let target_name = checkpoint
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let prefix = format!("{target_name}.staging-");
+    let entries = std::fs::read_dir(&parent).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "osslscope: checkpoint dir unreadable during settlement recovery ({e}; not {})",
+                checkpoint.display()
+            ),
+        )
+    })?;
+    let mut candidates = 0u32;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        candidates += 1;
+        if candidates > 64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "osslscope: too many checkpoint stages during settlement recovery (not {}) — operator must intervene",
+                    checkpoint.display()
+                ),
+            ));
+        }
+        // Junk skips quietly (nonregular, unreadable,
+        // unparseable, hash-mismatched — residue the flush
+        // scan declares; recovery only ever adopts
+        // hash-verified marker-bound bytes).
+        let path = parent.join(&name);
+        let Ok(Some(bytes)) = read_checkpoint_file(&path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let Some(sha) = str_at(&v, "sha256") else {
+            continue;
+        };
+        if sha != want_sha256 {
+            continue;
+        }
+        let mut bare = v.clone();
+        if let Some(obj) = bare.as_object_mut() {
+            obj.remove("sha256");
+        }
+        let bare_bytes = serde_json::to_vec(&bare).unwrap_or_default();
+        if sha256_hex(&bare_bytes) != sha {
+            continue;
+        }
+        return Ok(Some(bytes));
+    }
+    Ok(None)
+}
+
 /// Which conditional-publish arm the fused gate selected
-/// (P2fix14 NEW-80).
+/// (P2fix14 NEW-80; `Copy` P2fix15 — the arm is consulted
+/// at every post-publish step, never consumed).
+#[derive(Debug, Clone, Copy)]
 enum PublishArm {
     /// Target absent at the gate: NOREPLACE (anything raced
     /// in refuses with EEXIST — nothing to preserve, nothing
@@ -2086,36 +2386,184 @@ fn explain_publish_error(
     }
 }
 
-/// Declare an ambiguous settlement (P2fix14 NEW-80/NEW-81):
-/// verification failed where withdrawal is unsafe (state
-/// unknown) — NOTHING further is touched; the operator
-/// inspects, and reopen adopts whatever hash-valid bytes
-/// stand.
+/// Declare an ambiguous settlement (P2fix14 NEW-80/NEW-81,
+/// reopen rule P2fix15 NEW-88): verification failed where
+/// withdrawal is unsafe (state unknown) — NOTHING further is
+/// touched; the operator inspects, and reopen applies the
+/// settlement record (marker-bound prior or loud refusal —
+/// never a blind adoption of the standing bytes).
 fn ambiguous_settlement(primary: std::io::Error, detail: &str) -> std::io::Error {
     std::io::Error::new(
         primary.kind(),
         format!(
-            "{primary} (settlement ambiguous: {detail} — operator must inspect; reopen adopts whatever hash-valid bytes stand)"
+            "{primary} (settlement ambiguous: {detail} — operator must inspect; reopen applies the settlement record)"
         ),
     )
 }
 
-/// Withdraw an UNSETTLED publish (P2fix14 NEW-80/NEW-81): the
-/// publish syscall ran but post-verification (identity,
-/// tripwire, position) or the settle sync refused it — swap
-/// the exchange back (EXCHANGE arm) or remove our own target
-/// entry (NOREPLACE arm), verified at every step, and return
-/// `primary` with the remediation `outcome` declared. On any
-/// verification failure NOTHING further is touched and the
-/// ambiguity is declared loudly.
-fn remediate_unsettled_publish(
+/// Read a dirfd-relative name's full bytes WITHOUT
+/// following links (P2fix15 NEW-88 — the commit-time
+/// settlement freshness read): `Ok(None)` when absent,
+/// `Err` on any other failure (fail closed — the caller
+/// refuses). Never stalls (no FIFOs opened — `O_NOFOLLOW`
+/// + regular-only: nonregular names fail closed too).
+fn read_name_bytes(
     dir_fd: &std::fs::File,
+    name: &std::ffi::CString,
+) -> std::io::Result<Option<Vec<u8>>> {
+    use std::os::unix::io::AsRawFd as _;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: dir_fd is live; the name is NUL-free; st
+    // outlives the call.
+    if unsafe {
+        libc::fstatat(
+            dir_fd.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "osslscope: settlement record slot is not a regular file",
+        ));
+    }
+    // SAFETY: dir_fd is live; the name is NUL-free.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh owned fd.
+    let mut file = unsafe {
+        use std::os::fd::FromRawFd as _;
+        std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(fd))
+    };
+    let mut out = Vec::new();
+    {
+        use std::io::Read as _;
+        // Bounded (records are small; anything past 1 MiB
+        // fails closed — never unbounded).
+        file.by_ref().take(1024 * 1024 + 1).read_to_end(&mut out)?;
+    }
+    if out.len() > 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "osslscope: settlement record slot oversize",
+        ));
+    }
+    Ok(Some(out))
+}
+
+/// A failed settlement-record publish (P2fix15 NEW-88):
+/// the error PLUS whether the record rename ran (`Some` —
+/// our record stands at the name and withdrawal restores
+/// the pre-write authority over it; `None` — the record
+/// still carries the pre-write authority).
+struct MarkerAttempt {
+    err: std::io::Error,
+    replaced: Option<(u64, u64)>,
+}
+
+/// Whether the settlement record was replaced during the
+/// write being remediated (P2fix15 NEW-88 — withdrawal
+/// restores the FULL pre-write durable state: target bytes
+/// AND the settlement record).
+enum MarkerState {
+    /// The record still carries the pre-write authority
+    /// (absent or `settled_before`) — withdrawal leaves it.
+    Untouched,
+    /// Our marker publish renamed onto the record name (our
+    /// record stands under this identity) — withdrawal
+    /// restores `settled_before` (or absence) over it.
+    Replaced {
+        /// Identity of OUR record at the record name (a
+        /// rebind since our rename refuses the restore —
+        /// never replace a foreign object).
+        our_id: (u64, u64),
+    },
+}
+
+/// Append the left-standing note to a refused write (P2fix15
+/// NEW-87/NEW-88 — placement-bound withdrawal): the
+/// unsettled publish is NOT swapped back beneath an
+/// unproven directory (a swapback there is itself an inside
+/// mutation) — it stands declared instead, and prior
+/// authority survives via the settlement record (reopen
+/// adopts the marker-bound prior, never the unconfirmed
+/// replacement). The primary leads; the operator inspects.
+fn with_publish_left_standing_note(primary: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        primary.kind(),
+        format!(
+            "{primary} (unsettled publish left standing: placement unproven — no swapback beneath the producer; prior checkpoint remains authoritative via the settlement record; operator must inspect)"
+        ),
+    )
+}
+
+/// Append the withdrawal-unconfirmed note to a refused write
+/// (P2fix15 NEW-88): the swapback + removal ran but the
+/// confirming directory sync failed — crash states still
+/// converge on the prior via the settlement record (the
+/// record was untouched), but the withdrawal itself is not
+/// yet durable. The primary leads.
+fn with_withdrawal_unconfirmed_note(
+    primary: std::io::Error,
+    sync: std::io::Error,
+) -> std::io::Error {
+    std::io::Error::new(
+        primary.kind(),
+        format!("{primary} (withdrawal unconfirmed: directory sync failed: {sync})"),
+    )
+}
+
+/// Withdraw an UNSETTLED publish (P2fix14 NEW-80/NEW-81,
+/// placement-bound + durable P2fix15 NEW-87/NEW-88): the
+/// publish syscall ran but post-verification (identity,
+/// tripwire, position), the settle sync, or the settlement
+/// publish refused it. Placement is re-proven FIRST — a
+/// swapback or removal beneath the producer is itself an
+/// inside mutation, so an unproven directory leaves the
+/// unsettled publish STANDING declared (prior authority
+/// survives via the settlement record — never a blind
+/// adoption). Otherwise swap the exchange back (EXCHANGE
+/// arm) or remove our own target entry (NOREPLACE arm),
+/// identity-confirmed at every step, sync the directory
+/// (DURABLE withdrawal — a failed settlement never leaves
+/// the replacement authoritative across a crash), restore
+/// the pre-write settlement record when our marker publish
+/// replaced it, and return `primary` with the remediation
+/// `outcome` declared. On any verification failure NOTHING
+/// further is touched and the ambiguity is declared loudly.
+#[allow(clippy::too_many_arguments)]
+fn remediate_unsettled_publish(
+    guard: &PlacementGuard,
+    dir_fd: &std::fs::File,
+    out_dir: &Path,
+    step: &str,
+    display: &Path,
     stage_c: &std::ffi::CString,
     target_c: &std::ffi::CString,
+    settled_c: &std::ffi::CString,
     arm: &PublishArm,
     own_id: (u64, u64),
     outcome: &str,
     primary: std::io::Error,
+    settled_before: &Option<SettledRecord>,
+    marker: &MarkerState,
 ) -> std::io::Error {
     let withdrawn = |primary: std::io::Error| {
         std::io::Error::new(
@@ -2123,6 +2571,13 @@ fn remediate_unsettled_publish(
             format!("{primary} (unsettled publish withdrawn: {outcome})"),
         )
     };
+    // Placement FIRST (P2fix15 NEW-87): no swapback and no
+    // removal beneath an unproven directory — the unsettled
+    // publish stands declared instead (prior authority via
+    // the settlement record).
+    if guard.prove_before(dir_fd, out_dir, step, display).is_err() {
+        return with_publish_left_standing_note(primary);
+    }
     match arm {
         PublishArm::Present(old_id) => {
             // Swap back: target→prior, stage→ours.
@@ -2134,22 +2589,180 @@ fn remediate_unsettled_publish(
             {
                 return ambiguous_settlement(primary, "swapback verification failed");
             }
-            match unlink_checked(dir_fd, stage_c) {
-                Ok(()) => withdrawn(primary),
-                Err(cleanup) => with_stage_cleanup_note(primary, cleanup),
+            match unlink_owned(dir_fd, stage_c, own_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ambiguous_settlement(
+                        primary,
+                        "own stage identity changed during withdrawal",
+                    );
+                }
+                Err(cleanup) => return with_stage_cleanup_note(primary, cleanup),
             }
         }
         PublishArm::Absent => {
             // Remove our own target entry (absence restored).
-            if !name_refers_to(dir_fd, target_c, own_id) {
-                return ambiguous_settlement(primary, "target no longer carries our bytes");
-            }
-            match unlink_checked(dir_fd, target_c) {
-                Ok(()) => withdrawn(primary),
-                Err(cleanup) => with_stage_cleanup_note(primary, cleanup),
+            match unlink_owned(dir_fd, target_c, own_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ambiguous_settlement(primary, "target no longer carries our bytes");
+                }
+                Err(cleanup) => return with_stage_cleanup_note(primary, cleanup),
             }
         }
     }
+    // Durable withdrawal (P2fix15 NEW-88): the swapback +
+    // removal sync before the failure returns — every crash
+    // state converges on the prior via the settlement
+    // record (which the write below restores when ours
+    // replaced it).
+    if let Err(sync) = dir_fd.sync_all() {
+        return with_withdrawal_unconfirmed_note(primary, sync);
+    }
+    // Settlement-record restore (P2fix15 NEW-88): when our
+    // marker publish replaced the record, restore the
+    // pre-write authority (the record, or absence) —
+    // identity-confirmed (never replace a rebound name).
+    match marker {
+        MarkerState::Untouched => withdrawn(primary),
+        MarkerState::Replaced { our_id } => {
+            // Placement again before the restore mutations
+            // (a move since the entry proof leaves the
+            // record untouched — reopen refuses past the
+            // mismatch loudly, never adopting around it).
+            if guard
+                .prove_before(dir_fd, out_dir, "settlement restore", display)
+                .is_err()
+            {
+                return ambiguous_settlement(primary, "placement lost during settlement restore");
+            }
+            if !name_refers_to(dir_fd, settled_c, *our_id) {
+                return ambiguous_settlement(
+                    primary,
+                    "settlement record changed under our own marker publish",
+                );
+            }
+            match settled_before {
+                Some(rec) => {
+                    let bytes = render_settlement_record(rec);
+                    // Stage + rename over our own record (the
+                    // name still refers to our marker — the
+                    // rename only ever replaces our own
+                    // bytes; a failure declares loudly).
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    let tmp_c = std::ffi::CString::new(format!(
+                        "{}-staging-restore-{}-{nanos}.tmp",
+                        settled_c.to_string_lossy(),
+                        std::process::id()
+                    ))
+                    .unwrap_or_else(|_| settled_c.clone());
+                    if stage_and_rename(dir_fd, &tmp_c, settled_c, &bytes).is_err() {
+                        return ambiguous_settlement(primary, "settlement record restore failed");
+                    }
+                    if dir_fd.sync_all().is_err() {
+                        return ambiguous_settlement(
+                            primary,
+                            "settlement record restore unconfirmed",
+                        );
+                    }
+                    // Readback: the restored name must carry
+                    // the restored bytes (a rebind since the
+                    // rename declares loudly — never trusted).
+                    match read_name_bytes(dir_fd, settled_c) {
+                        Ok(Some(back)) if back == bytes => {}
+                        _ => {
+                            return ambiguous_settlement(
+                                primary,
+                                "settlement record restore readback mismatch",
+                            );
+                        }
+                    }
+                    withdrawn(primary)
+                }
+                None => match unlink_owned(dir_fd, settled_c, *our_id) {
+                    Ok(true) => {
+                        if dir_fd.sync_all().is_err() {
+                            return ambiguous_settlement(
+                                primary,
+                                "settlement record removal unconfirmed",
+                            );
+                        }
+                        withdrawn(primary)
+                    }
+                    Ok(false) => ambiguous_settlement(
+                        primary,
+                        "settlement record changed under our own marker publish",
+                    ),
+                    Err(cleanup) => with_stage_cleanup_note(primary, cleanup),
+                },
+            }
+        }
+    }
+}
+
+/// Stage bytes under a fresh dirfd-relative name and rename
+/// them onto `dest` (P2fix15 NEW-88 — the settlement-record
+/// publish/restore primitive): O_EXCL staging (never follows,
+/// never truncates a live name), fsync, plain rename onto
+/// the destination. The caller freshness-checks `dest`
+/// before (replace ours-or-absent only) and readback-checks
+/// after. Returns the staged file's identity for the
+/// caller's freshness tracking.
+fn stage_and_rename(
+    dir_fd: &std::fs::File,
+    stage_c: &std::ffi::CString,
+    dest_c: &std::ffi::CString,
+    bytes: &[u8],
+) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::io::AsRawFd as _;
+    // SAFETY: dir_fd is a live open directory fd; the stage
+    // name is NUL-free.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            stage_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh owned fd (O_EXCL
+    // created it — exclusively ours).
+    let file = unsafe {
+        use std::os::fd::FromRawFd as _;
+        std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(fd))
+    };
+    {
+        use std::io::Write as _;
+        let mut file = &file;
+        file.write_all(bytes)?;
+    }
+    file.sync_all()?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the file is live; st outlives the call.
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let id = (st.st_dev, st.st_ino);
+    // SAFETY: dir_fd is live; both names are NUL-free file
+    // names in it.
+    if unsafe {
+        libc::renameat(
+            dir_fd.as_raw_fd(),
+            stage_c.as_ptr(),
+            dir_fd.as_raw_fd(),
+            dest_c.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(id)
 }
 
 /// Test-only one-shot swap hook (P2fix8 NEW-50): armed by the
@@ -2447,9 +3060,10 @@ pub(crate) mod pre_exchange_hook {
 /// proof→syscall interval is pinned — a move there, including
 /// one that reverses before the next check, must withdraw the
 /// unsettled publish instead of completing it). Inert unless
-/// armed; production never arms it.
+/// armed; production never arms it. `pub(crate)` so the
+/// export failed-withdrawal pin arms it.
 #[cfg(test)]
-mod post_exchange_hook {
+pub(crate) mod post_exchange_hook {
     use std::cell::RefCell;
     thread_local! {
         static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
@@ -2464,6 +3078,124 @@ mod post_exchange_hook {
     }
     pub fn disarm() {
         HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// Test-only one-shot relocation hook (P2fix15 NEW-87): armed
+/// by the pin, run once AFTER the final post-publish position
+/// proof SUCCEEDS and before the settle-sync proof (proves
+/// placement holds THROUGH settlement — a move there must
+/// refuse BEFORE the directory sync runs, with no swapback
+/// beneath the producer and prior authority preserved via
+/// the settlement record). Inert unless armed; production
+/// never arms it.
+#[cfg(test)]
+mod post_position_hook {
+    use std::cell::RefCell;
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+    pub fn arm(hook: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+    pub fn take_and_run() {
+        if let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+    pub fn disarm() {
+        HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// Test-only one-shot entry hook (P2fix15 NEW-87): armed by
+/// the pin, run once INSIDE the identity-conditional unlink
+/// between its verification and the `unlinkat` (proves the
+/// verify→unlink interval is confirmed, not trusted — a
+/// rebind there must be DETECTED by the post-unlink
+/// confirmation and declared loudly, never silent success).
+/// Inert unless armed; production never arms it.
+#[cfg(test)]
+mod unlink_hook {
+    use std::cell::RefCell;
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+    pub fn arm(hook: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+    pub fn take_and_run() {
+        if let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+    pub fn disarm() {
+        HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// Test-only post-settlement cleanup fault injection (P2fix15
+/// NEW-89): remaining injected failures at the settled
+/// commit's prior-bytes removal — each armed failure fails
+/// the cleanup AFTER the commit settled, so the flush must
+/// report `Ok` WITH the residue (live advances) instead of
+/// failing. Inert at zero. `pub(crate)` so the export
+/// sink/shutdown/reopen pin arms it.
+#[cfg(test)]
+pub(crate) mod settle_cleanup_fault {
+    thread_local! { static FAIL_CLEANUP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+    /// Arm `n` injected post-settlement cleanup failures.
+    pub fn arm(n: u64) {
+        FAIL_CLEANUP.with(|f| f.set(n));
+    }
+    /// Take one injected failure (true = fail this cleanup).
+    pub fn take() -> bool {
+        FAIL_CLEANUP.with(|f| {
+            let n = f.get();
+            if n > 0 {
+                f.set(n - 1);
+                true
+            } else {
+                false
+            }
+        })
+    }
+}
+
+/// Test-only publish-syscall observation probe (P2fix15
+/// NEW-87): how many conditional-publish syscalls ran since
+/// the last take (lets a pin prove a refused publish NEVER
+/// RAN, not merely that it was withdrawn after). Production
+/// never reads it.
+#[cfg(test)]
+pub(crate) mod publish_probe {
+    use std::cell::Cell;
+    thread_local! {
+        static PUBLISHES: Cell<u64> = const { Cell::new(0) };
+    }
+    pub fn record() {
+        PUBLISHES.with(|m| m.set(m.get().saturating_add(1)));
+    }
+    pub fn take() -> u64 {
+        PUBLISHES.with(|m| m.replace(0))
+    }
+}
+
+/// Test-only directory-sync observation probe (P2fix15
+/// NEW-87): how many checkpoint-dir `sync_all` calls ran
+/// since the last take (lets a pin prove a refused
+/// settlement NEVER SYNCED). Production never reads it.
+#[cfg(test)]
+pub(crate) mod dir_sync_probe {
+    use std::cell::Cell;
+    thread_local! {
+        static SYNCS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub fn record() {
+        SYNCS.with(|m| m.set(m.get().saturating_add(1)));
+    }
+    pub fn take() -> u64 {
+        SYNCS.with(|m| m.replace(0))
     }
 }
 
@@ -3230,6 +3962,28 @@ pub struct Presenter {
     /// preserves its finals (the generation ACTUALLY being
     /// left), never the stale retained record.
     restored_generation: Option<u64>,
+    /// Filename sequence the CURRENT scan rejected at
+    /// (P2fix15 NEW-91, runtime-only): set where the scan
+    /// loop breaks on its first failure, cleared at every
+    /// scan start — the watch outage note names it beside
+    /// the accepted tip on the SAME line (same-scan proof).
+    /// `None` when the scan rejected nothing (or failed
+    /// before scanning) — the note says `none` instead of
+    /// naming a stale window.
+    last_rejected_seq: Option<u64>,
+    /// Prior-settlement recovery at open (P2fix15 NEW-88,
+    /// runtime-only): true when the target stood
+    /// hash-valid but UNCONFIRMED (settlement-record
+    /// mismatch) and the open adopted the marker-bound
+    /// prior from a standing stage instead — the operator
+    /// warning printed at recovery names the checkpoint.
+    recovered_prior: bool,
+    /// Post-settlement residue of the last settled flush
+    /// (P2fix15 NEW-89, runtime-only): names cleanup the
+    /// commit left behind — the caller drains it via
+    /// `take_flush_residue` and reports each entry (the
+    /// commit stands either way).
+    last_flush_residue: Vec<String>,
 }
 
 impl Presenter {
@@ -3306,6 +4060,9 @@ impl Presenter {
             epoch_folded: false,
             epoch_preview: None,
             restored_generation: None,
+            last_rejected_seq: None,
+            recovered_prior: false,
+            last_flush_residue: Vec::new(),
         };
         p.load_checkpoint()?;
         Ok(p)
@@ -3326,6 +4083,38 @@ impl Presenter {
     /// note names the tip AT the rejection, same scan).
     pub fn folded_tip(&self) -> (Option<u64>, Option<u64>) {
         (self.generation, self.watermark)
+    }
+
+    /// Rejected window for the watch outage note (P2fix15
+    /// NEW-91): the filename sequence the current scan
+    /// broke at (`None` when it rejected nothing) — named
+    /// on the SAME line as the accepted tip (same scan).
+    pub fn rejected_window(&self) -> Option<u64> {
+        self.last_rejected_seq
+    }
+
+    /// Prior-settlement recovery at open (P2fix15 NEW-88):
+    /// true when this presenter recovered by adopting the
+    /// marker-bound prior (the standing target was
+    /// hash-valid but unconfirmed).
+    pub fn recovered_unsettled_prior(&self) -> bool {
+        self.recovered_prior
+    }
+
+    /// Take the last settled flush's post-settlement
+    /// residue (P2fix15 NEW-89): each entry names cleanup
+    /// the commit left behind — the caller reports them
+    /// (the commit stands either way).
+    pub fn take_flush_residue(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.last_flush_residue)
+    }
+
+    /// Fold totals for cross-module pins (P2fix15 NEW-88):
+    /// the live (`calls_total`, four lanes) — lets the
+    /// export recovery pins assert exact reopen accounting
+    /// without reaching into fold state.
+    pub fn fold_totals(&self) -> (u64, [u64; 4]) {
+        (self.calls_total, self.lanes)
     }
 
     /// Refresh the epoch preview from live state (P2fix11 NEW-67):
@@ -3372,7 +4161,11 @@ impl Presenter {
     /// Flush the checkpoint NOW (export loop: after a generation
     /// change the new watermark + the new admission commit
     /// together BEFORE the new snapshot serves — P2fix3 NEW-9).
-    pub fn flush_checkpoint(&mut self) -> std::io::Result<()> {
+    /// The outcome reports post-settlement residue SEPARATELY
+    /// (P2fix15 NEW-89 — a settled commit is `Ok` even when
+    /// cleanup left residue; the caller advances live state
+    /// and surfaces the residue to the operator).
+    pub fn flush_checkpoint(&mut self) -> std::io::Result<FlushOutcome> {
         self.write_checkpoint()
     }
 
@@ -3460,13 +4253,20 @@ impl Presenter {
     /// checkpoint, return the snapshot.
     pub fn build_service(&mut self) -> Result<OperatorSnapshot, String> {
         let snap = self.build_service_staged()?;
-        if let Err(e) = self.write_checkpoint().map_err(|e| e.to_string()) {
-            // The epoch folded cleanly but never published (the
-            // checkpoint refused) — a failure in its tenure
-            // (P2fix11 NEW-67).
-            self.failed_generation = self.generation;
-            return Err(e);
-        }
+        let outcome = match self.write_checkpoint() {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // The epoch folded cleanly but never published (the
+                // checkpoint refused) — a failure in its tenure
+                // (P2fix11 NEW-67).
+                self.failed_generation = self.generation;
+                return Err(e.to_string());
+            }
+        };
+        // Settled (P2fix15 NEW-89): post-settlement residue
+        // reports separately — the caller drains it (the
+        // commit stands either way).
+        self.last_flush_residue = outcome.residue;
         // Framed publication (P2fix11 NEW-67): this generation is
         // published — and any preserved record OF it is stale
         // (same-generation recovery supersedes the mid-failure
@@ -3494,6 +4294,9 @@ impl Presenter {
     /// intermediate checkpoint with a new watermark beside a stale
     /// admission ever lands.
     pub fn build_service_staged(&mut self) -> Result<OperatorSnapshot, String> {
+        // A new scan rejects nothing yet (P2fix15 NEW-91 —
+        // the outage note never names a stale window).
+        self.last_rejected_seq = None;
         if !self.out_dir.is_dir() {
             // Every staged failure marks its tenure (P2fix11
             // NEW-67 — a failed-unpublished epoch later reset
@@ -3609,6 +4412,10 @@ impl Presenter {
                     expect = seq.saturating_add(1);
                 }
                 Err(e) => {
+                    // The scan broke AT this window (P2fix15
+                    // NEW-91 — the outage note's explicit
+                    // rejected window, same scan as the tip).
+                    self.last_rejected_seq = Some(seq);
                     scan_error = Some(e);
                     break;
                 }
@@ -4760,15 +5567,17 @@ impl Presenter {
     }
 
     /// Load the checkpoint (absent ⇒ fresh; torn ⇒ discard + replay
-    /// with unstable-all; owner-busy ⇒ usage error).
+    /// with unstable-all; owner-busy ⇒ usage error; unconfirmed
+    /// target ⇒ marker-bound prior or loud refusal — P2fix15
+    /// NEW-88).
     fn load_checkpoint(&mut self) -> std::io::Result<()> {
         // Bounded regular-file intake (P2fix13 NEW-76 — a
         // nonregular or oversize target refuses the open
         // loudly; absent stays a fresh start).
-        let Some(body) = read_checkpoint_file(&self.checkpoint_path)? else {
+        let Some(mut body) = read_checkpoint_file(&self.checkpoint_path)? else {
             return Ok(());
         };
-        let v: serde_json::Value = match serde_json::from_slice(&body) {
+        let mut v: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
             Err(_) => {
                 self.flag_epoch_unstable();
@@ -4797,6 +5606,46 @@ impl Presenter {
         if sha256_hex(&bytes) != want {
             self.flag_epoch_unstable();
             return Ok(());
+        }
+        // Settlement authority (P2fix15 NEW-88): a hash-valid
+        // target the settlement record does NOT confirm is an
+        // UNCONFIRMED replacement (interrupted or withdrawn
+        // publish) — adopt the marker-bound prior from a
+        // standing stage when one matches (recovery, warned),
+        // else refuse loudly (never adopt it, never silently
+        // reset). Absent record ⇒ legacy adoption (older
+        // checkpoints behave exactly as before); torn
+        // targets took the discard path above (never
+        // adopted); a torn/foreign record refuses past it
+        // (never adopted around).
+        if let Some(rec) = read_settlement_record(&self.checkpoint_path)? {
+            if rec.target_sha256 != want {
+                match scan_settled_stage(&self.checkpoint_path, &rec.target_sha256)? {
+                    Some(prior) => {
+                        eprintln!(
+                            "osslscope: checkpoint target unconfirmed ({}) — adopted the marker-bound prior (settlement-record recovery); operator should inspect",
+                            self.checkpoint_path.display()
+                        );
+                        body = prior;
+                        v = serde_json::from_slice(&body).map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "osslscope: corrupt checkpoint recovered prior",
+                            )
+                        })?;
+                        self.recovered_prior = true;
+                    }
+                    None => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "osslscope: checkpoint target unconfirmed (settlement-record mismatch: settled is a different transaction; not {}) — the standing replacement never settled and no marker-bound prior stage stands; refusing (never adopt, never reset)",
+                                self.checkpoint_path.display()
+                            ),
+                        ));
+                    }
+                }
+            }
         }
         // Pre-normalization duplicate check (P2fix5 NEW-27): the
         // checkpoint is our own format (the writer never emits
@@ -5249,35 +6098,361 @@ impl Presenter {
         }
     }
 
-    /// Atomic checkpoint write (stage + fsync + conditional
-    /// publish + verified settle), placement-held and
-    /// identity-bound through every mutation (P2fix14
-    /// NEW-80/NEW-81 — supersedes the P2fix13 plain-rename +
-    /// left-declared protocol):
+    /// Early settlement-record gate (P2fix15 NEW-87/NEW-88 —
+    /// refuse unsafe destinations BEFORE staging): the
+    /// `<target>.settled` name must be absent or OUR OWN
+    /// valid record — a foreign object there (nonregular or
+    /// foreign bytes) refuses with ZERO staging (the slot is
+    /// never replaced blindly). Returns the pre-write record
+    /// (restored by withdrawal when our marker publish
+    /// replaced it; the commit-time CONTENT recheck
+    /// re-confirms it — the gate is fail-fast, the recheck
+    /// is the enforcement).
+    fn check_settled_replaceable(
+        &self,
+        dir_fd: &std::fs::File,
+        settled_c: &std::ffi::CString,
+    ) -> std::io::Result<Option<SettledRecord>> {
+        match stat_target_raw(dir_fd, settled_c) {
+            TargetRaw::Absent => Ok(None),
+            TargetRaw::Regular(_) => match read_settlement_record(&self.checkpoint_path) {
+                Ok(rec) => Ok(rec),
+                Err(e) => Err(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "osslscope: checkpoint settlement record slot holds foreign content (refusing to replace it before staging; not {}): {e}",
+                        self.checkpoint_path.display()
+                    ),
+                )),
+            },
+            TargetRaw::NonRegular => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "osslscope: checkpoint settlement record slot is not a regular file (refusing to replace it; not {})",
+                    self.checkpoint_path.display()
+                ),
+            )),
+            TargetRaw::Unreadable => Err(std::io::Error::last_os_error()),
+        }
+    }
+
+    /// Publish the settlement record (P2fix15 NEW-88 — the
+    /// durable settlement discriminator): stage our record
+    /// (O_EXCL, placement-proven), rename it onto the record
+    /// name (freshness-checked: absent-or-ours CONTENT only —
+    /// never a raced-in object, not even an in-place
+    /// rewrite of our own inode), read it back
+    /// (byte-identical), fsync it, and sync the directory.
+    /// Every mutation runs fused behind a guard proof; the
+    /// owned marker stage is withdrawn on failure
+    /// (placement-bound — left declared when unproven).
+    /// Returns OUR record's identity at the record name. On
+    /// failure returns the error PLUS whether the rename ran
+    /// (`Some(our_id)` — the caller remediates WITH marker
+    /// restore; `None` — the record still carries the
+    /// pre-write authority).
+    fn commit_settlement_record(
+        &self,
+        guard: &PlacementGuard,
+        dir_fd: &std::fs::File,
+        target_name: &std::ffi::OsStr,
+        settled_c: &std::ffi::CString,
+        rec: &SettledRecord,
+        settled_before: &Option<SettledRecord>,
+    ) -> Result<(u64, u64), MarkerAttempt> {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::io::AsRawFd as _;
+        let bytes = render_settlement_record(rec);
+        let pid = std::process::id();
+        let seq = self.checkpoint_seq;
+        let withdraw_marker = |dir_fd: &std::fs::File,
+                               marker_c: &std::ffi::CString,
+                               marker_id: (u64, u64),
+                               err: std::io::Error| {
+            if guard
+                .prove_before(
+                    dir_fd,
+                    &self.out_dir,
+                    "settlement withdrawal",
+                    &self.checkpoint_path,
+                )
+                .is_err()
+            {
+                return with_stage_left_unproven_note(err);
+            }
+            match unlink_owned(dir_fd, marker_c, marker_id) {
+                Ok(true) => err,
+                Ok(false) => with_stage_left_note(err),
+                Err(cleanup) => with_stage_cleanup_note(err, cleanup),
+            }
+        };
+        let mut attempt = 0u32;
+        let (marker_file, marker_c, marker_id) = loop {
+            if attempt >= 16 {
+                return Err(MarkerAttempt {
+                    err: std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "osslscope: settlement staging crowded (not {})",
+                            self.checkpoint_path.display()
+                        ),
+                    ),
+                    replaced: None,
+                });
+            }
+            if let Err(e) = guard.prove_before(
+                dir_fd,
+                &self.out_dir,
+                "settlement stage",
+                &self.checkpoint_path,
+            ) {
+                return Err(MarkerAttempt {
+                    err: e,
+                    replaced: None,
+                });
+            }
+            let mut name = std::ffi::OsString::from(target_name);
+            name.push(format!(".settled-staging-{pid}-{seq}.{attempt}.tmp"));
+            let Ok(marker_c) = std::ffi::CString::new(name.as_os_str().as_bytes()) else {
+                return Err(MarkerAttempt {
+                    err: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "osslscope: checkpoint path without a file name",
+                    ),
+                    replaced: None,
+                });
+            };
+            // SAFETY: dir_fd is a live open directory fd; the
+            // name is a NUL-free file name.
+            let fd = unsafe {
+                libc::openat(
+                    dir_fd.as_raw_fd(),
+                    marker_c.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                    0o644,
+                )
+            };
+            if fd < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(MarkerAttempt {
+                    err: e,
+                    replaced: None,
+                });
+            }
+            // SAFETY: openat returned a fresh owned fd (O_EXCL
+            // created it — exclusively ours).
+            let file = unsafe { std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(fd)) };
+            let id = match file_id(&file) {
+                Ok(id) => id,
+                Err(e) => {
+                    let _ = unlink_checked(dir_fd, &marker_c);
+                    return Err(MarkerAttempt {
+                        err: e,
+                        replaced: None,
+                    });
+                }
+            };
+            break (file, marker_c, id);
+        };
+        {
+            use std::io::Write as _;
+            let mut marker_file = &marker_file;
+            if let Err(e) = marker_file.write_all(&bytes) {
+                return Err(MarkerAttempt {
+                    err: withdraw_marker(dir_fd, &marker_c, marker_id, e),
+                    replaced: None,
+                });
+            }
+        }
+        if let Err(e) = marker_file.sync_all() {
+            return Err(MarkerAttempt {
+                err: withdraw_marker(dir_fd, &marker_c, marker_id, e),
+                replaced: None,
+            });
+        }
+        if let Err(e) = guard.prove_after(
+            dir_fd,
+            &self.out_dir,
+            "settlement stage (post)",
+            &self.checkpoint_path,
+        ) {
+            return Err(MarkerAttempt {
+                err: withdraw_marker(dir_fd, &marker_c, marker_id, e),
+                replaced: None,
+            });
+        }
+        if let Err(e) = guard.prove_before(
+            dir_fd,
+            &self.out_dir,
+            "settlement publish",
+            &self.checkpoint_path,
+        ) {
+            return Err(MarkerAttempt {
+                err: withdraw_marker(dir_fd, &marker_c, marker_id, e),
+                replaced: None,
+            });
+        }
+        // Freshness (CONTENT — an in-place rewrite keeps
+        // the inode, so identity alone cannot see it): the
+        // record name must still carry the pre-write bytes
+        // (absent-or-ours, byte-identical — a raced-in
+        // object refuses, never replaced blindly).
+        let expected = settled_before.as_ref().map(render_settlement_record);
+        let fresh = match read_name_bytes(dir_fd, settled_c) {
+            Ok(current) => current == expected,
+            Err(_) => false,
+        };
+        if !fresh {
+            let e = std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "osslscope: checkpoint settlement record slot changed after the gate (not {})",
+                    self.checkpoint_path.display()
+                ),
+            );
+            return Err(MarkerAttempt {
+                err: withdraw_marker(dir_fd, &marker_c, marker_id, e),
+                replaced: None,
+            });
+        }
+        // SAFETY: dir_fd is live; both names are NUL-free
+        // file names in it.
+        if unsafe {
+            libc::renameat(
+                dir_fd.as_raw_fd(),
+                marker_c.as_ptr(),
+                dir_fd.as_raw_fd(),
+                settled_c.as_ptr(),
+            )
+        } != 0
+        {
+            let e = std::io::Error::last_os_error();
+            return Err(MarkerAttempt {
+                err: withdraw_marker(dir_fd, &marker_c, marker_id, e),
+                replaced: None,
+            });
+        }
+        // The rename RAN (our record stands at the name —
+        // failures below remediate WITH marker restore).
+        let failed = |detail: &str| MarkerAttempt {
+            err: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "osslscope: checkpoint settlement publish failed ({detail}; not {})",
+                    self.checkpoint_path.display()
+                ),
+            ),
+            replaced: Some(marker_id),
+        };
+        // Readback: the record name must carry OUR bytes
+        // (byte-identical — a rebind since the rename
+        // restores over nothing foreign: the restore
+        // re-checks identity first).
+        let readback = (|| -> std::io::Result<Vec<u8>> {
+            use std::io::Read as _;
+            // SAFETY: dir_fd is live; the name is NUL-free.
+            let fd = unsafe {
+                libc::openat(
+                    dir_fd.as_raw_fd(),
+                    settled_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: openat returned a fresh owned fd.
+            let mut file = unsafe { std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(fd)) };
+            let mut out = Vec::new();
+            file.read_to_end(&mut out)?;
+            file.sync_all()?;
+            Ok(out)
+        })();
+        match readback {
+            Ok(back) if back == bytes => {}
+            _ => return Err(failed("record readback mismatch")),
+        }
+        if dir_fd.sync_all().is_err() {
+            return Err(failed("directory sync failed"));
+        }
+        Ok(marker_id)
+    }
+
+    /// Stale stage names in the checkpoint directory (P2fix15
+    /// NEW-89 — the flush residue scan): every
+    /// `<target>.staging-*` and `<target>.settled-staging-*`
+    /// name still standing when a commit settles (our own
+    /// stage was consumed or removed — anything found is a
+    /// leftover of an interrupted or withdrawn write).
+    /// Sorted, capped (past 1024 the scan truncates with a
+    /// note — never unbounded).
+    fn scan_stage_residue(&self, parent: &Path) -> Vec<String> {
+        let target_name = self
+            .checkpoint_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let data_prefix = format!("{target_name}.staging-");
+        let marker_prefix = format!("{target_name}.settled-staging-");
+        let mut out: Vec<String> = vec![];
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&data_prefix) || name.starts_with(&marker_prefix) {
+                out.push(name);
+                if out.len() > 1024 {
+                    out.push(
+                        "(truncated: more stage residue stands — operator must list)".to_string(),
+                    );
+                    break;
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Atomic checkpoint write (stage + conditional publish +
+    /// verified settle + settlement record), placement-held
+    /// and identity-bound through every mutation (P2fix14
+    /// NEW-80/NEW-81, hardened P2fix15 NEW-87/NEW-88/NEW-89):
     ///
     /// The placement precondition HOLDS THROUGH the write:
     /// after the NEW-69 establishment, a `PlacementGuard`
     /// tripwire watches the opened parent and ancestry;
     /// every mutation runs fused behind a guard proof, and a
-    /// failed proof WITHDRAWS the owned stage by
-    /// identity-verified removal (the name must still refer
-    /// to our own stage inode — a move cannot rebind it) —
-    /// never left beneath a possibly-inside directory.
+    /// failed proof LEAVES the owned stage standing declared
+    /// (withdrawal is PLACEMENT-BOUND — a removal beneath an
+    /// unproven directory is itself an inside mutation).
     /// Publish is CONDITIONAL on the fused gate identity:
     /// NOREPLACE onto an absent target, EXCHANGE onto a
     /// present one — a substitution after the regularity
     /// check is detected (post-publish identity) and
     /// preserved (swapback), never replaced. Post-publish
     /// verification (identity + tripwire + position) pins
-    /// the proof→syscall interval: any move there (including
-    /// a reversal) withdraws the UNSETTLED publish — prior
-    /// bytes authoritative again, zero net effect. Commit
-    /// acknowledgment reflects DURABLE settlement: the
-    /// directory sync runs before the success return, and a
-    /// sync failure withdraws + reports FAILURE (never
-    /// success). No in-memory-only preservation window
-    /// exists; no restore protocol exists or is needed.
-    fn write_checkpoint(&mut self) -> std::io::Result<()> {
+    /// the proof→syscall interval; placement is re-proven
+    /// fused before the EXCHANGE, before the settle sync,
+    /// and after it: any move in those intervals remediates
+    /// placement-bound (swapback outside, or the unsettled
+    /// publish left STANDING declared inside — prior
+    /// authority via the settlement record), never success.
+    /// Commit acknowledgment reflects DURABLE settlement:
+    /// the directory sync runs before the success return, a
+    /// sync failure withdraws durably + reports FAILURE
+    /// (never success), and the settlement record publishes
+    /// after (reopen tells settled from unconfirmed across
+    /// interruption). Post-settlement cleanup leftovers
+    /// report SEPARATELY on the outcome (the settled commit
+    /// stands — live advances past them). No
+    /// in-memory-only preservation window exists.
+    fn write_checkpoint(&mut self) -> std::io::Result<FlushOutcome> {
         // Placement at every write (P2fix4 NEW-13/NEW-18): an
         // initially absent directory that became available after
         // open still holds the outside-producer condition — the
@@ -5340,6 +6515,17 @@ impl Presenter {
         // gate below stays as the freshness check the
         // conditional publish binds).
         self.check_target_replaceable(&dir_fd, &target_c)?;
+        let mut settled_name = std::ffi::OsString::from(target_name);
+        settled_name.push(".settled");
+        let settled_c = std::ffi::CString::new(settled_name.as_os_str().as_bytes())
+            .map_err(|_| bad_name("settlement record"))?;
+        // Early settlement-record gate (P2fix15 NEW-87/NEW-88
+        // — refuse unsafe destinations BEFORE staging): a
+        // foreign object at the record name refuses here with
+        // ZERO staging. Captures the pre-write record (the
+        // withdrawal restores it when our marker publish
+        // replaced it) + the commit-time freshness baseline.
+        let settled_before = self.check_settled_replaceable(&dir_fd, &settled_c)?;
         self.checkpoint_seq = self.checkpoint_seq.saturating_add(1);
         // Finalize the commit bytes (P2fix14 NEW-82 — the
         // envelope check refuses oversize folds BEFORE
@@ -5452,7 +6638,7 @@ impl Presenter {
             "stage creation (post)",
             &self.checkpoint_path,
         ) {
-            return Err(refuse_withdrawn(&dir_fd, &stage_c, stage_id, e));
+            return Err(refuse_leaving_stage(e));
         }
         {
             use std::io::Write as _;
@@ -5479,7 +6665,7 @@ impl Presenter {
             if let Err(e) =
                 guard.prove_before(&dir_fd, &self.out_dir, "first write", &self.checkpoint_path)
             {
-                return Err(refuse_withdrawn(&dir_fd, &stage_c, stage_id, e));
+                return Err(refuse_leaving_stage(e));
             }
             let written = (|| -> std::io::Result<()> {
                 if injected {
@@ -5489,7 +6675,16 @@ impl Presenter {
                 Ok(())
             })();
             if let Err(e) = written {
-                return Err(withdraw_stage(&dir_fd, &stage_c, stage_id, e));
+                return Err(withdraw_stage(
+                    &guard,
+                    &dir_fd,
+                    &self.out_dir,
+                    "stage write withdrawal",
+                    &self.checkpoint_path,
+                    &stage_c,
+                    stage_id,
+                    e,
+                ));
             }
             // Fault injection (P2fix11 NEW-66, test-only):
             // run the armed relocation AFTER the first bytes
@@ -5510,10 +6705,19 @@ impl Presenter {
                 "first write (post)",
                 &self.checkpoint_path,
             ) {
-                return Err(refuse_withdrawn(&dir_fd, &stage_c, stage_id, e));
+                return Err(refuse_leaving_stage(e));
             }
             if let Err(e) = stage_file.sync_all() {
-                return Err(withdraw_stage(&dir_fd, &stage_c, stage_id, e));
+                return Err(withdraw_stage(
+                    &guard,
+                    &dir_fd,
+                    &self.out_dir,
+                    "stage sync withdrawal",
+                    &self.checkpoint_path,
+                    &stage_c,
+                    stage_id,
+                    e,
+                ));
             }
         }
         // Fault injection (P2fix9 NEW-56, test-only): run the
@@ -5529,7 +6733,7 @@ impl Presenter {
         // withdrawn by identity-verified removal).
         if let Err(e) = guard.prove_before(&dir_fd, &self.out_dir, "commit", &self.checkpoint_path)
         {
-            return Err(refuse_withdrawn(&dir_fd, &stage_c, stage_id, e));
+            return Err(refuse_leaving_stage(e));
         }
         // Fault injection (P2fix10 NEW-61, test-only): run the
         // armed relocation AFTER the commit re-check SUCCEEDS,
@@ -5558,14 +6762,25 @@ impl Presenter {
             "commit rename",
             &self.checkpoint_path,
         ) {
-            return Err(refuse_withdrawn(&dir_fd, &stage_c, stage_id, e));
+            return Err(refuse_leaving_stage(e));
         }
         // Fused publish-gate target stat (P2fix14 NEW-80): the
         // identity the conditional publish binds (stat-only —
         // a substituted FIFO refuses promptly and survives).
         let arm = match self.stat_publish_target(&dir_fd, &target_c) {
             Ok(arm) => arm,
-            Err(e) => return Err(withdraw_stage(&dir_fd, &stage_c, stage_id, e)),
+            Err(e) => {
+                return Err(withdraw_stage(
+                    &guard,
+                    &dir_fd,
+                    &self.out_dir,
+                    "publish gate withdrawal",
+                    &self.checkpoint_path,
+                    &stage_c,
+                    stage_id,
+                    e,
+                ));
+            }
         };
         // Fault injection (P2fix14 NEW-80, test-only): run the
         // armed target substitution AFTER the gate stat
@@ -5586,8 +6801,33 @@ impl Presenter {
                     self.checkpoint_path.display()
                 ),
             );
-            return Err(withdraw_stage(&dir_fd, &stage_c, stage_id, e));
+            return Err(withdraw_stage(
+                &guard,
+                &dir_fd,
+                &self.out_dir,
+                "stage freshness withdrawal",
+                &self.checkpoint_path,
+                &stage_c,
+                stage_id,
+                e,
+            ));
         }
+        // EXCHANGE proof (P2fix15 NEW-87 — the FINAL
+        // pre-publish proof, fused with the publish syscall
+        // below; no hook point and no other work intervenes):
+        // a move after the gate refuses HERE, before the
+        // exchange can run beneath the producer (the owned
+        // stage stands declared — withdrawal is
+        // placement-bound).
+        if let Err(e) =
+            guard.prove_before(&dir_fd, &self.out_dir, "exchange", &self.checkpoint_path)
+        {
+            return Err(refuse_leaving_stage(e));
+        }
+        // Post-settlement residue accumulator (P2fix15 NEW-89
+        // — a settled commit reports leftovers separately,
+        // never as failure).
+        let mut residue: Vec<String> = vec![];
         // Conditional publish (P2fix14 NEW-80 — supersedes the
         // P2fix13 plain rename): NOREPLACE onto an absent
         // target (anything raced in refuses with EEXIST),
@@ -5601,7 +6841,16 @@ impl Presenter {
         };
         if let Err(e) = renameat2_result(&dir_fd, &stage_c, &target_c, publish_flags) {
             let named = explain_publish_error(&dir_fd, &target_c, &self.checkpoint_path, &arm, e);
-            return Err(withdraw_stage(&dir_fd, &stage_c, stage_id, named));
+            return Err(withdraw_stage(
+                &guard,
+                &dir_fd,
+                &self.out_dir,
+                "publish withdrawal",
+                &self.checkpoint_path,
+                &stage_c,
+                stage_id,
+                named,
+            ));
         }
         // Fault injection (P2fix14 NEW-80, test-only): run the
         // armed relocation AFTER the publish syscall, before
@@ -5654,61 +6903,75 @@ impl Presenter {
                 // IS the prior (swapback restores target→it).
                 let sub_arm = PublishArm::Present(sub_id);
                 return Err(remediate_unsettled_publish(
+                    &guard,
                     &dir_fd,
+                    &self.out_dir,
+                    "substitution withdrawal",
+                    &self.checkpoint_path,
                     &stage_c,
                     &target_c,
+                    &settled_c,
                     &sub_arm,
                     stage_id,
                     "substituted target restored",
                     e,
+                    &settled_before,
+                    &MarkerState::Untouched,
                 ));
             }
         } else {
             // NOREPLACE consumed the stage name — it must be
             // gone (a replanted stage name is foreign: the
-            // publish stands, the residue is declared, nothing
-            // is unlinked).
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: dir_fd is live; the name is NUL-free; st
-            // outlives the call.
-            let present = unsafe {
-                libc::fstatat(
-                    dir_fd.as_raw_fd(),
-                    stage_c.as_ptr(),
-                    &mut st,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } == 0;
-            if present {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "osslscope: checkpoint committed but a foreign stage name stands (never unlinked; not {})",
-                        self.checkpoint_path.display()
-                    ),
+            // publish stands, the residue is REPORTED
+            // separately (P2fix15 NEW-89 — the commit is not
+            // failed by it), nothing is unlinked).
+            if name_id(&dir_fd, &stage_c).is_some() {
+                residue.push(format!(
+                    "foreign stage name replanted after NOREPLACE publish (never unlinked): {}",
+                    stage_c.to_string_lossy()
                 ));
             }
         }
+        // Unsettled-publish withdrawal with the pre-write
+        // settlement authority still in place (P2fix15 —
+        // every refusal below runs before our marker publish
+        // replaced the record, so withdrawal never restores
+        // the record here; the marker-commit failure below
+        // remediates with restore instead).
+        let remediate = |step: &str, outcome: &str, primary: std::io::Error| {
+            remediate_unsettled_publish(
+                &guard,
+                &dir_fd,
+                &self.out_dir,
+                step,
+                &self.checkpoint_path,
+                &stage_c,
+                &target_c,
+                &settled_c,
+                &arm,
+                stage_id,
+                outcome,
+                primary,
+                &settled_before,
+                &MarkerState::Untouched,
+            )
+        };
+        let outcome = match arm {
+            PublishArm::Present(_) => "prior checkpoint restored",
+            PublishArm::Absent => "no checkpoint published",
+        };
         // Interval tripwire: any event in the publish's wake
         // means a move overlapped the syscall (including one
         // that reversed before this check) — WITHDRAW the
-        // unsettled publish (prior bytes authoritative again,
-        // zero net effect) instead of completing it.
+        // unsettled publish when placement allows (prior
+        // bytes authoritative again) or leave it STANDING
+        // declared when placement is unproven (prior
+        // authority via the settlement record) — never
+        // complete it, never success.
         let drained = match guard.drain("publish (post)", &self.checkpoint_path) {
             Ok(drained) => drained,
             Err(e) => {
-                return Err(remediate_unsettled_publish(
-                    &dir_fd,
-                    &stage_c,
-                    &target_c,
-                    &arm,
-                    stage_id,
-                    match arm {
-                        PublishArm::Present(_) => "prior checkpoint restored",
-                        PublishArm::Absent => "no checkpoint published",
-                    },
-                    e,
-                ));
+                return Err(remediate("interval withdrawal", outcome, e));
             }
         };
         if drained.events {
@@ -5717,39 +6980,36 @@ impl Presenter {
                 "moved during write",
                 &self.checkpoint_path,
             );
-            return Err(remediate_unsettled_publish(
-                &dir_fd,
-                &stage_c,
-                &target_c,
-                &arm,
-                stage_id,
-                match arm {
-                    PublishArm::Present(_) => "prior checkpoint restored",
-                    PublishArm::Absent => "no checkpoint published",
-                },
-                e,
-            ));
+            return Err(remediate("interval withdrawal", outcome, e));
         }
-        // Position NOW (a move that ended inside withdraws the
-        // same way — zero net effect inside).
+        // Position NOW (a move that ended inside remediates
+        // the same way — placement-bound).
         if let Err(e) = guard.prove_position(
             &dir_fd,
             &self.out_dir,
             "publish (post)",
             &self.checkpoint_path,
         ) {
-            return Err(remediate_unsettled_publish(
-                &dir_fd,
-                &stage_c,
-                &target_c,
-                &arm,
-                stage_id,
-                match arm {
-                    PublishArm::Present(_) => "prior checkpoint restored",
-                    PublishArm::Absent => "no checkpoint published",
-                },
-                e,
-            ));
+            return Err(remediate("post-publish withdrawal", outcome, e));
+        }
+        // Fault injection (P2fix15 NEW-87, test-only): run the
+        // armed relocation AFTER the final post-publish
+        // position proof SUCCEEDS, before the settle-sync
+        // proof (placement must hold THROUGH settlement —
+        // inert at zero).
+        #[cfg(test)]
+        post_position_hook::take_and_run();
+        // SETTLE-SYNC proof (P2fix15 NEW-87 — fused with the
+        // directory sync below; no hook point and no other
+        // work intervenes): a move after the final position
+        // proof refuses HERE, before the sync can run
+        // beneath the producer (the unsettled publish
+        // remediates placement-bound — standing declared
+        // when inside, never swapped back there).
+        if let Err(e) =
+            guard.prove_before(&dir_fd, &self.out_dir, "settle sync", &self.checkpoint_path)
+        {
+            return Err(remediate("settle-sync withdrawal", outcome, e));
         }
         // Settle: the directory sync (P2fix14 NEW-81 —
         // acknowledgment reflects DURABLE settlement now). A
@@ -5763,6 +7023,8 @@ impl Presenter {
         let sync_err: Option<std::io::Error> = if sync_injected {
             Some(std::io::Error::from_raw_os_error(libc::EIO))
         } else {
+            #[cfg(test)]
+            dir_sync_probe::record();
             dir_fd.sync_all().err()
         };
         if let Some(e) = sync_err {
@@ -5773,51 +7035,119 @@ impl Presenter {
                     self.checkpoint_path.display()
                 ),
             );
+            return Err(remediate("settle-sync withdrawal", outcome, e));
+        }
+        // Post-sync re-proof (P2fix15 NEW-87): an event in
+        // the sync's wake means a move overlapped
+        // settlement — remediate (placement-bound) instead
+        // of completing, never success.
+        if let Err(e) = guard.prove_after(
+            &dir_fd,
+            &self.out_dir,
+            "settle sync (post)",
+            &self.checkpoint_path,
+        ) {
+            return Err(remediate("settle-sync withdrawal", outcome, e));
+        }
+        // Settlement record (P2fix15 NEW-88 — the durable
+        // settlement discriminator): publish OUR record over
+        // the pre-write authority (the commit is SETTLED
+        // once this lands — reopen adopts these bytes). A
+        // publish failure remediates WITH marker restore
+        // (the pre-write record — or absence — returns, so
+        // reopen converges on the prior either way).
+        let our_record = SettledRecord {
+            target_sha256: {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                str_at(&v, "sha256").unwrap_or_default().to_string()
+            },
+            checkpoint_seq: self.checkpoint_seq,
+        };
+        if let Err(attempt) = self.commit_settlement_record(
+            &guard,
+            &dir_fd,
+            target_name,
+            &settled_c,
+            &our_record,
+            &settled_before,
+        ) {
+            let marker = match attempt.replaced {
+                Some(our_id) => MarkerState::Replaced { our_id },
+                None => MarkerState::Untouched,
+            };
             return Err(remediate_unsettled_publish(
+                &guard,
                 &dir_fd,
+                &self.out_dir,
+                "settlement withdrawal",
+                &self.checkpoint_path,
                 &stage_c,
                 &target_c,
+                &settled_c,
                 &arm,
                 stage_id,
-                match arm {
-                    PublishArm::Present(_) => "prior checkpoint restored",
-                    PublishArm::Absent => "no checkpoint published",
-                },
-                e,
+                outcome,
+                attempt.err,
+                &settled_before,
+                &marker,
             ));
         }
         // EXCHANGE arm: remove the prior bytes (the commit's
-        // only destructive step — identity-verified: the stage
-        // name must still carry the GATED prior identity, or
-        // nothing is unlinked and the ambiguity is declared).
-        // The publish already settled above, so reopen adopts
-        // the new bytes either way; the error below reports
-        // the residue truthfully.
+        // only destructive step — identity-confirmed: the
+        // stage name must still carry the GATED prior
+        // identity, or nothing is unlinked and the residue is
+        // REPORTED). The commit SETTLED above (publish +
+        // record durable), so cleanup leftovers report
+        // SEPARATELY (P2fix15 NEW-89 — the outcome carries
+        // them; live already advanced past them) — never as
+        // flush failure.
         if let PublishArm::Present(old_id) = arm {
+            let stage_name = stage_c.to_string_lossy().into_owned();
             if !name_refers_to(&dir_fd, &stage_c, old_id) {
-                let e = std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "osslscope: checkpoint committed but the stage no longer carries the prior bytes (never unlinked; not {})",
-                        self.checkpoint_path.display()
-                    ),
-                );
-                return Err(ambiguous_settlement(e, "settle unlink verification failed"));
+                residue.push(format!(
+                    "prior-bytes stage identity changed after settlement (never unlinked): {stage_name}"
+                ));
+            } else {
+                // Fault injection (P2fix15 NEW-89, test-only):
+                // fail the post-settlement cleanup AFTER the
+                // commit settled (inert at zero — production
+                // removes).
+                #[cfg(test)]
+                let cleanup_injected = settle_cleanup_fault::take();
+                #[cfg(not(test))]
+                let cleanup_injected = false;
+                let cleanup_err: Option<std::io::Error> = if cleanup_injected {
+                    Some(std::io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    match unlink_owned(&dir_fd, &stage_c, old_id) {
+                        Ok(true) => None,
+                        Ok(false) => Some(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "stage identity changed during settled cleanup",
+                        )),
+                        Err(e) => Some(e),
+                    }
+                };
+                if let Some(cleanup) = cleanup_err {
+                    residue.push(format!(
+                        "{stage_name}: prior-bytes cleanup failed: {cleanup}"
+                    ));
+                }
             }
-            if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
-                let committed = std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "osslscope: checkpoint committed but the prior-bytes stage could not be removed (not {})",
-                        self.checkpoint_path.display()
-                    ),
-                );
-                return Err(with_stage_cleanup_note(committed, cleanup));
+        }
+        // Stale-stage scan (P2fix15 NEW-89): anything still
+        // standing is a leftover of an interrupted or
+        // withdrawn write — declared on the outcome (names
+        // already reported above are not duplicated).
+        for stale in self.scan_stage_residue(&parent) {
+            if !residue.iter().any(|e| e.contains(&stale)) {
+                residue.push(format!("stale stage left standing: {stale}"));
             }
         }
         // Post-completion external renames of the directory
         // are outside any writer's control.
-        Ok(())
+        Ok(FlushOutcome { residue })
     }
 
     /// Adopt `run-summary.json` (compare-then-mark, §6C-1d).
@@ -7337,15 +8667,15 @@ mod tests {
 
     #[test]
     fn new56_reparent_between_staging_and_commit_refuses_commit() {
-        // P2fix9 NEW-56 (P2fix14 NEW-80 semantics — supersedes
-        // the P2fix13 left-declared contract): outside
-        // placement holds THROUGH the commit — a dir
+        // P2fix9 NEW-56 (P2fix15 NEW-87 semantics — supersedes
+        // the P2fix14 NEW-80 withdrawal: withdrawal is
+        // placement-bound — no unlink beneath the producer):
+        // outside placement holds THROUGH the commit — a dir
         // reparented under the producer tree AFTER the stage
         // write refuses the publish (the target name never
-        // appears there) and the owned stage is WITHDRAWN by
-        // identity-verified removal (never left beneath the
-        // moved dir). Pre-fix: the rename commits inside
-        // (RED).
+        // appears there) and the owned stage stands DECLARED
+        // (never unlinked beneath the moved dir). Pre-fix:
+        // the rename commits inside (RED).
         let base = unique_dir("reparent-before-commit");
         let out = base.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -7387,18 +8717,19 @@ mod tests {
             before,
             "the commit never replaced the checkpoint"
         );
-        // Nothing of the refused write stands after the move
-        // (P2fix14 NEW-80): the written stage was withdrawn
-        // (identity-verified removal), and the refusal
-        // declares it.
+        // The refused write's stage stands declared after
+        // the move (P2fix15 NEW-87 — never unlinked beneath
+        // the producer), and the refusal declares it.
         assert!(
-            format!("{err:?}").contains("withdrawn"),
-            "the refusal declares the withdrawal: {err:?}"
+            format!("{err:?}").contains("stage left in place"),
+            "the refusal declares the left stage: {err:?}"
         );
-        assert!(
-            staging_residue(&target).is_empty(),
-            "no stage residue inside: {:?}",
-            staging_residue(&target)
+        let (stage_name, stage_len, stage_seq) = single_left_stage(&target);
+        assert!(stage_len > 0, "the declared stage carries the written body");
+        assert_eq!(
+            stage_seq,
+            Some(presenter.checkpoint_seq),
+            "the declared stage is this write's ({stage_name})"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -7527,17 +8858,19 @@ mod tests {
             format!("{err:?}").contains("at first write"),
             "the refusal names the fused checkpoint: {err:?}"
         );
-        // The EMPTY stage is withdrawn (P2fix14 NEW-80):
-        // zero bytes were ever written, and no stage stands.
+        // The EMPTY stage stands declared (P2fix15 NEW-87 —
+        // never unlinked beneath the producer): zero bytes
+        // were ever written, and the refusal declares it.
         assert!(
-            format!("{err:?}").contains("withdrawn"),
-            "the refusal declares the withdrawal: {err:?}"
+            format!("{err:?}").contains("stage left in place"),
+            "the refusal declares the left stage: {err:?}"
         );
-        assert!(
-            staging_residue(&target).is_empty(),
-            "no stage residue inside: {:?}",
-            staging_residue(&target)
+        let (stage_name, stage_len, stage_seq) = single_left_stage(&target);
+        assert_eq!(
+            stage_len, 0,
+            "zero bytes in the declared stage ({stage_name})"
         );
+        assert_eq!(stage_seq, None, "the empty stage carries no body");
         assert_eq!(
             std::fs::read(target.join("ckpt.json")).unwrap(),
             before,
@@ -7549,12 +8882,12 @@ mod tests {
     #[test]
     fn new61_reparent_after_commit_check_refuses_rename() {
         // P2fix10 NEW-61 (+ NEW-13/NEW-26/NEW-34/NEW-50/NEW-56-OPEN;
-        // P2fix14 NEW-80 publish — supersedes the P2fix13
-        // left-declared contract): the hook fires AFTER the
-        // commit re-check SUCCEEDS — the fused publish proof
-        // must refuse with the publish NEVER running
-        // (checkpoint bytes untouched, the written stage
-        // withdrawn by identity-verified removal).
+        // P2fix15 NEW-87 leave — supersedes the P2fix14 NEW-80
+        // withdrawal: withdrawal is placement-bound): the
+        // hook fires AFTER the commit re-check SUCCEEDS — the
+        // fused publish proof must refuse with the publish
+        // NEVER running (checkpoint bytes untouched, the
+        // written stage standing declared).
         // Pre-fix: the rename commits inside (RED).
         let base = unique_dir("reparent-after-commit-check");
         let out = base.join("out");
@@ -7597,18 +8930,19 @@ mod tests {
             before,
             "the commit never replaced the checkpoint"
         );
-        // Nothing of the refused write stands after the move
-        // (P2fix14 NEW-80): the written stage was withdrawn
-        // (identity-verified removal), and the refusal
-        // declares it.
+        // The refused write's stage stands declared after
+        // the move (P2fix15 NEW-87 — never unlinked beneath
+        // the producer), and the refusal declares it.
         assert!(
-            format!("{err:?}").contains("withdrawn"),
-            "the refusal declares the withdrawal: {err:?}"
+            format!("{err:?}").contains("stage left in place"),
+            "the refusal declares the left stage: {err:?}"
         );
-        assert!(
-            staging_residue(&target).is_empty(),
-            "no stage residue inside: {:?}",
-            staging_residue(&target)
+        let (stage_name, stage_len, stage_seq) = single_left_stage(&target);
+        assert!(stage_len > 0, "the declared stage carries the written body");
+        assert_eq!(
+            stage_seq,
+            Some(presenter.checkpoint_seq),
+            "the declared stage is this write's ({stage_name})"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -7677,14 +9011,14 @@ mod tests {
     #[test]
     fn new66_true_mid_write_move_refuses_without_further_mutation() {
         // P2fix11 NEW-66 (+ NEW-61-OPEN — the TRUE mid-write
-        // pin; P2fix14 NEW-80 semantics, supersedes the
-        // P2fix13 left-declared contract): the hook fires
-        // AFTER the first bytes land in the owned stage
-        // (NON-empty — recorded as the proof) and before the
-        // fsync — the post-write re-proof must refuse with NO
-        // forward mutation (no sync, no publish) and the
-        // staged bytes WITHDRAWN by identity-verified removal
-        // (nothing of ours beneath the moved dir,
+        // pin; P2fix15 NEW-87 semantics, supersedes the
+        // P2fix14 NEW-80 withdrawal: withdrawal is
+        // placement-bound): the hook fires AFTER the first
+        // bytes land in the owned stage (NON-empty — recorded
+        // as the proof) and before the fsync — the post-write
+        // re-proof must refuse with NO forward mutation (no
+        // sync, no publish) and the staged bytes standing
+        // DECLARED (never unlinked beneath the moved dir,
         // pre-existing bytes untouched). Pre-fix: the bytes
         // sit inside through the sync and the refusal lands
         // late (RED).
@@ -7743,19 +9077,23 @@ mod tests {
             format!("{err:?}").contains("at first write (post)"),
             "the refusal names the post-write re-proof: {err:?}"
         );
-        // Nothing of ours stands after the move (P2fix14
-        // NEW-80): no byte landed after the move (the write
-        // stopped at the re-proof), and the staged bytes were
-        // withdrawn (identity-verified removal) — the refusal
-        // declares it.
+        // No byte landed after the move (P2fix15 NEW-87):
+        // the write stopped at the re-proof, and the staged
+        // bytes stand DECLARED (never unlinked beneath the
+        // moved dir) — the refusal declares them.
         assert!(
-            format!("{err:?}").contains("withdrawn"),
-            "the refusal declares the withdrawal: {err:?}"
+            format!("{err:?}").contains("stage left in place"),
+            "the refusal declares the left stage: {err:?}"
         );
+        let (stage_name, stage_len, stage_seq) = single_left_stage(&target);
         assert!(
-            staging_residue(&target).is_empty(),
-            "no stage residue inside: {:?}",
-            staging_residue(&target)
+            stage_len == size_at_move.load(std::sync::atomic::Ordering::Relaxed),
+            "no byte landed after the move ({stage_name})"
+        );
+        assert_eq!(
+            stage_seq,
+            Some(presenter.checkpoint_seq),
+            "the declared stage is this write's ({stage_name})"
         );
         assert_eq!(
             std::fs::read(target.join("ckpt.json")).unwrap(),
@@ -7772,18 +9110,19 @@ mod tests {
         // P2fix12 NEW-70 post-rename-restore pin: codex R13
         // rejects overwriting + syncing the target before
         // placement resolves with the prior bytes held only
-        // in memory), withdrawal arm P2fix14 NEW-80
-        // (supersedes the P2fix13 left-declared contract).
+        // in memory), leave arm P2fix15 NEW-87 (supersedes
+        // the P2fix14 NEW-80 withdrawal: withdrawal is
+        // placement-bound — no unlink beneath the producer).
         // Publish-last: the relocation hook fires at the
         // publish envelope boundary (after the commit checks,
         // before the fused publish proof) — the proof refuses
         // with the publish NEVER running: the last COMMITTED
         // bytes remain the durable authority (never replaced,
         // so nothing needs restoring and no restore file is
-        // ever written), the written stage is WITHDRAWN by
-        // identity-verified removal (never left beneath the
-        // moved dir), and a reopen after the dir is returned
-        // outside adopts the prior transaction exactly.
+        // ever written), the written stage stands DECLARED
+        // (never unlinked beneath the moved dir), and a
+        // reopen after the dir is returned outside adopts the
+        // prior transaction exactly.
         let base = unique_dir("late-abort-authority");
         let out = base.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -7827,22 +9166,35 @@ mod tests {
             "the last COMMITTED bytes were never replaced (publish-last — no restore needed)"
         );
         assert!(
-            format!("{err:?}").contains("withdrawn"),
-            "the refusal declares the withdrawal: {err:?}"
+            format!("{err:?}").contains("stage left in place"),
+            "the refusal declares the left stage: {err:?}"
         );
-        // No inside residue of any kind (P2fix14 NEW-80): the
-        // moved dir holds EXACTLY the pre-existing checkpoint
-        // (the refused write's stage was withdrawn — no
-        // restore file, no stage, no replacement).
-        let entries: Vec<String> = std::fs::read_dir(&target)
+        // Declared inside residue ONLY (P2fix15 NEW-87): the
+        // moved dir holds the pre-existing checkpoint + its
+        // settlement record + the refused write's declared
+        // stage (never unlinked beneath the producer — no
+        // restore file, no replacement).
+        let (stage_name, stage_len, stage_seq) = single_left_stage(&target);
+        assert!(stage_len > 0, "the declared stage carries the written body");
+        assert_eq!(
+            stage_seq,
+            Some(presenter.checkpoint_seq),
+            "the declared stage is this write's ({stage_name})"
+        );
+        let mut entries: Vec<String> = std::fs::read_dir(&target)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
+        entries.sort();
         assert_eq!(
             entries,
-            vec!["ckpt.json".to_string()],
-            "only the committed checkpoint stands inside: {entries:?}"
+            vec![
+                "ckpt.json".to_string(),
+                "ckpt.json.settled".to_string(),
+                stage_name,
+            ],
+            "only the committed checkpoint + its record + the declared stage stand inside: {entries:?}"
         );
         // Reopen adopts the prior transaction exactly (the
         // dir returned outside first — a checkpoint inside
@@ -8016,7 +9368,7 @@ mod tests {
             // when a pre-bump refusal precedes a later commit).
             let before = presenter.checkpoint_seq;
             match presenter.flush_checkpoint() {
-                Ok(()) => committed.push(presenter.checkpoint_seq),
+                Ok(_) => committed.push(presenter.checkpoint_seq),
                 Err(e) => {
                     let after = presenter.checkpoint_seq;
                     let msg = format!("{e:?}");
@@ -8495,7 +9847,7 @@ mod tests {
                 // open→validate window.
                 park(2);
                 match presenter.flush_checkpoint() {
-                    Ok(()) => {
+                    Ok(_) => {
                         ok += 1;
                         let bound = presenter.checkpoint_parent_id.unwrap();
                         assert!(
@@ -8650,18 +10002,18 @@ mod tests {
     #[test]
     fn new69_movement_within_mutation_interval_accounted() {
         // P2fix12 NEW-69 (+ NEW-13/NEW-26/NEW-34/NEW-50/NEW-56/
-        // NEW-61/NEW-66-OPEN; P2fix14 NEW-80 semantics —
-        // supersedes the P2fix13 left-declared contract):
-        // movement scheduled at EVERY hook point WITHIN the
-        // mutation interval refuses with the last committed
-        // bytes intact (never replaced — publish-last) and
-        // NOTHING of ours beneath the moved dir: moves before
-        // stage creation leave no stage at all; a move
-        // at/after creation WITHDRAWS the owned stage by
-        // identity-verified removal (the refusal declares
-        // it). Pre-fix: late schedules mutate beneath the
-        // producer and the final gap restores from memory
-        // (RED).
+        // NEW-61/NEW-66-OPEN; P2fix15 NEW-87 semantics —
+        // supersedes the P2fix14 NEW-80 withdrawal:
+        // withdrawal is placement-bound): movement scheduled
+        // at EVERY hook point WITHIN the mutation interval
+        // refuses with the last committed bytes intact (never
+        // replaced — publish-last): moves before stage
+        // creation leave no stage at all; a move at/after
+        // creation leaves the owned stage standing DECLARED
+        // (never unlinked beneath the producer — the refusal
+        // declares it). Pre-fix: late schedules mutate
+        // beneath the producer and the final gap restores
+        // from memory (RED).
         let points = [
             "post_validation",
             "post_staging_check",
@@ -8731,10 +10083,12 @@ mod tests {
                 format!("{err:?}").contains("outside the producer out-DIR"),
                 "the {point} refusal names placement: {err:?}"
             );
-            // Nothing of ours per point (P2fix14 NEW-80):
+            // Declared residue per point (P2fix15 NEW-87):
             // pre-creation envelopes created no stage; later
-            // points withdrew the owned stage (the refusal
-            // declares it); no restore file ever appears.
+            // points leave the owned stage standing declared
+            // (never unlinked beneath the producer — the
+            // refusal declares it); no restore file ever
+            // appears.
             let entries: Vec<String> = std::fs::read_dir(&target)
                 .unwrap()
                 .flatten()
@@ -8754,14 +10108,11 @@ mod tests {
                 }
                 _ => {
                     assert!(
-                        format!("{err:?}").contains("withdrawn"),
-                        "the {point} refusal declares the withdrawal: {err:?}"
+                        format!("{err:?}").contains("stage left in place"),
+                        "the {point} refusal declares the left stage: {err:?}"
                     );
-                    assert!(
-                        staging_residue(&target).is_empty(),
-                        "the {point} stage was withdrawn: {:?}",
-                        staging_residue(&target)
-                    );
+                    let (stage_name, _, _) = single_left_stage(&target);
+                    assert!(!stage_name.is_empty(), "the {point} stage stands declared");
                 }
             }
             assert_eq!(
@@ -9028,6 +10379,17 @@ mod tests {
             .insert("sha256".to_string(), serde_json::json!(hex));
     }
 
+    /// Void the settlement record beside a checkpoint
+    /// (P2fix15 NEW-88 — out-of-band craft support): the
+    /// record binds WRITER productions only, so a test that
+    /// mutates the target out-of-band removes the stale
+    /// record alongside the craft (the craft then exercises
+    /// the legacy content-validation path, whose rules are
+    /// identical on the marker path).
+    fn void_settlement(ckpt: &Path) {
+        let _ = std::fs::remove_file(super::settled_path(ckpt));
+    }
+
     /// Traced window envelope (P2fix12 NEW-73): a
     /// producer-shaped document carrying a REAL valid
     /// summarized trace plane, so the fold counts as MEASURED
@@ -9246,6 +10608,7 @@ mod tests {
             mutate(&mut crafted);
             rehash_checkpoint(&mut crafted);
             std::fs::write(&ckpt, serde_json::to_vec(&crafted).unwrap()).unwrap();
+            void_settlement(&ckpt);
             let err = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
                 .expect_err(&format!("{name}: a misbound record must refuse"));
             assert!(
@@ -9272,6 +10635,7 @@ mod tests {
             .remove("previous_epoch");
         rehash_checkpoint(&mut stripped);
         std::fs::write(&ckpt, serde_json::to_vec(&stripped).unwrap()).unwrap();
+        void_settlement(&ckpt);
         let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
             .expect("a legacy checkpoint without the record opens");
         assert_eq!(
@@ -9489,6 +10853,7 @@ mod tests {
             crafted["accumulators"]["previous_epoch"]["calls_total"] = serde_json::json!(calls);
             rehash_checkpoint(&mut crafted);
             std::fs::write(&ckpt, serde_json::to_vec(&crafted).unwrap()).unwrap();
+            void_settlement(&ckpt);
             let err = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
                 .expect_err(&format!("{name}: a lane-sum mismatch must refuse"));
             assert!(
@@ -9506,6 +10871,7 @@ mod tests {
         saturated["accumulators"]["previous_epoch"]["calls_total"] = serde_json::json!(u64::MAX);
         rehash_checkpoint(&mut saturated);
         std::fs::write(&ckpt, serde_json::to_vec(&saturated).unwrap()).unwrap();
+        void_settlement(&ckpt);
         let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
             .expect("an exactly saturated lane sum opens");
         assert_eq!(
@@ -10157,17 +11523,20 @@ mod tests {
     }
 
     #[test]
-    fn new80_move_between_proof_and_publish_withdrawn() {
+    fn new80_move_between_proof_and_publish_left_standing() {
         // P2fix14 NEW-80 (+ NEW-13/NEW-34/NEW-50/NEW-56/
-        // NEW-61/NEW-66-OPEN): a move AFTER the final publish
+        // NEW-61/NEW-66-OPEN; leave arm P2fix15 NEW-87 —
+        // supersedes the P2fix14 inside swapback: withdrawal
+        // is placement-bound): a move AFTER the final publish
         // proof returns and before/during the publish syscall
         // must not COMPLETE publication beneath the producer:
         // the post-publish verification detects the interval
-        // move and WITHDRAWS the unsettled publish (prior
-        // bytes authoritative again, zero net effect),
-        // reporting failure — never success. Pre-fix: no
-        // post-publish check exists, so the commit lands
-        // inside and reports success (RED).
+        // move and leaves the unsettled publish STANDING
+        // declared (no swapback beneath the producer — prior
+        // authority via the settlement record), reporting
+        // failure — never success. Pre-fix: no post-publish
+        // check exists, so the commit lands inside and
+        // reports success (RED).
         let base = unique_dir("proof-publish-move");
         let out = base.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -10210,34 +11579,61 @@ mod tests {
             format!("{err:?}").contains("moved during write"),
             "the refusal names the interval move: {err:?}"
         );
-        // Zero net effect inside: the moved dir holds EXACTLY
-        // the prior checkpoint (the unsettled publish was
-        // withdrawn — no new bytes, no stage).
-        let entries: Vec<String> = std::fs::read_dir(&inside)
+        assert!(
+            format!("{err:?}").contains("left standing"),
+            "the refusal declares the standing publish (no inside swapback): {err:?}"
+        );
+        assert!(
+            !format!("{err:?}").contains("prior checkpoint restored"),
+            "no swapback ran beneath the producer: {err:?}"
+        );
+        // Standing declared inside: the unsettled replacement
+        // at the target (the exchange ran pre-move), the
+        // prior under the stage name — both byte-exact, plus
+        // the untouched settlement record.
+        let target_now: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(inside.join("ckpt.json")).unwrap()).unwrap();
+        assert_eq!(
+            target_now["checkpoint_seq"],
+            serde_json::json!(before_seq + 1),
+            "the target carries the unsettled replacement (exchange ran pre-move)"
+        );
+        let (stage_name, _, _) = single_left_stage(&inside);
+        assert_eq!(
+            std::fs::read(inside.join(&stage_name)).unwrap(),
+            before,
+            "the aside bytes are the prior checkpoint byte-identical"
+        );
+        let mut entries: Vec<String> = std::fs::read_dir(&inside)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
+        entries.sort();
         assert_eq!(
             entries,
-            vec!["ckpt.json".to_string()],
-            "only the prior checkpoint stands inside: {entries:?}"
+            vec![
+                "ckpt.json".to_string(),
+                "ckpt.json.settled".to_string(),
+                stage_name,
+            ],
+            "only the standing publish + the record stand inside: {entries:?}"
         );
-        assert_eq!(
-            std::fs::read(inside.join("ckpt.json")).unwrap(),
-            before,
-            "the prior bytes were restored inside (nothing published)"
-        );
-        // Return outside + reopen: the prior transaction stands.
+        // Return outside + reopen: the prior transaction stands
+        // via the settlement record.
         let back = base.join("p-back");
         std::fs::rename(&inside, &back).unwrap();
         let q = Presenter::open_with_checkpoint(&out, &back.join("ckpt.json"), 1, "export")
-            .expect("reopen on the prior committed checkpoint");
+            .expect("reopen adopts the marker-bound prior");
         assert_eq!(
             q.checkpoint_seq, before_seq,
             "reopen adopts the prior committed sequence"
         );
         assert_eq!(q.watermark, Some(0), "the prior watermark stands");
+        assert!(
+            q.recovered_unsettled_prior(),
+            "the reopen reports the prior-settlement recovery"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -10318,15 +11714,14 @@ mod tests {
     }
 
     #[test]
-    fn new80_staging_race_withdraws_own_bytes() {
-        // P2fix14 NEW-80 (+ NEW-26/NEW-66-OPEN — supersedes the
-        // P2fix13 left-declared contract for mid-write races):
-        // a move racing the staging write refuses BEFORE the
-        // sync, and the staged bytes are WITHDRAWN by
-        // identity-verified removal (the name still refers to
-        // our own stage inode — a move cannot rebind it) —
-        // never left beneath a possibly-inside directory.
-        // Pre-fix: the stage is left in place (RED).
+    fn new80_staging_race_leaves_own_bytes_declared() {
+        // P2fix14 NEW-80 (+ NEW-26/NEW-66-OPEN — leave arm
+        // P2fix15 NEW-87, supersedes the P2fix14 withdrawal:
+        // withdrawal is placement-bound): a move racing the
+        // staging write refuses BEFORE the sync, and the
+        // staged bytes stand DECLARED (never unlinked
+        // beneath the possibly-inside directory). Pre-fix:
+        // the bytes sit inside through the sync (RED).
         let base = unique_dir("staging-race-withdraw");
         let out = base.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -10357,20 +11752,28 @@ mod tests {
             "the refusal names the race: {err:?}"
         );
         assert!(
-            format!("{err:?}").contains("withdrawn"),
-            "the refusal declares the withdrawal: {err:?}"
+            format!("{err:?}").contains("stage left in place"),
+            "the refusal declares the left stage: {err:?}"
         );
-        // The moved dir holds EXACTLY the prior checkpoint
-        // (the staged bytes were withdrawn, not left).
-        let entries: Vec<String> = std::fs::read_dir(&inside)
+        // The moved dir holds the prior checkpoint + its
+        // settlement record + the declared stage (never
+        // unlinked beneath the producer).
+        let (stage_name, stage_len, _) = single_left_stage(&inside);
+        assert!(stage_len > 0, "the declared stage carries the staged bytes");
+        let mut entries: Vec<String> = std::fs::read_dir(&inside)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
+        entries.sort();
         assert_eq!(
             entries,
-            vec!["ckpt.json".to_string()],
-            "the staged bytes were withdrawn inside: {entries:?}"
+            vec![
+                "ckpt.json".to_string(),
+                "ckpt.json.settled".to_string(),
+                stage_name,
+            ],
+            "the staged bytes stand declared inside: {entries:?}"
         );
         assert_eq!(
             std::fs::read(inside.join("ckpt.json")).unwrap(),
@@ -11168,6 +12571,947 @@ mod tests {
         );
         assert_eq!(q.watermark, Some(1), "the prior watermark stands");
         assert_eq!(q.calls_total, 20, "the prior totals stand");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new87_move_before_exchange_refuses_before_publish() {
+        // P2fix15 NEW-87 (+ NEW-13/NEW-34/NEW-50/NEW-56/
+        // NEW-61/NEW-66/NEW-69/NEW-74-OPEN): a move AFTER
+        // the publish gate and BEFORE the exchange syscall
+        // must refuse BEFORE the publish runs — never an
+        // inside exchange withdrawn after. The pin proves
+        // the syscall never ran (publish-syscall count
+        // covers the capability probe only) and the owned
+        // stage is left declared (withdrawal is
+        // placement-bound — no unlink beneath the producer).
+        // Pre-fix: the exchange runs inside and the error
+        // reports a post-hoc withdrawal (RED).
+        let base = unique_dir("move-before-exchange");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let before = std::fs::read(&ckpt).unwrap();
+        let before_seq = presenter.checkpoint_seq;
+        std::fs::write(
+            out.join("window-0000000001.json"),
+            serde_json::to_string(&test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        presenter
+            .build_service_staged()
+            .expect("staged fold advances");
+        let target = out.join("p-moved");
+        let (p2, target2) = (p.clone(), target.clone());
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran2 = ran.clone();
+        super::pre_exchange_hook::arm(move || {
+            std::fs::rename(&p2, &target2).unwrap();
+            ran2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        super::publish_probe::take();
+        let err = presenter
+            .flush_checkpoint()
+            .expect_err("a move before exchange must refuse before the publish");
+        super::pre_exchange_hook::disarm();
+        assert!(
+            ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the move hook ran between the gate and the publish"
+        );
+        assert!(
+            format!("{err:?}").contains("no longer outside"),
+            "the refusal names placement: {err:?}"
+        );
+        assert!(
+            !format!("{err:?}").contains("unsettled publish withdrawn"),
+            "nothing published, so nothing withdraws (refused BEFORE the syscall): {err:?}"
+        );
+        assert_eq!(
+            super::publish_probe::take(),
+            2,
+            "the publish syscall never ran (capability probe only)"
+        );
+        assert_eq!(
+            std::fs::read(target.join("ckpt.json")).unwrap(),
+            before,
+            "the prior target bytes are untouched"
+        );
+        // Placement-bound withdrawal: the owned stage stands
+        // declared (never unlinked beneath the producer).
+        let residue = staging_residue(&target);
+        assert_eq!(
+            residue.len(),
+            1,
+            "the owned stage stands declared: {residue:?}"
+        );
+        assert!(
+            format!("{err:?}").contains("stage left in place"),
+            "the refusal declares the left stage: {err:?}"
+        );
+        // Return outside + reopen: the prior transaction stands.
+        drop(presenter);
+        let back = base.join("p-back");
+        std::fs::rename(&target, &back).unwrap();
+        let q = Presenter::open_with_checkpoint(&out, &back.join("ckpt.json"), 1, "export")
+            .expect("reopen on the prior committed checkpoint");
+        assert_eq!(
+            q.checkpoint_seq, before_seq,
+            "reopen adopts the prior sequence"
+        );
+        assert_eq!(q.watermark, Some(0), "the prior watermark stands");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new87_move_after_final_position_check_skips_sync_and_swapback() {
+        // P2fix15 NEW-87 (+ NEW-61/NEW-66/NEW-69/NEW-74-OPEN):
+        // a move AFTER the final post-publish position proof
+        // must refuse BEFORE the directory sync runs — with
+        // no swapback beneath the producer (withdrawal is
+        // placement-bound) and prior authority preserved via
+        // the settlement record (the unsettled publish stands
+        // declared; reopen adopts the marker-bound prior).
+        // Pre-fix: nothing detects the move — the sync and
+        // the settled cleanup run inside and report success
+        // (RED).
+        let base = unique_dir("move-after-position");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let before = std::fs::read(&ckpt).unwrap();
+        let before_seq = presenter.checkpoint_seq;
+        std::fs::write(
+            out.join("window-0000000001.json"),
+            serde_json::to_string(&test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        presenter
+            .build_service_staged()
+            .expect("staged fold advances");
+        let target = out.join("p-moved");
+        let (p2, target2) = (p.clone(), target.clone());
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran2 = ran.clone();
+        super::post_position_hook::arm(move || {
+            std::fs::rename(&p2, &target2).unwrap();
+            ran2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        super::publish_probe::take();
+        super::dir_sync_probe::take();
+        let err = presenter
+            .flush_checkpoint()
+            .expect_err("a move after the final position check must refuse settlement");
+        super::post_position_hook::disarm();
+        assert!(
+            ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the move hook ran after the final position check"
+        );
+        assert!(
+            format!("{err:?}").contains("no longer outside"),
+            "the refusal names placement: {err:?}"
+        );
+        assert_eq!(
+            super::dir_sync_probe::take(),
+            0,
+            "the directory sync never ran beneath the producer"
+        );
+        assert_eq!(
+            super::publish_probe::take(),
+            3,
+            "the publish ran (before the move) but no swapback did (capability probe ×2 + publish)"
+        );
+        // Nothing touched after the move: the unsettled
+        // replacement stands at the target, the prior under
+        // the stage name — both byte-exact.
+        let target_now: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(target.join("ckpt.json")).unwrap()).unwrap();
+        assert_eq!(
+            target_now["watermark_seq"],
+            serde_json::json!(1),
+            "the target carries the unsettled replacement (exchange ran pre-move)"
+        );
+        let residue = staging_residue(&target);
+        assert_eq!(
+            residue.len(),
+            1,
+            "the prior stands aside declared: {residue:?}"
+        );
+        assert_eq!(
+            std::fs::read(target.join(&residue[0])).unwrap(),
+            before,
+            "the aside bytes are the prior checkpoint byte-identical"
+        );
+        // Return outside + reopen: prior authority via the
+        // settlement record — reopen adopts the marker-bound
+        // prior, never the standing unconfirmed replacement.
+        drop(presenter);
+        let back = base.join("p-back");
+        std::fs::rename(&target, &back).unwrap();
+        let moved_ckpt = back.join("ckpt.json");
+        let q = Presenter::open_with_checkpoint(&out, &moved_ckpt, 1, "export")
+            .expect("reopen adopts the marker-bound prior");
+        assert_eq!(
+            q.checkpoint_seq, before_seq,
+            "reopen adopts the prior sequence"
+        );
+        assert_eq!(q.watermark, Some(0), "the prior watermark stands");
+        assert_eq!(q.calls_total, 10, "the prior totals stand");
+        assert!(
+            q.recovered_unsettled_prior(),
+            "the reopen reports the prior-settlement recovery"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new87_rebound_unlink_detected_not_silent() {
+        // P2fix15 NEW-87 (+ NEW-26/NEW-69-OPEN): the
+        // verify→unlink interval is CONFIRMED, not trusted —
+        // a name rebound between identity verification and
+        // the `unlinkat` must be DETECTED by the post-unlink
+        // confirmation (our inode's link count intact while
+        // the name went away) and declared loudly — never
+        // silent success. Pre-fix: verification-then-unlink
+        // trusts the interval, so the foreign object is
+        // unlinked and the withdrawal reports clean (RED).
+        let base = unique_dir("rebound-unlink");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let p2 = p.clone();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran2 = ran.clone();
+        super::unlink_hook::arm(move || {
+            // Rebind the verified stage name to a sacrificial
+            // foreign file between verify and use.
+            let residue: Vec<String> = std::fs::read_dir(&p2)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".staging-"))
+                .collect();
+            assert_eq!(residue.len(), 1, "premise: one owned stage stands");
+            std::fs::rename(p2.join(&residue[0]), p2.join("aside.bin")).unwrap();
+            std::fs::write(p2.join(&residue[0]), b"sacrificial-foreign-bytes").unwrap();
+            ran2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        // The injected stage-write EIO drives the withdrawal
+        // (the withdrawal's unlink is the interval under test).
+        super::stage_fault::arm(1);
+        let err = presenter
+            .flush_checkpoint()
+            .expect_err("the injected EIO must fail the flush");
+        super::unlink_hook::disarm();
+        assert!(
+            ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the rebind hook ran inside the verify→unlink interval"
+        );
+        assert!(
+            format!("{err:?}").contains("rebound"),
+            "the failure declares the detected rebound (never silent): {err:?}"
+        );
+        // The damage is exactly what the confirmation
+        // describes: our own stage still stands (moved
+        // aside by the hook, never unlinked) while the
+        // rebound name went away.
+        assert!(
+            p.join("aside.bin").exists(),
+            "our own stage was never unlinked"
+        );
+        assert!(
+            staging_residue(&p).is_empty(),
+            "the rebound name went away (declared damage): {:?}",
+            staging_residue(&p)
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new87_foreign_settled_name_refuses_before_staging() {
+        // P2fix15 NEW-87 (refuse unsafe destinations before
+        // staging): a foreign object standing at the
+        // settlement-record name — a FIFO or foreign bytes —
+        // refuses the write with ZERO staging (the record
+        // slot is never replaced blindly) and the prior
+        // checkpoint stands untouched. Pre-fix: no gate
+        // exists, so the write succeeds past the foreign
+        // object (RED).
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        for arm in ["fifo", "regular"] {
+            let base = unique_dir(&format!("foreign-settled-{arm}"));
+            let out = base.join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(
+                out.join("window-0000000000.json"),
+                serde_json::to_string(&test_envelope(0, 0, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+            let p = base.join("p");
+            std::fs::create_dir_all(&p).unwrap();
+            let ckpt = p.join("ckpt.json");
+            let mut presenter =
+                Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+            presenter.build_service().expect("first fold commits");
+            let before = std::fs::read(&ckpt).unwrap();
+            let settled = super::settled_path(&ckpt);
+            // A foreign object stands at the record name (the
+            // first commit's own record, if any, is replaced
+            // by the plant — the gate must refuse it either
+            // way).
+            let _ = std::fs::remove_file(&settled);
+            if arm == "fifo" {
+                // SAFETY: mkfifo on a fresh private path.
+                assert_eq!(
+                    unsafe {
+                        libc::mkfifo(
+                            std::ffi::CString::new(settled.to_str().unwrap())
+                                .unwrap()
+                                .as_ptr(),
+                            0o600,
+                        )
+                    },
+                    0
+                );
+            } else {
+                std::fs::write(&settled, b"foreign-settled-bytes").unwrap();
+            }
+            let err = presenter
+                .flush_checkpoint()
+                .expect_err("a foreign settlement name must refuse before staging");
+            assert!(
+                format!("{err:?}").contains("settlement"),
+                "{arm}: the refusal names the settlement record: {err:?}"
+            );
+            assert!(
+                staging_residue(&p).is_empty(),
+                "{arm}: zero staging ran: {:?}",
+                staging_residue(&p)
+            );
+            assert_eq!(
+                std::fs::read(&ckpt).unwrap(),
+                before,
+                "{arm}: the prior checkpoint stands untouched"
+            );
+            use std::os::unix::fs::FileTypeExt as _;
+            if arm == "fifo" {
+                assert!(
+                    std::fs::symlink_metadata(&settled)
+                        .unwrap()
+                        .file_type()
+                        .is_fifo(),
+                    "{arm}: the planted FIFO survives (never opened)"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read(&settled).unwrap(),
+                    b"foreign-settled-bytes",
+                    "{arm}: the foreign bytes survive (never replaced)"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// Marker for the actual-interruption pin (P2fix15 NEW-88):
+    /// when the `P2FIX15_NEW88_CHILD` env spec is present this
+    /// test runs as the CHILD (open, fold, publish, then park
+    /// inside the post-exchange hook until the parent kills
+    /// it); without the spec it is a no-op pass (never run
+    /// directly — only re-executed by its parent pin).
+    #[test]
+    fn new88_interrupted_publish_child() {
+        let spec = match std::env::var("P2FIX15_NEW88_CHILD") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let parts: Vec<&str> = spec.split('|').collect();
+        assert_eq!(parts.len(), 3, "child spec is out|ckpt|ready: {spec:?}");
+        let (out, ckpt, ready) = (
+            std::path::PathBuf::from(parts[0]),
+            std::path::PathBuf::from(parts[1]),
+            std::path::PathBuf::from(parts[2]),
+        );
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("child opens");
+        presenter
+            .build_service_staged()
+            .expect("child folds the staged window");
+        let ready2 = ready.clone();
+        super::post_exchange_hook::arm(move || {
+            // The exchange RAN (this hook runs post-publish):
+            // signal the parent, then park until killed.
+            std::fs::write(&ready2, b"exchanged").unwrap();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        });
+        let _ = presenter.flush_checkpoint();
+        unreachable!("the child parks in the post-exchange hook until killed");
+    }
+
+    #[test]
+    fn new88_interrupted_publish_reopen_adopts_prior() {
+        // P2fix15 NEW-88 (+ NEW-2/NEW-56/NEW-66/NEW-70/
+        // NEW-75/NEW-81-OPEN): restart authority distinguishes
+        // settled from unsettled writes DURABLY — a process
+        // interrupted (SIGKILLed) after the exchange syscall
+        // and before settlement leaves the replacement
+        // standing UNCONFIRMED, and reopen adopts the
+        // marker-bound prior — never the unconfirmed
+        // replacement, never a silent reset. The interruption
+        // is REAL (a re-executed test-binary child killed
+        // mid-write), not a simulated fault. Pre-fix: reopen
+        // reads the authoritative name directly and adopts the
+        // unconfirmed replacement (RED).
+        let base = unique_dir("interrupted-publish");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        for seq in 0..2u64 {
+            std::fs::write(
+                out.join(format!("window-{seq:010}.json")),
+                serde_json::to_string(&test_envelope(seq, 0, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+        }
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        drop(presenter);
+        // The prior writer is GONE (its owner pid reaped —
+        // the realistic pre-state for crash recovery: the
+        // child opens a checkpoint whose owner is dead, and
+        // the harness's own live pid never leases it). The
+        // volatile owner field is fixed out-of-band and the
+        // settlement record is kept consistent with the
+        // fixed bytes (same content, dead owner) — the
+        // recovery mechanics below are unaffected by the
+        // owner value.
+        let mut reaped = std::process::Command::new("true")
+            .spawn()
+            .expect("reaped-pid probe spawns");
+        let dead_pid = reaped.id();
+        reaped.wait().expect("reaped-pid probe reaps");
+        assert!(
+            !super::pid_alive(dead_pid),
+            "premise: the probe pid is dead"
+        );
+        let mut forged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        forged["owner"]["pid"] = serde_json::json!(dead_pid);
+        rehash_checkpoint(&mut forged);
+        let forged_sha = forged["sha256"]
+            .as_str()
+            .expect("premise: rehashed")
+            .to_string();
+        let forged_seq = forged["checkpoint_seq"]
+            .as_u64()
+            .expect("premise: sequence");
+        std::fs::write(&ckpt, serde_json::to_vec(&forged).unwrap()).unwrap();
+        std::fs::write(
+            super::settled_path(&ckpt),
+            super::render_settlement_record(&super::SettledRecord {
+                target_sha256: forged_sha,
+                checkpoint_seq: forged_seq,
+            }),
+        )
+        .unwrap();
+        let before = std::fs::read(&ckpt).unwrap();
+        let before_seq = forged_seq;
+        // The child folds window 2 (staged before spawn).
+        std::fs::write(
+            out.join("window-0000000002.json"),
+            serde_json::to_string(&test_envelope(2, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let ready = base.join("child-ready");
+        let spec = format!("{}|{}|{}", out.display(), ckpt.display(), ready.display());
+        let exe = std::env::current_exe().expect("the test binary re-executes");
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut guard = KillOnDrop(
+            std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "presentation::snapshot::tests::new88_interrupted_publish_child",
+                    "--nocapture",
+                ])
+                .env("P2FIX15_NEW88_CHILD", &spec)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("the child spawns"),
+        );
+        // Wait for the post-exchange signal (the child dies
+        // early only on a bug — surface its output then).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if ready.exists() {
+                break;
+            }
+            if let Some(status) = guard.0.try_wait().expect("child wait") {
+                let mut err_text = String::new();
+                if let Some(mut stderr) = guard.0.stderr.take() {
+                    use std::io::Read as _;
+                    let _ = stderr.read_to_string(&mut err_text);
+                }
+                panic!("the child died before exchanging ({status:?}): {err_text}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child must exchange within the bound"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // The exchange RAN in the child: the standing target
+        // is the unconfirmed replacement (watermark 2).
+        let standing_bytes = std::fs::read(&ckpt).unwrap();
+        let standing: serde_json::Value = serde_json::from_slice(&standing_bytes).unwrap();
+        assert_eq!(
+            standing["watermark_seq"],
+            serde_json::json!(2),
+            "premise: the child exchanged the replacement before parking"
+        );
+        // ACTUAL INTERRUPTION: SIGKILL mid-write.
+        guard.0.kill().expect("the parent kills the child");
+        let status = guard.0.wait().expect("the parent reaps the child");
+        assert!(!status.success(), "the child died by signal, never exited");
+        assert_eq!(
+            status.code(),
+            None,
+            "the child was killed (no exit code): {status:?}"
+        );
+        std::mem::forget(guard);
+        // Reopen adopts the marker-bound PRIOR (watermark 1,
+        // exact totals) — never the standing replacement.
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("reopen adopts the marker-bound prior");
+        assert_eq!(
+            q.checkpoint_seq, before_seq,
+            "reopen adopts the prior sequence"
+        );
+        assert_eq!(q.watermark, Some(1), "the prior watermark stands");
+        assert_eq!(q.calls_total, 20, "the prior totals stand");
+        assert!(
+            q.recovered_unsettled_prior(),
+            "the reopen reports the prior-settlement recovery"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            standing_bytes,
+            "the standing replacement is untouched by the recovery-side reopen"
+        );
+        // The marker-bound prior stands under the stage name.
+        let residue = staging_residue(&p);
+        assert_eq!(residue.len(), 1, "the prior stands aside: {residue:?}");
+        assert_eq!(
+            std::fs::read(p.join(&residue[0])).unwrap(),
+            before,
+            "the aside bytes are the prior checkpoint byte-identical"
+        );
+        drop(q);
+        // Forward repair: the recovered state folds onward
+        // and settles (the interruption leaves no wedge).
+        let mut r =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("reopen for repair");
+        r.build_service().expect("post-recovery build settles");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        assert_eq!(v["watermark_seq"], serde_json::json!(2), "the tip advances");
+        assert_eq!(
+            v["accumulators"]["calls_total"],
+            serde_json::json!(30),
+            "exactly one fold of each window past the interruption"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new87_outside_move_at_exchange_proof_still_commits() {
+        // P2fix15 NEW-87 (Tier-1 adjacent edge — NEW-50
+        // stabilization at the NEW pre-exchange proof): an
+        // outside→outside move between the gate and the
+        // publish still COMMITS through the validated fd
+        // (the drain discards the move, the position holds)
+        // — the new fused proof refuses only inside moves,
+        // never stabilization.
+        let base = unique_dir("exchange-proof-stabilizes");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let moved = base.join("p-moved-outside");
+        let (p2, moved2) = (p.clone(), moved.clone());
+        super::pre_exchange_hook::arm(move || {
+            std::fs::rename(&p2, &moved2).unwrap();
+        });
+        presenter
+            .flush_checkpoint()
+            .expect("an outside move at the exchange proof still commits");
+        super::pre_exchange_hook::disarm();
+        let moved_ckpt = moved.join("ckpt.json");
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&moved_ckpt).unwrap()).unwrap();
+        assert_eq!(v["watermark_seq"], 0, "the commit landed through the move");
+        let q = Presenter::open_with_checkpoint(&out, &moved_ckpt, 1, "export")
+            .expect("the committed bytes reload");
+        assert_eq!(q.watermark, Some(0), "reopen adopts the commit");
+        assert!(
+            !q.recovered_unsettled_prior(),
+            "a clean commit reopens directly (no recovery)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new87_settled_slot_race_refuses_at_commit() {
+        // P2fix15 NEW-87 (Tier-1 adjacent edge — commit-time
+        // enforcement behind the early settled gate): an
+        // object raced into the settlement-record slot after
+        // the early gate refuses AT COMMIT (freshness
+        // mismatch — never replaced blindly), the publish
+        // remediates (swapback outside — the race touched no
+        // ancestry), and the prior stands.
+        let base = unique_dir("settled-slot-race");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let before = std::fs::read(&ckpt).unwrap();
+        let before_seq = presenter.checkpoint_seq;
+        let settled = super::settled_path(&ckpt);
+        let settled2 = settled.clone();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran2 = ran.clone();
+        super::pre_exchange_hook::arm(move || {
+            std::fs::write(&settled2, b"raced-into-settled-slot").unwrap();
+            ran2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let err = presenter
+            .flush_checkpoint()
+            .expect_err("a settled-slot race must refuse at commit");
+        super::pre_exchange_hook::disarm();
+        assert!(
+            ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the race hook ran between the gate and the publish"
+        );
+        assert!(
+            format!("{err:?}").contains("settlement record slot changed after the gate"),
+            "the refusal names the slot race: {err:?}"
+        );
+        assert!(
+            format!("{err:?}").contains("prior checkpoint restored"),
+            "the publish remediates outside: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&settled).unwrap(),
+            b"raced-into-settled-slot",
+            "the raced-in object is preserved (never replaced)"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            before,
+            "the prior checkpoint stands untouched"
+        );
+        // Operator clears the slot; the retry settles (the
+        // refused write consumed a sequence — gaps are
+        // harmless, no contiguity assumed).
+        std::fs::remove_file(&settled).unwrap();
+        presenter
+            .build_service()
+            .expect("retry settles after slot cleared");
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("reloads");
+        assert_eq!(q.checkpoint_seq, before_seq + 2, "the retry committed once");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new88_torn_target_discards_despite_marker() {
+        // P2fix15 NEW-88 (Tier-1 adjacent edge — torn
+        // handling preserved): a TORN target with a
+        // settlement record on file takes the EXISTING
+        // discard-and-replay path (fresh + unstable — never
+        // adopted, never a refusal): torn bytes are never
+        // authoritative under any rule, and the next flush
+        // re-settles over them (self-healing).
+        let base = unique_dir("torn-target-with-marker");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        assert!(
+            super::settled_path(&ckpt).exists(),
+            "premise: a record stands"
+        );
+        std::fs::write(&ckpt, b"{torn-json").unwrap();
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("a torn target discards (never refuses)");
+        assert_eq!(q.watermark, None, "discard replays fresh");
+        assert!(
+            !q.recovered_unsettled_prior(),
+            "discard is not recovery (no flag)"
+        );
+        // Self-healing: the next flush settles over the torn
+        // bytes and the record confirms them.
+        let mut r = q;
+        r.build_service().expect("post-discard build settles");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        assert_eq!(v["watermark_seq"], 0, "the tip rebuilds");
+        let s = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("reloads");
+        assert_eq!(
+            s.watermark,
+            Some(0),
+            "the re-settled commit adopts directly"
+        );
+        assert!(
+            !s.recovered_unsettled_prior(),
+            "the re-settled commit reopens directly (no recovery)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new89_stale_stage_declared_on_clean_commit() {
+        // P2fix15 NEW-89 (Tier-1 adjacent edge — crash
+        // residue declared, commit stands): a stale stage
+        // from an interrupted write (junk standing under a
+        // stage name) does not fail the next clean commit —
+        // the commit settles (`Ok`) and the residue scan
+        // declares the leftover on the outcome (operator
+        // intervenes; nothing silent, nothing failed).
+        let base = unique_dir("stale-stage-declared");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        std::fs::write(p.join("ckpt.json.staging-crashed.tmp"), b"crash-junk").unwrap();
+        let outcome = presenter
+            .flush_checkpoint()
+            .expect("a stale stage must not fail a clean commit");
+        assert!(
+            !outcome.residue.is_empty()
+                && outcome
+                    .residue
+                    .join(" ")
+                    .contains("ckpt.json.staging-crashed.tmp"),
+            "the outcome declares the stale stage: {:?}",
+            outcome.residue
+        );
+        assert_eq!(
+            std::fs::read(p.join("ckpt.json.staging-crashed.tmp")).unwrap(),
+            b"crash-junk",
+            "the stale stage is preserved (declared, never adopted, never removed)"
+        );
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("reloads");
+        assert_eq!(q.watermark, Some(0), "the clean commit adopts directly");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new91_rejected_window_clears_per_scan() {
+        // P2fix15 NEW-91 (Tier-1 adjacent edge — no stale
+        // windows): the rejected-window marker is per-scan —
+        // a failed scan records its break sequence, and the
+        // next scan clears it before running (a later
+        // success reports none; the outage note never names
+        // a stale window).
+        let base = unique_dir("rejected-clears-per-scan");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let mut bad = test_envelope(1, 0, run.clone(), 10);
+        bad["schema"] = serde_json::json!("service-window-v9");
+        std::fs::write(
+            out.join("window-0000000001.json"),
+            serde_json::to_string(&bad).unwrap(),
+        )
+        .unwrap();
+        let ckpt = base.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter
+            .build_service_staged()
+            .expect_err("the bad tail fails the scan");
+        assert_eq!(
+            presenter.rejected_window(),
+            Some(1),
+            "the failed scan records its break sequence"
+        );
+        std::fs::remove_file(out.join("window-0000000001.json")).unwrap();
+        presenter.build_service().expect("recovery builds");
+        assert_eq!(
+            presenter.rejected_window(),
+            None,
+            "the next scan clears the marker (no stale window)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new88_unsettled_replacement_without_prior_refuses() {
+        // P2fix15 NEW-88 (+ NEW-2/NEW-70/NEW-75-OPEN): a
+        // hash-valid target that the settlement record does
+        // NOT confirm is an unconfirmed replacement — reopen
+        // REFUSES it loudly when no marker-bound prior stage
+        // stands (never adopts it, never silently resets);
+        // when the prior stage DOES stand, reopen adopts the
+        // prior and reports the recovery. Pre-fix: reopen
+        // reads the name directly and adopts the replacement
+        // (RED).
+        let base = unique_dir("unsettled-without-prior");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        for seq in 0..2u64 {
+            std::fs::write(
+                out.join(format!("window-{seq:010}.json")),
+                serde_json::to_string(&test_envelope(seq, 0, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+        }
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let prior = std::fs::read(&ckpt).unwrap();
+        let before_seq = presenter.checkpoint_seq;
+        drop(presenter);
+        // A VALID twin transaction (same out-DIR, further
+        // tip) stands at the target unconfirmed (as if left
+        // by an interrupted publish that also lost its
+        // stage): crafted through the REAL writer on a twin
+        // path, then copied over.
+        std::fs::write(
+            out.join("window-0000000002.json"),
+            serde_json::to_string(&test_envelope(2, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let twin = p.join("twin.json");
+        let mut twin_p =
+            Presenter::open_with_checkpoint(&out, &twin, 1, "export").expect("twin opens");
+        twin_p.build_service().expect("twin folds further");
+        let replacement = std::fs::read(&twin).unwrap();
+        drop(twin_p);
+        assert_ne!(
+            replacement, prior,
+            "premise: the twin advanced past the prior"
+        );
+        std::fs::write(&ckpt, &replacement).unwrap();
+        // No marker-bound prior stage stands: reopen REFUSES
+        // the unconfirmed replacement loudly.
+        let err = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect_err("an unconfirmed replacement without a prior stage must refuse");
+        assert!(
+            format!("{err:?}").contains("unconfirmed"),
+            "the refusal names the unconfirmed replacement: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            replacement,
+            "the refusal mutates nothing"
+        );
+        // The prior stage stands: reopen adopts the
+        // marker-bound prior and reports the recovery.
+        std::fs::write(p.join("ckpt.json.staging-manual.tmp"), &prior).unwrap();
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("reopen adopts the marker-bound prior stage");
+        assert_eq!(
+            q.checkpoint_seq, before_seq,
+            "reopen adopts the prior sequence"
+        );
+        assert_eq!(q.watermark, Some(1), "the prior watermark stands");
+        assert_eq!(q.calls_total, 20, "the prior totals stand");
+        assert!(
+            q.recovered_unsettled_prior(),
+            "the reopen reports the prior-settlement recovery"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

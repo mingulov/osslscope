@@ -783,6 +783,10 @@ struct QueuedPush {
     admitted: super::prometheus::Admitted,
     epoch_start: u64,
     run_start: u64,
+    /// Post-settlement checkpoint residue carried with this
+    /// COMMITTED push (P2fix15 NEW-89 — the commit stands;
+    /// the residue reports separately).
+    residue: Vec<String>,
 }
 
 /// Bounded drop-oldest OTLP handoff (P2fix2 item 21): THE queue
@@ -1094,7 +1098,10 @@ fn refresh_once(presenter: &mut Presenter, state: &mut RefreshState) -> Result<Q
     if FAIL_NEXT_COMMIT.with(|f| f.replace(false)) {
         return Err("osslscope: checkpoint flush: injected failure".to_string());
     }
-    staged
+    // Settled (P2fix15 NEW-89): the staged transaction is
+    // DURABLE now — commit it to live even when cleanup left
+    // residue (the residue rides the push separately).
+    let outcome = staged
         .flush_checkpoint()
         .map_err(|e| format!("osslscope: checkpoint flush: {e}"))?;
     // Commit (infallible from here): the staged fold state +
@@ -1124,6 +1131,7 @@ fn refresh_once(presenter: &mut Presenter, state: &mut RefreshState) -> Result<Q
         admitted,
         epoch_start: state.epoch_start,
         run_start: state.run_start,
+        residue: outcome.residue,
     })
 }
 
@@ -1133,8 +1141,10 @@ fn refresh_once(presenter: &mut Presenter, state: &mut RefreshState) -> Result<Q
 /// new watermark beside a stale admission — the shutdown bypass).
 /// The flush result REPORTS (P2fix12 NEW-70 — a failed shutdown
 /// persist is durability loss, never a silent discard: the
-/// caller surfaces it to the operator).
-fn shutdown_flush(presenter: &mut Presenter) -> std::io::Result<()> {
+/// caller surfaces it to the operator; P2fix15 NEW-89 — a
+/// settled shutdown persist is `Ok` even with cleanup
+/// residue, which the caller surfaces separately).
+fn shutdown_flush(presenter: &mut Presenter) -> std::io::Result<super::snapshot::FlushOutcome> {
     // Flush ONLY (P2fix5 NEW-22 — the old final build folded
     // newly landed windows without admission, checkpointing a new
     // watermark beside a stale admission; the next open folds
@@ -1204,6 +1214,14 @@ pub fn serve_with_shutdown(
             loop {
                 match refresh_once(&mut presenter, &mut state) {
                     Ok(qp) => {
+                        // Settled with residue (P2fix15 NEW-89):
+                        // the commit stands and serves — each
+                        // leftover reports loudly (a persistent
+                        // condition re-alerts per tick until the
+                        // operator intervenes).
+                        for r in qp.residue.iter() {
+                            eprintln!("osslscope: refresh: checkpoint committed with residue: {r}");
+                        }
                         *last_good.lock().unwrap() = Some(qp);
                     }
                     Err(e) => {
@@ -1301,16 +1319,33 @@ pub fn serve_with_shutdown(
     // serving last-good throughout; the exit code signals
     // serve health, and the stderr line carries the persist
     // failure).
-    let shutdown = collector.join().unwrap_or(Ok(()));
+    let shutdown = collector
+        .join()
+        .unwrap_or_else(|_| Ok(super::snapshot::FlushOutcome::clean()));
     handoff.close();
     if let Some(worker) = worker {
         let _ = worker.join();
     }
-    if let Err(e) = shutdown {
-        let line = format!("osslscope: shutdown checkpoint flush failed: {e}");
-        eprintln!("{line}");
-        #[cfg(test)]
-        SHUTDOWN_REPORT.lock().unwrap().push(line);
+    match shutdown {
+        Err(e) => {
+            let line = format!("osslscope: shutdown checkpoint flush failed: {e}");
+            eprintln!("{line}");
+            #[cfg(test)]
+            SHUTDOWN_REPORT.lock().unwrap().push(line);
+        }
+        // Settled with residue (P2fix15 NEW-89): the persist
+        // stands — each leftover reports loudly on its own
+        // line (serve still exits SUCCESS; the lines carry
+        // the residue).
+        Ok(outcome) => {
+            for r in outcome.residue {
+                let line =
+                    format!("osslscope: shutdown checkpoint flush committed with residue: {r}");
+                eprintln!("{line}");
+                #[cfg(test)]
+                SHUTDOWN_REPORT.lock().unwrap().push(line);
+            }
+        }
     }
     ExitCode::SUCCESS
 }
@@ -4090,6 +4125,209 @@ mod tests {
                 .as_array()
                 .is_some_and(|fs| !fs.is_empty()),
             "the gap flags the epoch"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new88_failed_withdrawal_preserves_prior_authority() {
+        // P2fix15 NEW-88 (+ NEW-2/NEW-22/NEW-33/NEW-56/
+        // NEW-70/NEW-75-OPEN — failed withdrawal after
+        // retention): retention removes already-folded
+        // windows, the next refresh publishes past the gap,
+        // the settle sync fails, AND the withdrawal itself
+        // fails (the checkpoint dir is read-only when the
+        // swapback runs) — the unsettled replacement stands
+        // untouched, and reopen adopts the marker-bound
+        // PRIOR with exact accounting — the failed
+        // withdrawal never leaves the replacement
+        // authoritative. Pre-fix: reopen reads the name
+        // directly and adopts the unconfirmed replacement
+        // (RED).
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix15-new88-failed-withdrawal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        for seq in 0..3u64 {
+            std::fs::write(
+                dir.join(format!("window-{seq:010}.json")),
+                serde_json::to_string(&snapshot::test_envelope(seq, 0, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+        }
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("ckpt.json");
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::default();
+        refresh_once(&mut p, &mut state).expect("first refresh commits watermark 2");
+        // Retention removes the already-folded windows; a new
+        // fold-pending window lands past a gap.
+        for seq in 0..3u64 {
+            std::fs::remove_file(dir.join(format!("window-{seq:010}.json"))).unwrap();
+        }
+        std::fs::write(
+            dir.join("window-0000000004.json"),
+            serde_json::to_string(&snapshot::test_envelope(4, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        // The settle sync fails AND the withdrawal's swapback
+        // fails (read-only dir from the post-publish hook on —
+        // placement proofs still pass on a readable dir).
+        let ckpt_dir2 = ckpt_dir.clone();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran2 = ran.clone();
+        snapshot::post_exchange_hook::arm(move || {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&ckpt_dir2, std::fs::Permissions::from_mode(0o555)).unwrap();
+            ran2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        snapshot::dir_sync_fault::arm(1);
+        let err = refresh_once(&mut p, &mut state)
+            .err()
+            .expect("failed settlement with failed withdrawal fails the refresh");
+        snapshot::post_exchange_hook::disarm();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&ckpt_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the read-only hook ran after the publish"
+        );
+        assert!(
+            err.contains("swapback failed"),
+            "the failure declares the failed withdrawal: {err}"
+        );
+        // The unsettled replacement stands untouched at the
+        // target; the prior stands under the stage name.
+        let standing: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        assert_eq!(
+            standing["watermark_seq"],
+            serde_json::json!(4),
+            "the standing target is the unconfirmed replacement"
+        );
+        let stages: Vec<String> = std::fs::read_dir(&ckpt_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".staging-"))
+            .collect();
+        assert_eq!(stages.len(), 1, "the prior stands aside: {stages:?}");
+        // Reopen adopts the marker-bound PRIOR with exact
+        // accounting — the replacement never authoritative.
+        drop(p);
+        drop(state);
+        let q = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+            .expect("reopen adopts the marker-bound prior");
+        assert_eq!(q.folded_tip(), (Some(0), Some(2)), "the prior tip stands");
+        assert_eq!(
+            q.fold_totals(),
+            (30, [30, 0, 0, 0]),
+            "the prior totals stand"
+        );
+        assert!(
+            q.recovered_unsettled_prior(),
+            "the reopen reports the prior-settlement recovery"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new89_settle_cleanup_failure_commits_live_and_reports_residue() {
+        // P2fix15 NEW-89 (+ NEW-9/NEW-16/NEW-70-OPEN): a
+        // post-settlement cleanup failure must not leave
+        // live behind durable — the settled commit ADVANCES
+        // live state and the residue reports SEPARATELY:
+        // through the SINK (the served push carries the new
+        // transaction + the residue), through SHUTDOWN (the
+        // shutdown persist reports `Ok` with residue), and
+        // through REOPEN (the durable new checkpoint
+        // reloads). Pre-fix: the cleanup failure fails the
+        // refresh and live stays behind (RED).
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix15-new89-cleanup-residue-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("ckpt.json");
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::default();
+        let qp0 = refresh_once(&mut p, &mut state).expect("first refresh commits");
+        assert!(qp0.residue.is_empty(), "a clean commit carries no residue");
+        std::fs::write(
+            dir.join("window-0000000001.json"),
+            serde_json::to_string(&snapshot::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        // SINK: the refresh commits the new transaction AND
+        // reports the cleanup residue on the served push.
+        snapshot::settle_cleanup_fault::arm(1);
+        let qp = refresh_once(&mut p, &mut state)
+            .expect("a settled commit advances live despite cleanup failure");
+        assert_eq!(
+            qp.snap.source.window_seq,
+            Some(1),
+            "the served push carries the NEW tip (live advanced)"
+        );
+        assert!(
+            !qp.residue.is_empty() && qp.residue.join(" ").contains(".staging-"),
+            "the push reports the cleanup residue separately: {:?}",
+            qp.residue
+        );
+        // SHUTDOWN: the live transaction persists (watermark
+        // 1 — live == durable) and the shutdown persist
+        // reports `Ok` with the residue.
+        let outcome = super::shutdown_flush(&mut p)
+            .expect("a settled shutdown persist reports Ok with residue");
+        assert!(
+            !outcome.residue.is_empty(),
+            "the shutdown persist reports the residue: {:?}",
+            outcome.residue
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        assert_eq!(
+            body["watermark_seq"],
+            serde_json::json!(1),
+            "live persisted == durable (no live-behind)"
+        );
+        assert_eq!(
+            body["accumulators"]["calls_total"],
+            serde_json::json!(20),
+            "exactly one fold of each window"
+        );
+        // REOPEN: the durable new checkpoint reloads.
+        drop(p);
+        drop(state);
+        let q = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+            .expect("reopen on the settled checkpoint");
+        assert_eq!(q.folded_tip(), (Some(0), Some(1)), "the new tip stands");
+        assert_eq!(q.fold_totals(), (20, [20, 0, 0, 0]), "the new totals stand");
+        assert!(
+            !q.recovered_unsettled_prior(),
+            "a settled commit reopens directly (no recovery)"
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&ckpt_dir);

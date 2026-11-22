@@ -628,6 +628,12 @@ pub fn run(args: &[String]) -> ExitCode {
     if !tty && !opts.follow {
         return match presenter.build_service() {
             Ok(snap) => {
+                // Settled with residue (P2fix15 NEW-89): the
+                // commit stands — each leftover reports loudly
+                // (stdout keeps the frame only).
+                for r in presenter.take_flush_residue() {
+                    eprintln!("osslscope: watch: checkpoint committed with residue: {r}");
+                }
                 if opts.format_json {
                     match serde_json::to_vec_pretty(&snap) {
                         Ok(mut bytes) => {
@@ -665,6 +671,12 @@ pub fn run(args: &[String]) -> ExitCode {
         match presenter.build_service() {
             Ok(snap) => {
                 built_once = true;
+                // Settled with residue (P2fix15 NEW-89): the
+                // commit stands — each leftover reports loudly
+                // on stderr (the frame path is untouched).
+                for r in presenter.take_flush_residue() {
+                    eprintln!("osslscope: watch: checkpoint committed with residue: {r}");
+                }
                 let generation = snap.source.generation;
                 // Previous-epoch tail (P2fix11 NEW-67): the
                 // preserved failed-unpublished epoch wins over
@@ -768,12 +780,20 @@ pub fn run(args: &[String]) -> ExitCode {
                 // folded tip from the single scan that just ran,
                 // same line, so live-test synchronization observes
                 // the accepted tip + the rejected tail from the
-                // SAME scan with no buffered-note counting).
+                // SAME scan with no buffered-note counting) AND
+                // the EXPLICIT rejected window (P2fix15 NEW-91 —
+                // the filename sequence that scan broke at, never
+                // the schema-error text — matched as complete
+                // fields, never substrings).
                 let tip = match presenter.folded_tip() {
                     (Some(g), Some(s)) => format!("accepted tip gen={g} seq={s}; "),
                     _ => "accepted tip none; ".to_string(),
                 };
-                eprintln!("osslscope: watch: {e} ({tip}retaining last-good)");
+                let rejected = match presenter.rejected_window() {
+                    Some(r) => format!("rejected window seq={r}; "),
+                    None => "rejected window none; ".to_string(),
+                };
+                eprintln!("osslscope: watch: {e} ({tip}{rejected}retaining last-good)");
                 if let Some(last) = last_built.clone() {
                     let mut republished = last;
                     let (age, stale) = super::snapshot::snapshot_freshness(

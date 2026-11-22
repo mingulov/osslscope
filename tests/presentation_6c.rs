@@ -3458,6 +3458,12 @@ fn gate29_contract_triggers_and_coverage_across_all_paths() {
             .unwrap()
             .insert("sha256".to_string(), serde_json::json!(hash));
         std::fs::write(&ckpt, serde_json::to_vec(&v).unwrap()).unwrap();
+        // Out-of-band craft voids the settlement record
+        // (P2fix15 NEW-88 — the record binds writer
+        // productions only; the craft exercises the legacy
+        // content-validation path, whose rules are identical
+        // on the marker path).
+        let _ = std::fs::remove_file(format!("{}.settled", ckpt.display()));
     };
     retamper(&|v| {
         v["accumulators"]["latest"]["api_activity"] = serde_json::json!([]);
@@ -4717,6 +4723,12 @@ fn new19_required_nullable_presence_and_null_rules_across_all_gates() {
             .unwrap()
             .insert("sha256".to_string(), serde_json::json!(hash));
         std::fs::write(&ckpt, serde_json::to_vec(&v).unwrap()).unwrap();
+        // Out-of-band craft voids the settlement record
+        // (P2fix15 NEW-88 — the record binds writer
+        // productions only; the craft exercises the legacy
+        // content-validation path, whose rules are identical
+        // on the marker path).
+        let _ = std::fs::remove_file(format!("{}.settled", ckpt.display()));
     };
     // Absent classes ride the UNCERTAIN shape (present-null
     // applies; absent refuses — the preserved distinction).
@@ -6600,6 +6612,12 @@ fn new2_restore_rejects_unbound_watermark() {
             .unwrap()
             .insert("sha256".to_string(), serde_json::json!(hash));
         std::fs::write(&ckpt, serde_json::to_vec(&v).unwrap()).unwrap();
+        // Out-of-band craft voids the settlement record
+        // (P2fix15 NEW-88 — the record binds writer
+        // productions only; the craft exercises the legacy
+        // content-validation path, whose rules are identical
+        // on the marker path).
+        let _ = std::fs::remove_file(format!("{}.settled", ckpt.display()));
     };
     // Sanity: the untampered checkpoint restores.
     snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
@@ -7130,6 +7148,12 @@ fn new4_restore_revalidates_typed_state() {
             .unwrap()
             .insert("sha256".to_string(), serde_json::json!(hash));
         std::fs::write(&ckpt, serde_json::to_vec(&v).unwrap()).unwrap();
+        // Out-of-band craft voids the settlement record
+        // (P2fix15 NEW-88 — the record binds writer
+        // productions only; the craft exercises the legacy
+        // content-validation path, whose rules are identical
+        // on the marker path).
+        let _ = std::fs::remove_file(format!("{}.settled", ckpt.display()));
     };
     // Non-vocabulary counter in restored signals.
     retamper(&|v| {
@@ -7478,11 +7502,22 @@ fn new34_concurrent_distinct_checkpoints_share_no_staging() {
         );
         let _ = snapshot::Presenter::open_with_checkpoint(&dir, ckpt, 1, "export")
             .expect("checkpoint reloads");
+        // Settlement record (P2fix15 NEW-88): each target
+        // carries its own record confirming its own bytes
+        // (per-target citizens — never shared, never
+        // crossed).
+        let settled: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(format!("{}.settled", ckpt.display())).unwrap())
+                .unwrap();
+        assert_eq!(
+            settled["target_sha256"], v["sha256"],
+            "the record confirms its own target: {ckpt:?}"
+        );
     }
     let residue: Vec<_> = std::fs::read_dir(&parent)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n != "w.json" && n != "w.bak")
+        .filter(|n| n != "w.json" && n != "w.bak" && n != "w.json.settled" && n != "w.bak.settled")
         .collect();
     assert!(residue.is_empty(), "no staging residue: {residue:?}");
 }
@@ -8642,9 +8677,9 @@ fn new67_gen_change_preserves_failed_epoch_through_follow_loop() {
         serde_json::to_string(&win2).unwrap(),
     )
     .unwrap();
-    // Exact-scan wait (P2fix14 NEW-84): one outage note
-    // naming the rejected tail AND the accepted tip
-    // (gen=1 seq=2) on the same line proves one scan
+    // Exact-scan wait (P2fix15 NEW-91): one outage note
+    // naming the explicit rejected window AND the accepted tip
+    // (rejected seq=3; tip gen=1 seq=2) on the same line proves one scan
     // folded the gen-1 prefix and rejected the tail (no
     // buffered-note counting).
     drain_until_exact_scan(
@@ -8652,7 +8687,7 @@ fn new67_gen_change_preserves_failed_epoch_through_follow_loop() {
         &mut out_lines,
         &mut err_lines,
         Instant::now() + Duration::from_secs(20),
-        "service-window-v1",
+        3,
         1,
         2,
     );
@@ -8910,9 +8945,9 @@ fn new67_gen_change_preserves_failed_epoch_through_follow_json() {
         serde_json::to_string(&win2).unwrap(),
     )
     .unwrap();
-    // Exact-scan wait (P2fix14 NEW-84): one outage note
-    // naming the rejected tail AND the accepted tip
-    // (gen=1 seq=2) on the same line proves one scan
+    // Exact-scan wait (P2fix15 NEW-91): one outage note
+    // naming the explicit rejected window AND the accepted tip
+    // (rejected seq=3; tip gen=1 seq=2) on the same line proves one scan
     // folded the prefix and rejected the tail (no
     // buffered-note counting).
     drain_until_exact_scan(
@@ -8920,7 +8955,7 @@ fn new67_gen_change_preserves_failed_epoch_through_follow_json() {
         &mut out_lines,
         &mut err_lines,
         Instant::now() + Duration::from_secs(20),
-        "service-window-v1",
+        3,
         1,
         2,
     );
@@ -9106,9 +9141,9 @@ fn new67_same_generation_recovery_through_follow_loop() {
         serde_json::to_string(&win2).unwrap(),
     )
     .unwrap();
-    // Exact-scan wait (P2fix14 NEW-84): one outage note
-    // naming the rejected tail AND the accepted tip
-    // (gen=1 seq=2) on the same line proves one scan
+    // Exact-scan wait (P2fix15 NEW-91): one outage note
+    // naming the explicit rejected window AND the accepted tip
+    // (rejected seq=3; tip gen=1 seq=2) on the same line proves one scan
     // folded the prefix and rejected the tail (no
     // buffered-note counting).
     drain_until_exact_scan(
@@ -9116,7 +9151,7 @@ fn new67_same_generation_recovery_through_follow_loop() {
         &mut out_lines,
         &mut err_lines,
         Instant::now() + Duration::from_secs(20),
-        "service-window-v1",
+        3,
         1,
         2,
     );
@@ -10323,32 +10358,53 @@ fn envelope_raw_duplicate_trace_keys_reject() {
     assert!(!err.contains("`mode`"), "key must not echo: {err}");
 }
 
-/// Exact-scan synchronization (P2fix14 NEW-84 — supersedes
-/// the P2fix13 NEW-78 two-note count): wait until ONE outage
-/// note names BOTH the rejected tail (`want_err`) AND the
-/// accepted tip (`want_gen`/`want_seq`) on the SAME line.
-/// Same-line atomicity IS the same-scan proof: the watch loop
-/// prints the live folded tip beside the rejection from the
-/// single scan that just ran (one `eprintln!` — pipe
-/// buffering cannot fuse lines from different scans). No
-/// buffered-note counting: tail-only scans (the tip is
-/// elsewhere — they folded no prefix) can never satisfy the
-/// wait, however many queue up (codex R14's counterexample:
-/// two queued tail errors from before the prefix landed).
+/// Complete-field phrase match (P2fix15 NEW-91): the
+/// phrase must occur AND the first byte after it must not
+/// be an ASCII digit — `seq=20` never satisfies `seq=2`
+/// (the old substring wait accepted the decimal prefix).
+/// Mid-phrase boundaries are structural (the fixed
+/// `watch.rs` words + spaces pin every interior field, so
+/// only the trailing digits need the bound).
+fn phrase_eq(line: &str, phrase: &str) -> bool {
+    match line.find(phrase) {
+        Some(i) => !line
+            .as_bytes()
+            .get(i + phrase.len())
+            .is_some_and(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// Exact-scan synchronization (P2fix15 NEW-91 — supersedes
+/// the P2fix14 NEW-84 substring wait): wait until ONE outage
+/// note names BOTH the explicit rejected window
+/// (`want_rejected` — the filename sequence that scan broke
+/// at, never the schema-error text) AND the accepted tip
+/// (`want_gen`/`want_seq`) on the SAME line, matched as
+/// COMPLETE fields. Same-line atomicity IS the same-scan
+/// proof: the watch loop prints the live folded tip beside
+/// the rejection from the single scan that just ran (one
+/// `eprintln!` — pipe buffering cannot fuse lines from
+/// different scans). No buffered-note counting: tail-only
+/// scans (the tip is elsewhere — they folded no prefix) can
+/// never satisfy the wait, however many queue up (codex
+/// R14's counterexample: two queued tail errors from before
+/// the prefix landed).
 fn drain_until_exact_scan(
     rx: &std::sync::mpsc::Receiver<(bool, String)>,
     out_lines: &mut Vec<String>,
     err_lines: &mut Vec<String>,
     deadline: std::time::Instant,
-    want_err: &str,
+    want_rejected: u64,
     want_gen: u64,
     want_seq: u64,
 ) {
     let tip = format!("accepted tip gen={want_gen} seq={want_seq}");
+    let rejected = format!("rejected window seq={want_rejected}");
     loop {
         for line in err_lines.iter() {
-            if line.contains(want_err)
-                && line.contains(tip.as_str())
+            if phrase_eq(line, tip.as_str())
+                && phrase_eq(line, rejected.as_str())
                 && line.contains("retaining last-good")
             {
                 return;
@@ -10356,7 +10412,7 @@ fn drain_until_exact_scan(
         }
         if std::time::Instant::now() >= deadline {
             panic!(
-                "timed out waiting for the same-scan tip+tail note ({want_err:?} + {tip:?}); out={out_lines:?} err={err_lines:?}"
+                "timed out waiting for the same-scan tip+tail note ({rejected:?} + {tip:?}); out={out_lines:?} err={err_lines:?}"
             );
         }
         match rx.recv_timeout(std::time::Duration::from_millis(200)) {
@@ -10374,14 +10430,15 @@ fn drain_until_exact_scan(
 
 #[test]
 fn new84_same_scan_tip_and_tail_satisfies() {
-    // P2fix14 NEW-84 (positive arm, synthetic — no binary):
-    // ONE outage note naming the rejected tail AND the
-    // accepted tip on the same line (the real `watch.rs`
-    // line shape) satisfies the wait immediately.
+    // P2fix14 NEW-84 (positive arm, synthetic — no binary;
+    // line shape updated P2fix15 NEW-91): ONE outage note
+    // naming the explicit rejected window AND the accepted
+    // tip on the same line (the real `watch.rs` line shape)
+    // satisfies the wait immediately.
     let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
     tx.send((
         false,
-        "osslscope: watch: envelope without service-window-v1 schema (accepted tip gen=1 seq=2; retaining last-good)"
+        "osslscope: watch: envelope without service-window-v1 schema (accepted tip gen=1 seq=2; rejected window seq=3; retaining last-good)"
             .to_string(),
     ))
     .unwrap();
@@ -10393,7 +10450,7 @@ fn new84_same_scan_tip_and_tail_satisfies() {
         &mut out_lines,
         &mut err_lines,
         std::time::Instant::now() + std::time::Duration::from_secs(5),
-        "service-window-v1",
+        3,
         1,
         2,
     );
@@ -10402,13 +10459,13 @@ fn new84_same_scan_tip_and_tail_satisfies() {
 #[test]
 #[should_panic(expected = "timed out waiting for the same-scan tip+tail note")]
 fn new84_tail_only_notes_never_satisfy() {
-    // P2fix14 NEW-84 (negative arm, synthetic — no binary):
-    // tail-only outage notes (the tip is elsewhere or none —
-    // scans that rejected the tail WITHOUT folding the
-    // prefix) NEVER satisfy the wait, however many queue up
-    // (codex R14's counterexample: two queued tail errors
-    // from before the prefix landed satisfied the old
-    // two-note count).
+    // P2fix14 NEW-84 (negative arm, synthetic — no binary;
+    // line shape updated P2fix15 NEW-91): tail-only outage
+    // notes (the tip is elsewhere or none — scans that
+    // rejected the tail WITHOUT folding the prefix) NEVER
+    // satisfy the wait, however many queue up (codex R14's
+    // counterexample: two queued tail errors from before
+    // the prefix landed satisfied the old two-note count).
     let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
     for tip in [
         "accepted tip gen=0 seq=0",
@@ -10417,7 +10474,7 @@ fn new84_tail_only_notes_never_satisfy() {
     ] {
         tx.send((
             false,
-            format!("osslscope: watch: envelope without service-window-v1 schema ({tip}; retaining last-good)"),
+            format!("osslscope: watch: envelope without service-window-v1 schema ({tip}; rejected window seq=3; retaining last-good)"),
         ))
         .unwrap();
     }
@@ -10429,9 +10486,124 @@ fn new84_tail_only_notes_never_satisfy() {
         &mut out_lines,
         &mut err_lines,
         std::time::Instant::now() + std::time::Duration::from_millis(500),
-        "service-window-v1",
+        3,
         1,
         2,
+    );
+}
+
+#[test]
+#[should_panic(expected = "timed out waiting for the same-scan tip+tail note")]
+fn new91_neighboring_sequence_never_satisfies() {
+    // P2fix15 NEW-91 (+ NEW-65/NEW-78/NEW-84-OPEN —
+    // neighboring-sequence negative, synthetic): notes whose
+    // tip is a DECIMAL NEIGHBOR of the wanted tip (longer
+    // numbers sharing the wanted digits as a prefix, or a
+    // different generation sharing the prefix) NEVER satisfy
+    // the wait — `seq=20` must not satisfy `seq=2` (the old
+    // substring wait accepted every line below — RED).
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    for tip in [
+        "accepted tip gen=1 seq=20",
+        "accepted tip gen=1 seq=21",
+        "accepted tip gen=1 seq=12",
+        "accepted tip gen=10 seq=2",
+        "accepted tip gen=12 seq=2",
+    ] {
+        tx.send((
+            false,
+            format!("osslscope: watch: envelope without service-window-v1 schema ({tip}; rejected window seq=3; retaining last-good)"),
+        ))
+        .unwrap();
+    }
+    drop(tx);
+    let mut out_lines: Vec<String> = vec![];
+    let mut err_lines: Vec<String> = vec![];
+    drain_until_exact_scan(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        std::time::Instant::now() + std::time::Duration::from_millis(500),
+        3,
+        1,
+        2,
+    );
+}
+
+#[test]
+#[should_panic(expected = "timed out waiting for the same-scan tip+tail note")]
+fn new91_wrong_tail_never_satisfies() {
+    // P2fix15 NEW-91 (+ NEW-65/NEW-78/NEW-84-OPEN —
+    // wrong-tail negative, synthetic): notes naming the
+    // RIGHT tip but the WRONG rejected window (a different
+    // tail, or a decimal neighbor of the wanted tail) NEVER
+    // satisfy the wait — the rejected window is matched as a
+    // complete field on the same line, not as a substring.
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    for rejected in [
+        "rejected window seq=4",
+        "rejected window seq=30",
+        "rejected window seq=13",
+        "rejected window none",
+    ] {
+        tx.send((
+            false,
+            format!("osslscope: watch: envelope without service-window-v1 schema (accepted tip gen=1 seq=2; {rejected}; retaining last-good)"),
+        ))
+        .unwrap();
+    }
+    drop(tx);
+    let mut out_lines: Vec<String> = vec![];
+    let mut err_lines: Vec<String> = vec![];
+    drain_until_exact_scan(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        std::time::Instant::now() + std::time::Duration::from_millis(500),
+        3,
+        1,
+        2,
+    );
+}
+
+#[test]
+fn new91_multidigit_tip_satisfies_exactly() {
+    // P2fix15 NEW-91 (multi-digit positive guard, synthetic):
+    // the complete-field matcher is exact in BOTH directions
+    // — a shorter prefix line (`seq=1`) must NOT satisfy a
+    // wait for `seq=12` (the wait keeps waiting), while the
+    // exact multi-digit line satisfies immediately (guards
+    // against an over-strict matcher that only handles
+    // single digits).
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    tx.send((
+        false,
+        "osslscope: watch: envelope without service-window-v1 schema (accepted tip gen=1 seq=1; rejected window seq=13; retaining last-good)"
+            .to_string(),
+    ))
+    .unwrap();
+    tx.send((
+        false,
+        "osslscope: watch: envelope without service-window-v1 schema (accepted tip gen=1 seq=12; rejected window seq=13; retaining last-good)"
+            .to_string(),
+    ))
+    .unwrap();
+    drop(tx);
+    let mut out_lines: Vec<String> = vec![];
+    let mut err_lines: Vec<String> = vec![];
+    drain_until_exact_scan(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+        13,
+        1,
+        12,
+    );
+    assert_eq!(
+        err_lines.len(),
+        2,
+        "the prefix line waited, the exact line satisfied: {err_lines:?}"
     );
 }
 
@@ -10562,9 +10734,9 @@ fn new71_published_prefix_through_follow_loop() {
                 .as_bytes(),
         );
     }
-    // Exact-scan wait (P2fix14 NEW-84): one outage note
-    // naming the rejected tail AND the accepted tip
-    // (gen=0 seq=3) on the same line proves one scan
+    // Exact-scan wait (P2fix15 NEW-91): one outage note
+    // naming the explicit rejected window AND the accepted tip
+    // (rejected seq=4; tip gen=0 seq=3) on the same line proves one scan
     // folded the newer prefix and rejected the tail (no
     // buffered-note counting).
     drain_until_exact_scan(
@@ -10572,7 +10744,7 @@ fn new71_published_prefix_through_follow_loop() {
         &mut out_lines,
         &mut err_lines,
         Instant::now() + Duration::from_secs(20),
-        "service-window-v1",
+        4,
         0,
         3,
     );
@@ -10829,9 +11001,9 @@ fn new71_published_prefix_through_follow_json() {
                 .as_bytes(),
         );
     }
-    // Exact-scan wait (P2fix14 NEW-84): one outage note
-    // naming the rejected tail AND the accepted tip
-    // (gen=0 seq=3) on the same line proves one scan
+    // Exact-scan wait (P2fix15 NEW-91): one outage note
+    // naming the explicit rejected window AND the accepted tip
+    // (rejected seq=4; tip gen=0 seq=3) on the same line proves one scan
     // folded the newer prefix and rejected the tail (no
     // buffered-note counting).
     drain_until_exact_scan(
@@ -10839,7 +11011,7 @@ fn new71_published_prefix_through_follow_json() {
         &mut out_lines,
         &mut err_lines,
         Instant::now() + Duration::from_secs(20),
-        "service-window-v1",
+        4,
         0,
         3,
     );
@@ -11028,7 +11200,7 @@ fn new77_coalesced_resets_through_follow_loop() {
         &mut out_lines,
         &mut err_lines,
         Instant::now() + Duration::from_secs(20),
-        "service-window-v1",
+        3,
         1,
         2,
     );
@@ -11297,7 +11469,7 @@ fn new77_coalesced_resets_through_follow_json() {
         &mut out_lines,
         &mut err_lines,
         Instant::now() + Duration::from_secs(20),
-        "service-window-v1",
+        3,
         1,
         2,
     );
@@ -11518,9 +11690,9 @@ fn new65_same_generation_recovery_through_follow_json() {
         &dir.join("window-0000000002.json"),
         serde_json::to_string(&win2).unwrap().as_bytes(),
     );
-    // Exact-scan wait (P2fix14 NEW-84): one outage note
-    // naming the rejected tail AND the accepted tip
-    // (gen=1 seq=2) on the same line proves one scan
+    // Exact-scan wait (P2fix15 NEW-91): one outage note
+    // naming the explicit rejected window AND the accepted tip
+    // (rejected seq=3; tip gen=1 seq=2) on the same line proves one scan
     // folded the exact accepted prefix and rejected the
     // tail (no buffered-note counting).
     drain_until_exact_scan(
@@ -11528,7 +11700,7 @@ fn new65_same_generation_recovery_through_follow_json() {
         &mut out_lines,
         &mut err_lines,
         Instant::now() + Duration::from_secs(20),
-        "service-window-v1",
+        3,
         1,
         2,
     );
@@ -11706,7 +11878,7 @@ fn new83_first_frame_after_restart_shows_outgoing_loop() {
         &mut out_lines,
         &mut err_lines,
         Instant::now() + Duration::from_secs(20),
-        "service-window-v1",
+        3,
         1,
         2,
     );
@@ -11971,7 +12143,7 @@ fn new83_first_frame_after_restart_shows_outgoing_json() {
         &mut out_lines,
         &mut err_lines,
         Instant::now() + Duration::from_secs(20),
-        "service-window-v1",
+        3,
         1,
         2,
     );
