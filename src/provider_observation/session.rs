@@ -557,21 +557,21 @@ enum QuiesceRepoll {
 /// positions prove; writer QUIESCENCE rides the successful RCU
 /// gate close — map-in-map deletion waits out the grace
 /// period, so post-close no new reserves can start). The two
-/// samples straddle a scheduling opportunity (yield + short
-/// sleep): stability across the sleep rules out in-flight
-/// reserves landing between samples (P2fix9 NEW-60: no
-/// admitted writer survives the RCU barrier to be descheduled
-/// across them — the gate close already waited out every
-/// admitted critical section, so the samples prove EXHAUSTION
-/// only, never quiescence). Any consumed record resets the
-/// count and folds through the exact path; the drain deadline
-/// bounds the wait (unproved past it, never confirmed).
+/// samples straddle short sample spacing (yield + short sleep;
+/// P2fix10 NEW-64 — spacing only, never a wait for writer
+/// scheduling: no admitted writer survives the RCU barrier —
+/// the gate close already waited out every admitted critical
+/// section — so the samples prove EXHAUSTION only, never
+/// quiescence). Any consumed record resets the count and folds
+/// through the exact path; the drain deadline bounds the wait
+/// (unproved past it, never confirmed).
 const TERMINAL_DRAIN_EQUALITY_SAMPLES: u32 = 2;
 /// Quiet-sample spacing (P2fix6 NEW-32, reused P2fix7 NEW-41):
-/// the sleep between consecutive position samples (the
-/// writer-quiescence wait — a descheduled writer gets a
-/// scheduling opportunity before the next sample; recoveries
-/// drain at full speed, never slept).
+/// the sleep between consecutive position samples (P2fix10
+/// NEW-64 — spacing only: quiescence rides the RCU gate close,
+/// never this sleep — no admitted writer survives the barrier
+/// to be scheduled across it; recoveries drain at full speed,
+/// never slept).
 const TERMINAL_QUIESCE_SAMPLE_SLEEP: Duration = Duration::from_millis(1);
 /// Load (consumer, producer) from a ringbuf meta-pages base
 /// (P2fix7 NEW-41): consumer at +0, producer at +page_size
@@ -5363,23 +5363,27 @@ impl ProviderSession {
                 None if !self.final_drain => break,
                 // P2fix5 NEW-23 + P2fix6 NEW-32 + P2fix7 NEW-41:
                 // a TERMINAL-drain `None` is busy-or-empty —
-                // quiesce (yield so an in-flight commit lands;
-                // the writers detached at the terminal cut, so
-                // no NEW records start) and re-poll before
-                // believing it. A quiet re-poll proves NOTHING
-                // by itself (aya repeats `None` for the same
-                // busy head) — past it the drain samples ring
-                // positions (AFFIRMATIVE): producer==consumer
-                // proves zero outstanding bytes (a busy head
-                // implies producer > consumer), and
+                // quiesce (yield spacing before the re-poll —
+                // P2fix10 NEW-64: spacing only, never a wait for
+                // writer scheduling — the writers detached at
+                // the terminal cut and the RCU gate close waited
+                // out every admitted critical section, so no NEW
+                // records start) and re-poll before believing
+                // it. A quiet re-poll proves NOTHING by itself
+                // (aya repeats `None` for the same busy head) —
+                // past it the drain samples ring positions
+                // (AFFIRMATIVE): producer==consumer proves zero
+                // outstanding bytes (a busy head implies producer
+                // > consumer), and
                 // [`TERMINAL_DRAIN_EQUALITY_SAMPLES`]
-                // consecutive equal samples across a
-                // scheduling opportunity prove ring exhaustion
-                // (P2fix8 NEW-49: positions prove exhaustion;
-                // writer quiescence rides the successful RCU
-                // gate close). Outstanding or unreadable
-                // positions reset the count and wait (sleeping
-                // gives writers a scheduling opportunity); a
+                // consecutive equal samples across sample
+                // spacing prove ring exhaustion (P2fix8 NEW-49:
+                // positions prove exhaustion; writer quiescence
+                // rides the successful RCU gate close).
+                // Outstanding or unreadable positions reset the
+                // count and sleep before the next sample (P2fix10
+                // NEW-64 — sample spacing only: quiescence rides
+                // the RCU gate close, never this sleep); a
                 // recovered record resets the count and folds
                 // through the exact path below (the loop
                 // re-arms quiescence at the next `None`); an
@@ -5413,11 +5417,11 @@ impl ProviderSession {
                                     equality_samples = 0;
                                 }
                             }
-                            // Another scheduling opportunity
-                            // before the next sample (the
-                            // writer-quiescence wait —
-                            // recoveries never sleep, only
-                            // quiet spacing).
+                            // Sample spacing before the next
+                            // sample (P2fix10 NEW-64 — spacing
+                            // only, never a writer-scheduling
+                            // wait — recoveries never sleep,
+                            // only quiet spacing).
                             std::thread::sleep(TERMINAL_QUIESCE_SAMPLE_SLEEP);
                             continue;
                         }

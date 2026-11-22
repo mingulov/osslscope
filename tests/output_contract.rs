@@ -834,6 +834,8 @@ fn schema_version_gate() {
         "observed-crypto-v2.0",
         "observed-crypto-v2.9",
         "observed-crypto-v2",
+        // P2fix10 NEW-62: the u64 upper boundary admits.
+        "observed-crypto-v2.18446744073709551615",
     ] {
         assert!(check_version_v2(ok), "v2 reader accepts {ok}");
     }
@@ -847,6 +849,8 @@ fn schema_version_gate() {
         "observed-crypto-v2.x",
         "observed-crypto-vX",
         "2.0",
+        // P2fix10 NEW-62: overflow rejects like any unsupported version.
+        "observed-crypto-v2.18446744073709551616",
     ] {
         assert!(!check_version_v2(bad), "v2 reader rejects {bad}");
     }

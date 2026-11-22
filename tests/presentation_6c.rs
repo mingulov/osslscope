@@ -8262,6 +8262,262 @@ fn new58_invalid_canonical_version_rejects_without_trace() {
 }
 
 #[test]
+fn new62_minor_overflow_rejects_u64max_admits() {
+    // P2fix10 NEW-62 (+ GATE29/NEW-51/NEW-58-OPEN): ONE
+    // representable minor domain (u64) across raw intake + both
+    // presenter shapes + persistence — a supplied minor above
+    // u64::MAX rejects like any unsupported version (no
+    // .parse().ok() erasure to None → sectionless); the u64
+    // upper boundary admits (sectionless AND with a valid
+    // section — the minor is genuinely represented); implicit
+    // .0 + valid future minors retained. Pre-fix: the overflow
+    // spelling maps to None and admits sectionless (RED).
+    use osslscope::presentation::snapshot;
+    const OVERFLOW: &str = "observed-crypto-v2.18446744073709551616";
+    const MAXM: &str = "observed-crypto-v2.18446744073709551615";
+    let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+    // Raw intake gate: overflow rejects, the boundary admits.
+    assert!(
+        !osslscope::schema::check_version_v2(OVERFLOW),
+        "raw gate rejects the overflowing minor"
+    );
+    assert!(
+        osslscope::schema::check_version_v2(MAXM),
+        "raw gate admits the u64 upper boundary"
+    );
+    // Overflow rejects on both shapes, direct + oneshot.
+    let mut doc = snapshot::test_document(3, "complete");
+    doc["schema"] = serde_json::json!(OVERFLOW);
+    assert!(
+        snapshot::signals_from_producer(&doc).is_none(),
+        "producer-shaped overflow rejects"
+    );
+    assert!(
+        snapshot::Presenter::oneshot(&doc).is_err(),
+        "producer oneshot rejects overflow"
+    );
+    let mut dd = doc_json_shell();
+    dd["schema_version"] = serde_json::json!(OVERFLOW);
+    assert!(
+        snapshot::signals_from_doc_json(&dd).is_none(),
+        "doc_json overflow rejects"
+    );
+    assert!(
+        snapshot::Presenter::oneshot(&dd).is_err(),
+        "doc_json oneshot rejects overflow"
+    );
+    // Service intake rejects the overflow window (never folds +
+    // persists an erased None minor).
+    let dir = out_dir("new62-service-overflow");
+    let env = snapshot::test_envelope_with_doc(0, 0, run.clone(), doc);
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&env).unwrap(),
+    )
+    .unwrap();
+    let ckpt = ckpt_for(&dir);
+    let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+    assert!(
+        p.build_service().is_err(),
+        "service intake rejects the overflow minor"
+    );
+    // The u64 upper boundary admits sectionless on every path.
+    let mut doc = snapshot::test_document(3, "complete");
+    doc["schema"] = serde_json::json!(MAXM);
+    assert!(
+        snapshot::signals_from_producer(&doc).is_some(),
+        "producer-shaped u64::MAX admits"
+    );
+    assert!(
+        snapshot::Presenter::oneshot(&doc).is_ok(),
+        "producer oneshot admits u64::MAX"
+    );
+    let mut dd = doc_json_shell();
+    dd["schema_version"] = serde_json::json!(MAXM);
+    assert!(
+        snapshot::signals_from_doc_json(&dd).is_some(),
+        "doc_json u64::MAX admits"
+    );
+    assert!(
+        snapshot::Presenter::oneshot(&dd).is_ok(),
+        "doc_json oneshot admits u64::MAX"
+    );
+    // MAX + a valid trace section admits (no erasure: the minor
+    // survives as Some(u64::MAX) through the trigger).
+    let mut traced = trace_doc(1, false);
+    traced["schema"] = serde_json::json!(MAXM);
+    assert!(
+        snapshot::signals_from_producer(&traced).is_some(),
+        "producer-shaped u64::MAX with a section admits"
+    );
+    assert!(
+        snapshot::Presenter::oneshot(&traced).is_ok(),
+        "producer oneshot admits u64::MAX with a section"
+    );
+    // Retention: implicit .0 + valid future minors admit on
+    // every path.
+    for good in ["observed-crypto-v2", "observed-crypto-v2.10"] {
+        let mut doc = snapshot::test_document(3, "complete");
+        doc["schema"] = serde_json::json!(good);
+        assert!(
+            snapshot::signals_from_producer(&doc).is_some(),
+            "producer {good:?} retained"
+        );
+        assert!(
+            snapshot::Presenter::oneshot(&doc).is_ok(),
+            "producer oneshot {good:?} retained"
+        );
+        let mut dd = doc_json_shell();
+        dd["schema_version"] = serde_json::json!(good);
+        assert!(
+            snapshot::signals_from_doc_json(&dd).is_some(),
+            "doc_json {good:?} retained"
+        );
+        assert!(
+            snapshot::Presenter::oneshot(&dd).is_ok(),
+            "doc_json oneshot {good:?} retained"
+        );
+    }
+    // Service-intake MAX control: folds + persists + the
+    // checkpoint reloads (restore re-runs the contract on the
+    // persisted u64::MAX minor).
+    let dir = out_dir("new62-service-max");
+    let mut doc = snapshot::test_document(3, "complete");
+    doc["schema"] = serde_json::json!(MAXM);
+    let env = snapshot::test_envelope_with_doc(0, 0, run, doc);
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&env).unwrap(),
+    )
+    .unwrap();
+    let ckpt = ckpt_for(&dir);
+    let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+    p.build_service().expect("service intake folds u64::MAX");
+    let mut q = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+        .expect("the persisted u64::MAX checkpoint reloads");
+    q.build_service().expect("reopened presenter rebuilds");
+}
+
+#[test]
+fn new65_recovery_publishes_hole_through_both_formats_and_reopen() {
+    // P2fix10 NEW-65 (+ NEW-P2c/NEW-P2h/NEW-2/NEW-57-OPEN): a
+    // retention hole + a valid new-generation window + a rejected
+    // later window, then recovery — the failed scan preserves
+    // the valid prefix's gap flags + ranges (no watermark
+    // advance orphans the missing span), and the recovery
+    // publishes WITH the missing span through BOTH watch formats
+    // (human frame + JSON) + the reopened checkpoint. Pre-fix:
+    // the failure skips the re-union and recovery publishes
+    // without the hole (RED).
+    use osslscope::presentation::snapshot;
+    let dir = out_dir("new65-hole-gen-reject");
+    let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+    for (seq, generation) in [(0u64, 0u64), (2u64, 1u64)] {
+        let env =
+            snapshot::test_envelope_with_doc(seq, generation, run.clone(), trace_doc(1, false));
+        std::fs::write(
+            dir.join(format!("window-{seq:010}.json")),
+            serde_json::to_string(&env).unwrap(),
+        )
+        .unwrap();
+    }
+    let mut bad = snapshot::test_envelope_with_doc(3, 1, run.clone(), trace_doc(1, false));
+    bad["schema"] = serde_json::json!("service-window-v9");
+    std::fs::write(
+        dir.join("window-0000000003.json"),
+        serde_json::to_string(&bad).unwrap(),
+    )
+    .unwrap();
+    let ckpt = ckpt_for(&dir);
+    let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+    let err = p
+        .build_service_staged()
+        .expect_err("the rejected window-3 must fail the scan");
+    assert!(
+        err.contains("service-window-v1"),
+        "the failure names the rejected window: {err:?}"
+    );
+    // Repair window-3 (valid gen-2 traced window) → recovery.
+    let repaired = snapshot::test_envelope_with_doc(3, 1, run, trace_doc(1, false));
+    std::fs::write(
+        dir.join("window-0000000003.json"),
+        serde_json::to_string(&repaired).unwrap(),
+    )
+    .unwrap();
+    let snap = p.build_service().expect("recovery builds");
+    snap.check_unknown_invariant().unwrap();
+    // The recovery publishes WITH the missing span.
+    let trace = snap.trace.as_ref().expect("raw trace block");
+    assert_eq!(
+        trace.unmeasured_seqs,
+        vec![[1u64, 1u64]],
+        "the hole range publishes on recovery"
+    );
+    assert!(
+        snap.unknown
+            .iter()
+            .any(|e| e.path == "counts.calls_total" && e.reason == "unstable_snapshot"),
+        "the hole flags publish on recovery: {:?}",
+        snap.unknown
+            .iter()
+            .map(|e| format!("{}:{}", e.path, e.reason))
+            .collect::<Vec<_>>()
+    );
+    // Both watch formats carry the missing span.
+    let frame = osslscope::presentation::watch::render_frame(&snap);
+    assert!(
+        frame.contains("unmeasured=[[1, 1]]"),
+        "the human frame carries the hole: {frame:?}"
+    );
+    assert!(
+        frame.contains("unstable_snapshot") || frame.contains("UNKNOWN"),
+        "the human frame carries the flags: {frame:?}"
+    );
+    let json = serde_json::to_string(&snap).unwrap();
+    assert!(
+        json.contains("\"unmeasured_seqs\":[[1,1]]"),
+        "the JSON frame carries the hole"
+    );
+    assert!(
+        json.contains("unstable_snapshot"),
+        "the JSON frame carries the flags"
+    );
+    // The committed checkpoint carries the evidence, and the
+    // reopened presenter re-serves it.
+    let ckpt_text = std::fs::read_to_string(&ckpt).unwrap();
+    let ckpt_json: serde_json::Value = serde_json::from_str(&ckpt_text).unwrap();
+    assert_eq!(
+        ckpt_json["accumulators"]["trace_unmeasured"],
+        serde_json::json!([[1, 1]]),
+        "the checkpoint persists the hole range"
+    );
+    assert!(
+        ckpt_json["accumulators"]["unstable"]
+            .as_array()
+            .is_some_and(|flags| flags.iter().any(|f| f == "counts.calls_total")),
+        "the checkpoint persists the hole flags"
+    );
+    drop(p);
+    let mut q = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+        .expect("the recovery checkpoint reloads");
+    let snap2 = q.build_service().expect("reopened presenter rebuilds");
+    snap2.check_unknown_invariant().unwrap();
+    let trace2 = snap2.trace.as_ref().expect("raw trace block after reopen");
+    assert_eq!(
+        trace2.unmeasured_seqs,
+        vec![[1u64, 1u64]],
+        "the hole range survives the reopen"
+    );
+    assert!(
+        snap2
+            .unknown
+            .iter()
+            .any(|e| e.path == "counts.calls_total" && e.reason == "unstable_snapshot"),
+        "the hole flags survive the reopen"
+    );
+}
+
+#[test]
 fn new51_duplicate_raw_discriminators_reject() {
     // P2fix8 NEW-51: duplicate raw discriminator members reject
     // BEFORE normalization (last-wins must not pick one version

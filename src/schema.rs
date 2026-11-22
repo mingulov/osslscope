@@ -55,7 +55,11 @@ pub const V2_SCHEMA_JSON: &str = include_str!("../schemas/observed-crypto-v2.jso
 /// True iff a v2.x reader accepts this `schema_version`: accepts
 /// `observed-crypto-v2` (implicit .0) and `observed-crypto-v2.<minor>`;
 /// rejects other majors and anything unparseable. Minor versions add
-/// OPTIONAL keys only — readers must ignore unknown keys.
+/// OPTIONAL keys only — readers must ignore unknown keys. The minor
+/// domain is REPRESENTABLE u64 (P2fix10 NEW-62 — one minor domain
+/// across raw intake + both presenter shapes + persistence: a digit
+/// string above `u64::MAX` rejects like any unsupported version,
+/// never erases to sectionless downstream).
 pub fn check_version_v2(v: &str) -> bool {
     let Some(rest) = v.strip_prefix("observed-crypto-v") else {
         return false;
@@ -69,7 +73,9 @@ pub fn check_version_v2(v: &str) -> bool {
     }
     match minor {
         None => true,
-        Some(m) => !m.is_empty() && m.bytes().all(|b| b.is_ascii_digit()),
+        Some(m) => {
+            !m.is_empty() && m.bytes().all(|b| b.is_ascii_digit()) && m.parse::<u64>().is_ok()
+        }
     }
 }
 
@@ -1015,10 +1021,17 @@ fn check_request_evidence(root: &serde_json::Map<String, serde_json::Value>) -> 
         .get("schema_version")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "doc.schema_version: expected string".to_string())?;
-    let minor: u64 = version
+    // P2fix10 NEW-62: explicit minor read (no `.parse().ok()`
+    // erasure — the version gate above already rejected
+    // malformed/overflowing minors, so only the bare
+    // implicit-.0 spelling defaults to 0 here).
+    let minor: u64 = match version
         .strip_prefix("observed-crypto-v2.")
-        .and_then(|m| m.parse().ok())
-        .unwrap_or(0);
+        .map(|m| m.parse::<u64>())
+    {
+        Some(Ok(n)) => n,
+        _ => 0,
+    };
     let Some(section) = root.get("request_evidence") else {
         // NEW-4: the reverse trigger applies to the CURRENT v2.8
         // stamp only — a later minor may be stamped for an
@@ -1186,10 +1199,17 @@ fn check_v26_sections(root: &serde_json::Map<String, serde_json::Value>) -> Resu
         .get("schema_version")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "doc.schema_version: expected string".to_string())?;
-    let minor: u64 = version
+    // P2fix10 NEW-62: explicit minor read (no `.parse().ok()`
+    // erasure — the version gate above already rejected
+    // malformed/overflowing minors, so only the bare
+    // implicit-.0 spelling defaults to 0 here).
+    let minor: u64 = match version
         .strip_prefix("observed-crypto-v2.")
-        .and_then(|m| m.parse().ok())
-        .unwrap_or(0);
+        .map(|m| m.parse::<u64>())
+    {
+        Some(Ok(n)) => n,
+        _ => 0,
+    };
     let has_sysctls = root
         .get("context")
         .and_then(|c| c.as_object())
@@ -1244,10 +1264,17 @@ fn check_execution_attributions(
         .get("schema_version")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "doc.schema_version: expected string".to_string())?;
-    let minor: u64 = version
+    // P2fix10 NEW-62: explicit minor read (no `.parse().ok()`
+    // erasure — the version gate above already rejected
+    // malformed/overflowing minors, so only the bare
+    // implicit-.0 spelling defaults to 0 here).
+    let minor: u64 = match version
         .strip_prefix("observed-crypto-v2.")
-        .and_then(|m| m.parse().ok())
-        .unwrap_or(0);
+        .map(|m| m.parse::<u64>())
+    {
+        Some(Ok(n)) => n,
+        _ => 0,
+    };
     if minor < 5 {
         return Err(format!(
             "doc.schema_version: attribution sections need minor >= 5, got {version:?}"
@@ -3612,6 +3639,10 @@ mod tests {
         assert!(check_version_v2("observed-crypto-v2.0"));
         assert!(check_version_v2("observed-crypto-v2.9"));
         assert!(check_version_v2("observed-crypto-v2"));
+        // P2fix10 NEW-62: the representable minor domain is u64 —
+        // the upper boundary admits, overflow rejects.
+        assert!(check_version_v2("observed-crypto-v2.18446744073709551615"));
+        assert!(!check_version_v2("observed-crypto-v2.18446744073709551616"));
         assert!(!check_version_v2("observed-crypto-v1.0"));
         assert!(!check_version_v2("observed-crypto-v1"));
         assert!(!check_version_v2("observed-crypto-v3.0"));

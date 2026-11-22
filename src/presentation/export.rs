@@ -1624,15 +1624,32 @@ mod tests {
         assert_eq!(qp.snap.source.generation, Some(1));
         let dir2 = std::env::temp_dir().join(format!("{}.twin", dir.display()));
         std::fs::create_dir_all(&dir2).unwrap();
-        for name in ["window-0000000000.json", "window-0000000001.json"] {
-            std::fs::copy(dir.join(name), dir2.join(name)).unwrap();
-        }
+        std::fs::copy(
+            dir.join("window-0000000000.json"),
+            dir2.join("window-0000000000.json"),
+        )
+        .unwrap();
         let ckpt2 = std::path::PathBuf::from(format!("{}.checkpoint.json", dir2.display()));
         {
             let mut t =
                 snapshot::Presenter::open_with_checkpoint(&dir2, &ckpt2, 1, "export").unwrap();
             let mut tstate = RefreshState::default();
             refresh_once(&mut t, &mut tstate).expect("twin first refresh");
+            // Mirror main's history (P2fix10 NEW-65): window-1
+            // lands AFTER the first refresh, so the twin's second
+            // refresh crosses the same scan boundary as the main
+            // retry. A same-scan re-union preserves scan-detected
+            // ranges across a mid-scan reset, while a cross-scan
+            // reset starts clean (documented epoch-boundary rule)
+            // — identical histories are the premise of the
+            // single-transaction equivalence below (batching both
+            // windows into the twin's first refresh compares two
+            // different histories).
+            std::fs::copy(
+                dir.join("window-0000000001.json"),
+                dir2.join("window-0000000001.json"),
+            )
+            .unwrap();
             refresh_once(&mut t, &mut tstate).expect("twin second refresh");
         }
         let scrub = |path: &std::path::Path| {

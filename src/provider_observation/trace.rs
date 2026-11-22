@@ -493,7 +493,11 @@ pub(crate) enum DocShape {
 /// old invalid→`None`→admit-sectionless path let an invalid
 /// version enter where the raw gate refuses it). Only ABSENT
 /// reads `None` (legacy sectionless, plus the implicit-.0
-/// spelling the raw gate accepts).
+/// spelling the raw gate accepts). The minor parses EXPLICITLY
+/// (P2fix10 NEW-62 — no `.parse().ok()` erasure: an
+/// unrepresentable minor rejects here even if the gate above
+/// ever loosens, so admission + persistence share the one u64
+/// domain with raw intake).
 pub(crate) fn canonical_minor(
     doc: &serde_json::Value,
     shape: DocShape,
@@ -522,9 +526,14 @@ pub(crate) fn canonical_minor(
     if !crate::schema::check_version_v2(text) {
         return Err(format!("doc.{canonical}: unsupported version {text:?}"));
     }
-    Ok(text
-        .strip_prefix("observed-crypto-v2.")
-        .and_then(|m| m.parse::<u64>().ok()))
+    match text.strip_prefix("observed-crypto-v2.") {
+        // Bare spelling (gate-verified above) reads implicit .0.
+        None => Ok(None),
+        Some(digits) => digits
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| format!("doc.{canonical}: unrepresentable minor in {text:?}")),
+    }
 }
 
 /// Required-nullable presence + non-nullable null rules (P2fix4
