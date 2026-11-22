@@ -558,14 +558,14 @@ enum QuiesceRepoll {
 /// gate close — map-in-map deletion waits out the grace
 /// period, so post-close no new reserves can start). The two
 /// samples straddle a scheduling opportunity (yield + short
-/// sleep): any admitted writer reserves within its
-/// non-preemptible window — stability across the sleep rules
-/// out in-flight reserves landing between samples. Any
-/// consumed record resets the count and folds through the exact
-/// path; the drain deadline bounds the wait (unproved past it,
-/// never confirmed). Residual: an admitted-but-unreserved
-/// writer descheduled across BOTH samples (vanishing —
-/// disclosed, not proven).
+/// sleep): stability across the sleep rules out in-flight
+/// reserves landing between samples (P2fix9 NEW-60: no
+/// admitted writer survives the RCU barrier to be descheduled
+/// across them — the gate close already waited out every
+/// admitted critical section, so the samples prove EXHAUSTION
+/// only, never quiescence). Any consumed record resets the
+/// count and folds through the exact path; the drain deadline
+/// bounds the wait (unproved past it, never confirmed).
 const TERMINAL_DRAIN_EQUALITY_SAMPLES: u32 = 2;
 /// Quiet-sample spacing (P2fix6 NEW-32, reused P2fix7 NEW-41):
 /// the sleep between consecutive position samples (the

@@ -6188,6 +6188,259 @@ fn new53_malformed_window_gross_rejects_envelope() {
 }
 
 #[test]
+fn new57_malformed_current_window_rejects_envelope() {
+    // P2fix9 NEW-57 (+ NEW-P2b/NEW-53-OPEN): window intake
+    // checks exact source identity, distinguishes raw key
+    // ABSENCE (legacy zeros) from EVERY supplied invalid
+    // shape, and validates a supplied configuration marker —
+    // all BEFORE mutation. A present non-object gross
+    // (null/scalar/array), a wrong-schema envelope, or a
+    // non-bool marker rejects the WHOLE envelope. Pre-fix:
+    // `obj_at` folds every non-object gross as legacy zeros,
+    // wrong-schema windows enter, and non-bool markers read
+    // as false (RED).
+    use osslscope::presentation::snapshot;
+    let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+    let gross = new46_valid_drops(5, 50);
+    for (what, mutate) in [
+        (
+            "gross-null",
+            serde_json::json!({"stream_gross_close": null}),
+        ),
+        ("gross-number", serde_json::json!({"stream_gross_close": 8})),
+        (
+            "gross-string",
+            serde_json::json!({"stream_gross_close": "8"}),
+        ),
+        (
+            "gross-bool",
+            serde_json::json!({"stream_gross_close": true}),
+        ),
+        ("gross-array", serde_json::json!({"stream_gross_close": []})),
+        (
+            "wrong-schema",
+            serde_json::json!({"schema": "service-run-v1"}),
+        ),
+        ("schema-null", serde_json::json!({"schema": null})),
+        ("schema-number", serde_json::json!({"schema": 1})),
+        ("marker-number", serde_json::json!({"stream_configured": 1})),
+        (
+            "marker-string",
+            serde_json::json!({"stream_configured": "true"}),
+        ),
+    ] {
+        let dir = out_dir(&format!("new57-current-{what}"));
+        let mut env0 = snapshot::test_envelope(0, 0, run.clone(), 10);
+        for (k, v) in mutate.as_object().unwrap() {
+            env0[k] = v.clone();
+        }
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&env0).unwrap(),
+        )
+        .unwrap();
+        let ckpt = ckpt_for(&dir);
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        assert!(
+            p.build_service().is_err(),
+            "{what}: the malformed window rejects the envelope"
+        );
+    }
+    // Missing-schema twin (key removal, not a value shape).
+    let dir = out_dir("new57-current-missing-schema");
+    let mut env0 = snapshot::test_envelope(0, 0, run.clone(), 10);
+    env0.as_object_mut().unwrap().remove("schema");
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&env0).unwrap(),
+    )
+    .unwrap();
+    let ckpt = ckpt_for(&dir);
+    let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+    assert!(
+        p.build_service().is_err(),
+        "missing-schema: the window rejects the envelope"
+    );
+    // Valid twin (control): exact identity + valid gross +
+    // bool marker folds.
+    let dir = out_dir("new57-current-valid");
+    let mut env0 = snapshot::test_envelope(0, 0, run.clone(), 10);
+    env0["stream_gross_close"] = gross;
+    env0["stream_configured"] = serde_json::json!(true);
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&env0).unwrap(),
+    )
+    .unwrap();
+    let ckpt = ckpt_for(&dir);
+    let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+    p.build_service().expect("valid window folds");
+    // Rejection advances nothing: the folded window keeps its
+    // exact checkpoint bytes across a rejected successor.
+    let mut env1 = snapshot::test_envelope(1, 0, run, 10);
+    env1["stream_gross_close"] = serde_json::json!(null);
+    std::fs::write(
+        dir.join("window-0000000001.json"),
+        serde_json::to_string(&env1).unwrap(),
+    )
+    .unwrap();
+    let good = std::fs::read(&ckpt).unwrap();
+    assert!(
+        p.build_service().is_err(),
+        "the null-gross successor rejects"
+    );
+    assert_eq!(
+        std::fs::read(&ckpt).unwrap(),
+        good,
+        "a rejected window persists nothing"
+    );
+}
+
+#[test]
+fn new57_malformed_successor_window_rejects_envelope() {
+    // P2fix9 NEW-57 successor twin: a next-run window with a
+    // malformed gross rejects WITHOUT sealing the departed
+    // run (seal-on-transition never fires on a rejected
+    // window) and persists nothing; repairing the successor
+    // seals A from the observed close with the honest note.
+    use osslscope::presentation::snapshot;
+    let boot = "12345678-9abc-def0-1234-56789abcdef0";
+    let tag_a = format!("1-2-{boot}");
+    let run_a = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": boot});
+    let run_b = serde_json::json!({"pid": 3, "starttime": 4, "boot_id": boot});
+    let dir = out_dir("new57-successor");
+    let mut env0 = snapshot::test_envelope(0, 0, run_a, 10);
+    env0["stream_gross_close"] = new46_valid_drops(5, 50);
+    env0["stream_configured"] = serde_json::json!(true);
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&env0).unwrap(),
+    )
+    .unwrap();
+    let ckpt = ckpt_for(&dir);
+    let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+    p.build_service().expect("run A folds");
+    let good = std::fs::read(&ckpt).unwrap();
+    let mut env1 = snapshot::test_envelope(1, 0, run_b.clone(), 10);
+    env1["stream_gross_close"] = serde_json::json!([1, 2]);
+    std::fs::write(
+        dir.join("window-0000000001.json"),
+        serde_json::to_string(&env1).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        p.build_service().is_err(),
+        "the array-gross successor rejects"
+    );
+    assert_eq!(
+        std::fs::read(&ckpt).unwrap(),
+        good,
+        "a rejected successor persists nothing"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&good).unwrap();
+    assert!(
+        v["accumulators"]["sealed"].get(&tag_a).is_none(),
+        "A stays unsealed: {:?}",
+        v["accumulators"]
+    );
+    // Repair the successor: valid gross seals A honestly.
+    let mut env1 = snapshot::test_envelope(1, 0, run_b, 10);
+    env1["stream_gross_close"] = new46_valid_drops(1, 10);
+    env1["stream_configured"] = serde_json::json!(false);
+    std::fs::write(
+        dir.join("window-0000000001.json"),
+        serde_json::to_string(&env1).unwrap(),
+    )
+    .unwrap();
+    p.build_service().expect("repaired successor seals A");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+    assert_eq!(
+        v["accumulators"]["sealed"][&tag_a]["records"], 5,
+        "A seals from the observed close: {:?}",
+        v["accumulators"]["sealed"][&tag_a]
+    );
+    assert_eq!(
+        v["accumulators"]["sealed"][&tag_a]["tail_note"],
+        serde_json::json!(snapshot::NOTE_SEALED_FROM_CLOSE),
+        "the honest no-summary note: {:?}",
+        v["accumulators"]["sealed"][&tag_a]
+    );
+}
+
+#[test]
+fn new57_malformed_window_rejected_across_restart() {
+    // P2fix9 NEW-57 restart twin: a rejected window leaves
+    // watermark, generation, and sealed gross intact across a
+    // checkpoint restart — nothing persists a phantom gross,
+    // and the post-restart seal reads the observed close.
+    use osslscope::presentation::snapshot;
+    let boot = "12345678-9abc-def0-1234-56789abcdef0";
+    let tag_a = format!("1-2-{boot}");
+    let run_a = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": boot});
+    let run_b = serde_json::json!({"pid": 3, "starttime": 4, "boot_id": boot});
+    let dir = out_dir("new57-restart");
+    let mut env0 = snapshot::test_envelope(0, 0, run_a, 10);
+    env0["stream_gross_close"] = new46_valid_drops(5, 50);
+    env0["stream_configured"] = serde_json::json!(true);
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&env0).unwrap(),
+    )
+    .unwrap();
+    let ckpt = ckpt_for(&dir);
+    let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+    p.build_service().expect("run A folds");
+    drop(p);
+    let mut p2 =
+        snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").expect("reopen works");
+    let mut env1 = snapshot::test_envelope(1, 0, run_b.clone(), 10);
+    env1["stream_gross_close"] = serde_json::json!("5");
+    std::fs::write(
+        dir.join("window-0000000001.json"),
+        serde_json::to_string(&env1).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        p2.build_service().is_err(),
+        "the scalar-gross successor rejects after restart"
+    );
+    drop(p2);
+    let mut p3 = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+        .expect("second reopen works");
+    p3.build_service()
+        .expect_err("the bad window still rejects");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+    assert_eq!(v["watermark_seq"], 0, "watermark intact: {v:?}");
+    assert_eq!(v["generation"], 0, "generation intact: {v:?}");
+    assert!(
+        v["accumulators"]["sealed"].get(&tag_a).is_none(),
+        "A stays unsealed: {:?}",
+        v["accumulators"]
+    );
+    assert_eq!(
+        v["accumulators"]["current_gross"]["records"], 5,
+        "sealed gross intact: {:?}",
+        v["accumulators"]
+    );
+    // Repair: the valid successor seals A honestly.
+    let mut env1 = snapshot::test_envelope(1, 0, run_b, 10);
+    env1["stream_gross_close"] = new46_valid_drops(1, 10);
+    std::fs::write(
+        dir.join("window-0000000001.json"),
+        serde_json::to_string(&env1).unwrap(),
+    )
+    .unwrap();
+    p3.build_service().expect("repaired successor seals A");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+    assert_eq!(
+        v["accumulators"]["sealed"][&tag_a]["tail_note"],
+        serde_json::json!(snapshot::NOTE_SEALED_FROM_CLOSE),
+        "the honest note survives restart: {:?}",
+        v["accumulators"]["sealed"][&tag_a]
+    );
+}
+
+#[test]
 fn newp2b_summary_before_window_preserves_one_gross() {
     // P2fix3 NEW-P2b: when the summary arrives BEFORE the run's
     // windows, the later seal-from-close reconciles (compare-
@@ -7838,6 +8091,174 @@ fn new51_canonical_discriminator_binds_per_shape() {
         p.build_service().is_err(),
         "the bypass document rejects the window (never folds)"
     );
+}
+
+#[test]
+fn new58_invalid_canonical_version_rejects_without_trace() {
+    // P2fix9 NEW-58 (+ GATE29/NEW-51-OPEN): the presenter
+    // requires supported version syntax + a valid minor
+    // before admission or persistence — a supplied malformed
+    // or unsupported canonical value rejects (no
+    // invalid→None→admit-sectionless path), through service
+    // intake AND both oneshot shapes. Documented legacy forms
+    // (absent discriminator, valid pre-9 minors without a
+    // section) still pass. Pre-fix: every invalid value below
+    // maps to None and admits sectionless (RED).
+    use osslscope::presentation::snapshot;
+    let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+    let bad_values = [
+        "observed-crypto-v9.9",
+        "observed-crypto-v1.0",
+        "observed-crypto-v2.x",
+        "observed-crypto-v2.",
+        "observed-crypto-v2",
+        "v2.9",
+        "",
+    ];
+    // Service intake: a window carrying the invalid producer
+    // version rejects (never folds + persists a None minor).
+    for bad in bad_values {
+        // NOTE: "observed-crypto-v2" (implicit .0) is VALID
+        // syntax per the raw gate — it belongs to the legacy
+        // controls below, not the reject set.
+        if bad == "observed-crypto-v2" {
+            continue;
+        }
+        let dir = out_dir(&format!("new58-service-{bad}"));
+        let mut doc = snapshot::test_document(3, "complete");
+        doc["schema"] = serde_json::json!(bad);
+        let env = snapshot::test_envelope_with_doc(0, 0, run.clone(), doc);
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&env).unwrap(),
+        )
+        .unwrap();
+        let ckpt = ckpt_for(&dir);
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        assert!(
+            p.build_service().is_err(),
+            "service intake rejects canonical {bad:?}"
+        );
+    }
+    // Non-string canonicals reject on every path.
+    for (what, raw) in [
+        ("null", serde_json::json!(null)),
+        ("number", serde_json::json!(9)),
+        ("bool", serde_json::json!(true)),
+        ("array", serde_json::json!([])),
+        ("object", serde_json::json!({})),
+    ] {
+        let mut doc = snapshot::test_document(3, "complete");
+        doc["schema"] = raw.clone();
+        assert!(
+            snapshot::signals_from_producer(&doc).is_none(),
+            "producer-shaped {what} canonical rejects"
+        );
+        assert!(
+            snapshot::Presenter::oneshot(&doc).is_err(),
+            "producer oneshot rejects {what} canonical"
+        );
+        let mut dd = doc_json_shell();
+        dd["schema_version"] = raw;
+        assert!(
+            snapshot::signals_from_doc_json(&dd).is_none(),
+            "doc_json {what} canonical rejects"
+        );
+        assert!(
+            snapshot::Presenter::oneshot(&dd).is_err(),
+            "doc_json oneshot rejects {what} canonical"
+        );
+    }
+    // String rejects on the direct + oneshot paths too.
+    for bad in [
+        "observed-crypto-v9.9",
+        "observed-crypto-v1.0",
+        "observed-crypto-v2.x",
+        "observed-crypto-v2.",
+        "v2.9",
+        "",
+    ] {
+        let mut doc = snapshot::test_document(3, "complete");
+        doc["schema"] = serde_json::json!(bad);
+        assert!(
+            snapshot::signals_from_producer(&doc).is_none(),
+            "producer-shaped {bad:?} rejects"
+        );
+        assert!(
+            snapshot::Presenter::oneshot(&doc).is_err(),
+            "producer oneshot rejects {bad:?}"
+        );
+        let mut dd = doc_json_shell();
+        dd["schema_version"] = serde_json::json!(bad);
+        assert!(
+            snapshot::signals_from_doc_json(&dd).is_none(),
+            "doc_json {bad:?} rejects"
+        );
+        assert!(
+            snapshot::Presenter::oneshot(&dd).is_err(),
+            "doc_json oneshot rejects {bad:?}"
+        );
+    }
+    // Legacy controls: absent discriminator + valid pre-9
+    // minors without a section pass on every path.
+    let doc = snapshot::test_document(3, "complete");
+    assert!(
+        snapshot::signals_from_producer(&doc).is_some(),
+        "absent producer discriminator passes"
+    );
+    assert!(
+        snapshot::Presenter::oneshot(&doc).is_ok(),
+        "absent-discriminator producer oneshot passes"
+    );
+    let dd = doc_json_shell();
+    assert!(
+        snapshot::signals_from_doc_json(&dd).is_some(),
+        "absent doc_json discriminator passes"
+    );
+    assert!(
+        snapshot::Presenter::oneshot(&dd).is_ok(),
+        "absent-discriminator doc_json oneshot passes"
+    );
+    for good in [
+        "observed-crypto-v2",
+        "observed-crypto-v2.0",
+        "observed-crypto-v2.8",
+    ] {
+        let mut doc = snapshot::test_document(3, "complete");
+        doc["schema"] = serde_json::json!(good);
+        assert!(
+            snapshot::signals_from_producer(&doc).is_some(),
+            "producer legacy {good:?} passes"
+        );
+        assert!(
+            snapshot::Presenter::oneshot(&doc).is_ok(),
+            "producer oneshot legacy {good:?} passes"
+        );
+        let mut dd = doc_json_shell();
+        dd["schema_version"] = serde_json::json!(good);
+        assert!(
+            snapshot::signals_from_doc_json(&dd).is_some(),
+            "doc_json legacy {good:?} passes"
+        );
+        assert!(
+            snapshot::Presenter::oneshot(&dd).is_ok(),
+            "doc_json oneshot legacy {good:?} passes"
+        );
+    }
+    // Service-intake legacy control: v2.8 without a section
+    // folds + persists its minor.
+    let dir = out_dir("new58-service-legacy");
+    let mut doc = snapshot::test_document(3, "complete");
+    doc["schema"] = serde_json::json!("observed-crypto-v2.8");
+    let env = snapshot::test_envelope_with_doc(0, 0, run, doc);
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&env).unwrap(),
+    )
+    .unwrap();
+    let ckpt = ckpt_for(&dir);
+    let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+    p.build_service().expect("service intake folds legacy v2.8");
 }
 
 #[test]

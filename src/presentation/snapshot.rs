@@ -1349,6 +1349,31 @@ mod parent_swap_hook {
     }
 }
 
+/// Test-only one-shot pre-commit relocation hook (P2fix9
+/// NEW-56): armed by the pin, run once after the stage write
+/// and before the commit rename (proves outside placement
+/// holds THROUGH the commit — a dir reparented under the
+/// producer tree after staging must not commit there). Inert
+/// unless armed; production never arms it.
+#[cfg(test)]
+mod pre_commit_hook {
+    use std::cell::RefCell;
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+    pub fn arm(hook: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+    pub fn take_and_run() {
+        if let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+    pub fn disarm() {
+        HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
 /// Test-only one-shot relocation hook (P2fix8 NEW-50): armed by
 /// the pin, run once after checkpoint-parent validation and
 /// before the first staging write (proves placement stabilizes
@@ -2588,6 +2613,13 @@ impl Presenter {
         let seq = u64_at(env, "seq").ok_or_else(|| "envelope without seq".to_string())?;
         let generation =
             u64_at(env, "generation").ok_or_else(|| "envelope without generation".to_string())?;
+        // Exact window source identity (P2fix9 NEW-57): the
+        // envelope must BE a service window — a wrong-schema
+        // artifact never drives the fold (checked BEFORE any
+        // mutation, like the summary gate).
+        if str_at(env, "schema") != Some(crate::service::envelope::SCHEMA_WINDOW) {
+            return Err("envelope without service-window-v1 schema".to_string());
+        }
         let run_value =
             obj_at(env, "run_id").ok_or_else(|| "envelope without run_id".to_string())?;
         let run_id = read_run_id(run_value).ok_or_else(|| "bad run_id".to_string())?;
@@ -2622,11 +2654,13 @@ impl Presenter {
         // Present window gross validates here too (P2fix8 NEW-53
         // — strict shape + conservation BEFORE the window
         // mutates fold state; a malformed gross rejects the
-        // whole envelope, like the tallies). ABSENT stays the
-        // documented legacy zeros (`None` below).
-        let validated_close: Option<StreamDropsShape> = match obj_at(env, "stream_gross_close") {
+        // whole envelope, like the tallies). Only ABSENCE reads
+        // the documented legacy zeros (P2fix9 NEW-57 — a
+        // SUPPLIED non-object gross (null/scalar/array) is
+        // present-but-invalid and rejects, never zero-folds).
+        let validated_close: Option<StreamDropsShape> = match env.get("stream_gross_close") {
             None => None,
-            Some(g) => {
+            Some(g) if g.is_object() => {
                 let shape = read_stream_drops_strict(g)
                     .ok_or_else(|| "stream_gross_close: malformed gross".to_string())?;
                 if !stream_drops_conserves(&shape) {
@@ -2636,7 +2670,20 @@ impl Presenter {
                 }
                 Some(shape)
             }
+            Some(_) => {
+                return Err("stream_gross_close: present gross must be an object".to_string());
+            }
         };
+        // Supplied configuration marker (P2fix9 NEW-57): a
+        // present marker must be a bool — validated BEFORE
+        // mutation (previously a non-bool marker silently read
+        // as false). Absent stays false (old producers).
+        if let Some(marker) = env.get("stream_configured") {
+            if !marker.is_boolean() {
+                return Err("stream_configured: present marker must be a bool".to_string());
+            }
+        }
+        let configured_marker = bool_at(env, "stream_configured").unwrap_or(false);
         let policy_active = obj_at(env, "policy").and_then(read_policy_active);
         // --- Validated: mutate. ---
         if self.generation != Some(generation) {
@@ -2746,7 +2793,7 @@ impl Presenter {
         // zero-valued additive field is unconfigured, not
         // configured-quiet) or from observed nonzero GROSS (old
         // producers without the marker).
-        if bool_at(env, "stream_configured").unwrap_or(false) {
+        if configured_marker {
             configured = true;
         }
         if close.records > 0 || close.bytes > 0 {
@@ -3618,6 +3665,22 @@ impl Presenter {
         // validated fd — inert at zero).
         #[cfg(test)]
         post_validation_hook::take_and_run();
+        // Outside placement THROUGH staging (P2fix9 NEW-56):
+        // the opened dir itself may have been reparented after
+        // validation — re-prove fd-anchored ancestry on the SAME
+        // fd immediately before the first staging write.
+        // Occupancy is NOT re-checked (the NEW-50 outside-rename
+        // control requires proceeding when only the PATH moved).
+        // Refusal precedes ANY write (zero bytes land inside).
+        if !opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "osslscope: checkpoint dir no longer outside the producer out-DIR at staging (reparented during write; not {})",
+                    self.checkpoint_path.display()
+                ),
+            ));
+        }
         let bad_name = |what: &str| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -3730,6 +3793,40 @@ impl Presenter {
             // the 16-attempt bound and wedge export offline after
             // storage recovers.
             if let Err(e) = staged {
+                unsafe {
+                    libc::unlinkat(dir_fd.as_raw_fd(), stage_c.as_ptr(), 0);
+                }
+                return Err(e);
+            }
+        }
+        // Fault injection (P2fix9 NEW-56, test-only): run the
+        // armed pre-commit relocation after the stage write,
+        // before the commit rename (placement must hold THROUGH
+        // the commit — inert at zero).
+        #[cfg(test)]
+        pre_commit_hook::take_and_run();
+        // Outside placement THROUGH the commit (P2fix9 NEW-56):
+        // re-prove fd-anchored ancestry on the SAME fd
+        // immediately before the rename — a dir reparented
+        // under the producer tree after staging must not
+        // commit there. The owned stage is unlinked on
+        // refusal (NEW-45 cleanup covers EVERY pre-commit
+        // failure, placement included).
+        match opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path) {
+            Ok(true) => {}
+            Ok(false) => {
+                unsafe {
+                    libc::unlinkat(dir_fd.as_raw_fd(), stage_c.as_ptr(), 0);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "osslscope: checkpoint dir no longer outside the producer out-DIR at commit (reparented during write; not {})",
+                        self.checkpoint_path.display()
+                    ),
+                ));
+            }
+            Err(e) => {
                 unsafe {
                     libc::unlinkat(dir_fd.as_raw_fd(), stage_c.as_ptr(), 0);
                 }
@@ -5168,6 +5265,126 @@ mod tests {
         assert!(
             std::fs::read_dir(&inner).unwrap().next().is_none(),
             "the inside dir stays empty"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new56_opened_dir_reparented_under_producer_refuses_without_writes() {
+        // P2fix9 NEW-56 (+ NEW-13/NEW-26/NEW-34/NEW-50-OPEN):
+        // outside placement holds THROUGH staging — an opened
+        // checkpoint dir reparented UNDER the producer out-DIR
+        // after validation refuses with ZERO writes there. The
+        // armed relocation hook moves the validated parent INTO
+        // the producer tree after validation, before the first
+        // staging write. Pre-fix: the staging openat lands
+        // bytes inside (RED). Post-fix: the pre-staging
+        // ancestry re-check refuses before any write (GREEN).
+        let base = unique_dir("reparent-under-producer");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let before = std::fs::read(&ckpt).unwrap();
+        let target = out.join("p-moved");
+        let (p2, target2) = (p.clone(), target.clone());
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran2 = ran.clone();
+        super::post_validation_hook::arm(move || {
+            std::fs::rename(&p2, &target2).unwrap();
+            ran2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let err = presenter
+            .flush_checkpoint()
+            .expect_err("reparent under the producer tree must refuse");
+        super::post_validation_hook::disarm();
+        assert!(
+            ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the relocation hook ran after validation"
+        );
+        assert!(
+            format!("{err:?}").contains("outside the producer out-DIR"),
+            "the refusal names placement: {err:?}"
+        );
+        // ZERO writes: no stage residue in the moved dir, and
+        // the pre-existing checkpoint bytes are untouched.
+        assert!(
+            staging_residue(&target).is_empty(),
+            "no stage file was created inside: {:?}",
+            staging_residue(&target)
+        );
+        assert_eq!(
+            std::fs::read(target.join("ckpt.json")).unwrap(),
+            before,
+            "the moved checkpoint bytes are untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new56_reparent_between_staging_and_commit_refuses_commit() {
+        // P2fix9 NEW-56: outside placement holds THROUGH the
+        // commit — a dir reparented under the producer tree
+        // AFTER the stage write refuses the rename (the target
+        // name never appears there) and the owned stage is
+        // cleaned. Pre-fix: the rename commits inside (RED).
+        // Post-fix: the pre-commit ancestry re-check refuses
+        // (GREEN).
+        let base = unique_dir("reparent-before-commit");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let before = std::fs::read(&ckpt).unwrap();
+        let target = out.join("p-moved");
+        let (p2, target2) = (p.clone(), target.clone());
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran2 = ran.clone();
+        super::pre_commit_hook::arm(move || {
+            std::fs::rename(&p2, &target2).unwrap();
+            ran2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let err = presenter
+            .flush_checkpoint()
+            .expect_err("reparent before the commit must refuse");
+        super::pre_commit_hook::disarm();
+        assert!(
+            ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the pre-commit hook ran after staging"
+        );
+        assert!(
+            format!("{err:?}").contains("outside the producer out-DIR"),
+            "the refusal names placement: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(target.join("ckpt.json")).unwrap(),
+            before,
+            "the commit never replaced the checkpoint"
+        );
+        assert!(
+            staging_residue(&target).is_empty(),
+            "the owned stage is cleaned on refusal: {:?}",
+            staging_residue(&target)
         );
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -486,9 +486,14 @@ pub(crate) enum DocShape {
 /// agreeing one — has no standing: the shared selector's
 /// alias-priority let a producer v2.9 document with an added
 /// earlier-version alias skip the v2.9 trigger and enter the
-/// fold sectionless). Unparseable/absent canonical reads
-/// `None` (the contract fails closed where a version is
-/// required).
+/// fold sectionless). A PRESENT canonical needs supported
+/// version syntax (P2fix9 NEW-58 — the raw gate's
+/// [`crate::schema::check_version_v2`]: a supplied malformed
+/// or unsupported value rejects, never maps to `None` — the
+/// old invalid→`None`→admit-sectionless path let an invalid
+/// version enter where the raw gate refuses it). Only ABSENT
+/// reads `None` (legacy sectionless, plus the implicit-.0
+/// spelling the raw gate accepts).
 pub(crate) fn canonical_minor(
     doc: &serde_json::Value,
     shape: DocShape,
@@ -506,10 +511,20 @@ pub(crate) fn canonical_minor(
             }
         ));
     }
-    Ok(doc
-        .get(canonical)
-        .and_then(|x| x.as_str())
-        .and_then(|v| v.strip_prefix("observed-crypto-v2.")?.parse().ok()))
+    let Some(raw) = doc.get(canonical) else {
+        return Ok(None);
+    };
+    let Some(text) = raw.as_str() else {
+        return Err(format!(
+            "doc.{canonical}: version discriminator must be a string"
+        ));
+    };
+    if !crate::schema::check_version_v2(text) {
+        return Err(format!("doc.{canonical}: unsupported version {text:?}"));
+    }
+    Ok(text
+        .strip_prefix("observed-crypto-v2.")
+        .and_then(|m| m.parse::<u64>().ok()))
 }
 
 /// Required-nullable presence + non-nullable null rules (P2fix4
