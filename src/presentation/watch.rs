@@ -105,7 +105,8 @@ pub enum PrevEpoch<'a> {
 /// frame's own bytes survive untouched (a flattened re-wrap
 /// would re-emit every key through a map and reorder them), so
 /// frames without preservation are byte-identical to before and
-/// preserved frames differ only by this leading key.
+/// preserved frames differ only by this leading key. The JSON
+/// frame keeps the FULL range list (no cap — P2fix12 NEW-73).
 fn splice_previous_epoch(frame: &[u8], prev: &super::snapshot::PreservedEpoch) -> Option<Vec<u8>> {
     if frame.first() != Some(&b'{') {
         return None;
@@ -118,6 +119,54 @@ fn splice_previous_epoch(frame: &[u8], prev: &super::snapshot::PreservedEpoch) -
     out.push(b',');
     out.extend_from_slice(&frame[1..]);
     Some(out)
+}
+
+/// Render the `prev-unmeasured` tail line (P2fix12 NEW-73): a
+/// short payload renders the full `Debug` list (byte-identical
+/// to before); a payload above the 200-char bound renders
+/// COMPLETE bounded entries with an EXACT omitted-range count
+/// (`.., +N more]` — never a mid-list cut). The constructed
+/// line is ≤ 200 chars BY CONSTRUCTION (each entry appends
+/// only when the entry + its eventual suffix fit), so the
+/// frame cap below never cuts it.
+fn prev_unmeasured_line(unmeasured: &[[u64; 2]]) -> String {
+    const MAX: usize = 200;
+    let full = format!("  prev-unmeasured={unmeasured:?}");
+    if full.len() <= MAX {
+        return full;
+    }
+    let total = unmeasured.len();
+    let mut line = String::from("  prev-unmeasured=[");
+    let mut omitted = total;
+    for range in unmeasured {
+        let entry = format!("{range:?}");
+        let sep = if omitted == total { "" } else { ", " };
+        let rest = omitted - 1;
+        // Suffix if we stop AFTER this entry (no trailing
+        // comma when nothing is omitted — unreachable here,
+        // since then `full` would have fit, but exact anyway).
+        let suffix = if rest == 0 {
+            "]".to_string()
+        } else {
+            format!(", +{rest} more]")
+        };
+        if line.len() + sep.len() + entry.len() + suffix.len() > MAX {
+            break;
+        }
+        line.push_str(sep);
+        line.push_str(&entry);
+        omitted = rest;
+    }
+    if omitted == total {
+        // No entry fit (only for absurdly wide scalars —
+        // `u64::MAX` pairs still fit one) — the count alone.
+        line.push_str(&format!("+{omitted} more]"));
+    } else if omitted == 0 {
+        line.push(']');
+    } else {
+        line.push_str(&format!(", +{omitted} more]"));
+    }
+    line
 }
 
 /// Render one frame with an optional previous-epoch tail (§6C-3
@@ -192,7 +241,9 @@ pub fn render_frame_with_prev(
                 p.unstable.join(",")
             };
             lines.push(format!("  prev-unstable={unstable}"));
-            lines.push(format!("  prev-unmeasured={:?}", p.unmeasured));
+            // Bounded range entries + exact omitted count
+            // (P2fix12 NEW-73 — never a mid-list cut).
+            lines.push(prev_unmeasured_line(&p.unmeasured));
         }
         None => {}
     }
@@ -429,6 +480,120 @@ fn first_n(items: &[String], n: usize) -> String {
 
 fn short16(sha: &str) -> String {
     sha.chars().take(16).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prev_with_ranges(unmeasured: Vec<[u64; 2]>) -> super::super::snapshot::PreservedEpoch {
+        super::super::snapshot::PreservedEpoch {
+            generation: 7,
+            window_seq: 9,
+            calls_total: 11,
+            lanes: [11, 0, 0, 0],
+            unstable: vec!["counts.calls_total".to_string()],
+            unmeasured,
+        }
+    }
+
+    #[test]
+    fn new73_short_payload_renders_full_list_verbatim() {
+        // P2fix12 NEW-73 (no-regression half): payloads at or
+        // below the bound render the full Debug list,
+        // byte-identical to before (small payloads never gain
+        // a count suffix).
+        assert_eq!(prev_unmeasured_line(&[]), "  prev-unmeasured=[]");
+        assert_eq!(
+            prev_unmeasured_line(&[[1, 1]]),
+            "  prev-unmeasured=[[1, 1]]"
+        );
+        let ranges: Vec<[u64; 2]> = (0..10u64).map(|k| [k * 3 + 1, k * 3 + 2]).collect();
+        let line = prev_unmeasured_line(&ranges);
+        assert_eq!(line, format!("  prev-unmeasured={ranges:?}"));
+        assert!(line.len() <= 200, "the small payload fits: {line:?}");
+    }
+
+    #[test]
+    fn new73_bounded_payload_renders_complete_entries_with_exact_count() {
+        // P2fix12 NEW-73 (unit half — the snapshot
+        // `new73_bounded_ranges_...` pin carries the pipeline):
+        // a 36-range payload renders COMPLETE entries within
+        // 200 chars with the EXACT omitted count, and the
+        // frame cap never cuts it (no `…`).
+        let ranges: Vec<[u64; 2]> = (0..36u64).map(|k| [k * 3 + 1, k * 3 + 2]).collect();
+        let line = prev_unmeasured_line(&ranges);
+        assert!(
+            line.len() <= 200,
+            "the line respects the bound ({}): {line:?}",
+            line.len()
+        );
+        assert_eq!(bound_line(&line), line, "the frame cap never cuts it");
+        let shown = line
+            .as_bytes()
+            .windows(2)
+            .filter(|w| w[0] == b'[' && w[1].is_ascii_digit())
+            .count();
+        assert!(shown > 0 && shown < 36, "bounded but nonempty: {line:?}");
+        assert!(
+            line.contains(&format!("+{} more", 36 - shown)),
+            "the exact omitted-range count: {line:?}"
+        );
+        assert!(
+            line.starts_with("  prev-unmeasured=[[1, 2], [4, 5]"),
+            "complete entries from the front: {line:?}"
+        );
+        // Wide scalars: u64::MAX pairs still bound correctly.
+        let wide = vec![[u64::MAX, u64::MAX]; 36];
+        let wide_line = prev_unmeasured_line(&wide);
+        assert!(wide_line.len() <= 200, "wide scalars bound: {wide_line:?}");
+        assert_eq!(bound_line(&wide_line), wide_line, "no cut on wide scalars");
+    }
+
+    #[test]
+    fn new73_json_splice_keeps_full_range_list() {
+        // P2fix12 NEW-73 (JSON half): the spliced follow frame
+        // keeps the FULL 36-range list (no cap on JSON) with
+        // the frame body otherwise untouched.
+        let ranges: Vec<[u64; 2]> = (0..36u64).map(|k| [k * 3 + 1, k * 3 + 2]).collect();
+        let prev = prev_with_ranges(ranges.clone());
+        let frame = b"{\n  \"source\": 1\n}\n";
+        let spliced = splice_previous_epoch(frame, &prev).expect("the frame splices");
+        let v: serde_json::Value = serde_json::from_slice(&spliced).expect("valid JSON");
+        assert_eq!(v["source"], serde_json::json!(1), "the body survives");
+        assert_eq!(
+            v["previous_epoch"]["unmeasured"]
+                .as_array()
+                .map(|a| a.len()),
+            Some(36),
+            "the full range list survives"
+        );
+        assert_eq!(
+            v["previous_epoch"]["unmeasured"][35],
+            serde_json::json!([106, 107]),
+            "the last range is exact"
+        );
+    }
+
+    #[test]
+    fn new73_unstable_line_never_hits_the_bound() {
+        // P2fix12 NEW-73 (sibling-line guard): the closed
+        // 8-word flag vocabulary caps the `prev-unstable` line
+        // at 166 chars — it never needs bounding.
+        let flags = [
+            "counts.calls_total",
+            "counts.lanes",
+            "members.retired_epoch",
+            "counts.by_outcome",
+            "loss.epoch_by_cause",
+            "completeness.epoch_partial_by_class",
+            "histograms",
+            "stream.drops",
+        ];
+        let line = format!("  prev-unstable={}", flags.join(","));
+        assert!(line.len() <= 200, "the full flag line fits: {line:?}");
+        assert_eq!(bound_line(&line), line, "the frame cap never cuts it");
+    }
 }
 
 /// Watch entry: non-TTY renders exactly one frame and exits 0

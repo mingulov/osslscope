@@ -8588,11 +8588,12 @@ fn new67_gen_change_preserves_failed_epoch_through_follow_loop() {
             }
         }
     }
-    fn drain_err_until(
+    fn drain_err_fresh_until(
         rx: &std::sync::mpsc::Receiver<(bool, String)>,
         out_lines: &mut Vec<String>,
         err_lines: &mut Vec<String>,
         deadline: Instant,
+        fresh_from: usize,
         want_err: &str,
     ) {
         loop {
@@ -8609,7 +8610,9 @@ fn new67_gen_change_preserves_failed_epoch_through_follow_loop() {
                 }
                 Err(_) => continue,
             }
-            if err_lines.iter().any(|l| l.contains(want_err)) {
+            // Only lines received AFTER the settle satisfy the
+            // wait (P2fix12 NEW-65 — pre-prefix notes are stale).
+            if err_lines[fresh_from..].iter().any(|l| l.contains(want_err)) {
                 return;
             }
         }
@@ -8668,11 +8671,25 @@ fn new67_gen_change_preserves_failed_epoch_through_follow_loop() {
         serde_json::to_string(&win2).unwrap(),
     )
     .unwrap();
-    drain_err_until(
+    // Fresh-outage wait (P2fix12 NEW-65 — retrofitted: the
+    // note must come from a poll that OBSERVED the prefix —
+    // settle past two polls, then require a NEW note, so a
+    // generic pre-prefix note cannot satisfy the wait).
+    std::thread::sleep(Duration::from_millis(2200));
+    while let Ok((is_out, line)) = rx.try_recv() {
+        if is_out {
+            out_lines.push(line);
+        } else {
+            err_lines.push(line);
+        }
+    }
+    let fresh_from = err_lines.len();
+    drain_err_fresh_until(
         &rx,
         &mut out_lines,
         &mut err_lines,
         Instant::now() + Duration::from_secs(15),
+        fresh_from,
         "retaining last-good",
     );
     assert!(
@@ -8929,6 +8946,18 @@ fn new67_gen_change_preserves_failed_epoch_through_follow_json() {
         serde_json::to_string(&win2).unwrap(),
     )
     .unwrap();
+    // Fresh-outage wait (P2fix12 NEW-65 — retrofitted:
+    // settle past two polls, then require a NEW note, so a
+    // generic pre-prefix note cannot satisfy the wait).
+    std::thread::sleep(Duration::from_millis(2200));
+    while let Ok((is_out, line)) = rx.try_recv() {
+        if is_out {
+            out_lines.push(line);
+        } else {
+            err_lines.push(line);
+        }
+    }
+    let fresh_from = err_lines.len();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if Instant::now() >= deadline {
@@ -8944,7 +8973,10 @@ fn new67_gen_change_preserves_failed_epoch_through_follow_json() {
             }
             Err(_) => continue,
         }
-        if err_lines.iter().any(|l| l.contains("retaining last-good")) {
+        if err_lines[fresh_from..]
+            .iter()
+            .any(|l| l.contains("retaining last-good"))
+        {
             break;
         }
     }
@@ -9130,6 +9162,18 @@ fn new67_same_generation_recovery_through_follow_loop() {
         serde_json::to_string(&win2).unwrap(),
     )
     .unwrap();
+    // Fresh-outage wait (P2fix12 NEW-65 — retrofitted:
+    // settle past two polls, then require a NEW note, so a
+    // generic pre-prefix note cannot satisfy the wait).
+    std::thread::sleep(Duration::from_millis(2200));
+    while let Ok((is_out, line)) = rx.try_recv() {
+        if is_out {
+            out_lines.push(line);
+        } else {
+            err_lines.push(line);
+        }
+    }
+    let fresh_from = err_lines.len();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if Instant::now() >= deadline {
@@ -9145,7 +9189,10 @@ fn new67_same_generation_recovery_through_follow_loop() {
             }
             Err(_) => continue,
         }
-        if err_lines.iter().any(|l| l.contains("retaining last-good")) {
+        if err_lines[fresh_from..]
+            .iter()
+            .any(|l| l.contains("retaining last-good"))
+        {
             break;
         }
     }
@@ -10350,4 +10397,744 @@ fn envelope_raw_duplicate_trace_keys_reject() {
     let err = p.build_service().expect_err("dup mode key must reject");
     assert!(err.contains("duplicate field"), "{err}");
     assert!(!err.contains("`mode`"), "key must not echo: {err}");
+}
+
+/// Atomic staged-window write (P2fix12 loop pins): tmp +
+/// rename, so a mid-staging poll never reads a torn prefix
+/// file (a torn read would fail on the prefix instead of the
+/// tail and blur the exact-state waits below).
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
+#[test]
+fn new71_published_prefix_through_follow_loop() {
+    // P2fix12 NEW-71 (+ NEW-P2c-OPEN — human current-frame
+    // format): publish gen 0, then accept MORE gen-0 windows
+    // before a rejected tail — recovery into gen 1 through
+    // the RUNNING public follow loop shows the FINAL accepted
+    // prefix + uncertainty (never the stale published tip).
+    // Pre-fix: the published shortcut clears the newer prefix
+    // and the terminal shows stale last-good counts
+    // (`gen=0 calls=3 win=0`) (RED).
+    use std::io::BufRead;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+    let dir = out_dir("new71-follow-human");
+    let win0 =
+        snapshot::test_envelope_with_doc(0, 0, run.clone(), snapshot::test_document(3, "partial"));
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&win0).unwrap(),
+    )
+    .unwrap();
+    let spawn = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+            .args([
+                "watch",
+                "--out",
+                dir.to_str().unwrap(),
+                "--follow",
+                "--poll-seconds",
+                "1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = OwnedChild(spawn());
+    let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    let tx2 = tx.clone();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send((true, line)).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx2.send((false, line)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut out_lines: Vec<String> = vec![];
+    let mut err_lines: Vec<String> = vec![];
+    let drain_until = |rx: &std::sync::mpsc::Receiver<(bool, String)>,
+                       out_lines: &mut Vec<String>,
+                       err_lines: &mut Vec<String>,
+                       deadline: Instant,
+                       want_out: &str| {
+        loop {
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for {want_out:?}; out={out_lines:?} err={err_lines:?}");
+            }
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok((is_out, line)) => {
+                    if is_out {
+                        out_lines.push(line);
+                    } else {
+                        err_lines.push(line);
+                    }
+                }
+                Err(_) => continue,
+            }
+            if out_lines.iter().any(|l| l.contains(want_out)) {
+                return;
+            }
+        }
+    };
+    // Stage 1: gen-0 frame publishes at tip 0 (steady follow).
+    drain_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        "MARKER partial seq=0",
+    );
+    // Stage 2: the bad tail lands FIRST (a mid-staging poll
+    // fails safely), then MORE gen-0 windows after a hole —
+    // the scan folds the newer prefix and rejects the tail.
+    let mut bad = snapshot::test_envelope(4, 0, run.clone(), 10);
+    bad["schema"] = serde_json::json!("service-window-v9");
+    write_atomic(
+        &dir.join("window-0000000004.json"),
+        serde_json::to_string(&bad).unwrap().as_bytes(),
+    );
+    for (seq, calls) in [(2u64, 20u64), (3, 30)] {
+        write_atomic(
+            &dir.join(format!("window-{seq:010}.json")),
+            serde_json::to_string(&snapshot::test_envelope(seq, 0, run.clone(), calls))
+                .unwrap()
+                .as_bytes(),
+        );
+    }
+    // Fresh-outage wait (P2fix12 NEW-65 — the note must come
+    // from a poll that OBSERVED the prefix: settle past two
+    // polls, then require a NEW note naming the tail's error
+    // — a generic pre-prefix note cannot satisfy it).
+    std::thread::sleep(Duration::from_millis(2200));
+    while let Ok((is_out, line)) = rx.try_recv() {
+        if is_out {
+            out_lines.push(line);
+        } else {
+            err_lines.push(line);
+        }
+    }
+    let fresh_from = err_lines.len();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for the fresh tail outage; err={err_lines:?}");
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok((is_out, line)) => {
+                if is_out {
+                    out_lines.push(line);
+                } else {
+                    err_lines.push(line);
+                }
+            }
+            Err(_) => continue,
+        }
+        if err_lines[fresh_from..]
+            .iter()
+            .any(|l| l.contains("service-window-v1") && l.contains("retaining last-good"))
+        {
+            break;
+        }
+    }
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "follow must survive the rejected tail"
+    );
+    // Stage 3: retention removes the bad tail AFTER the valid
+    // gen-1 window lands — recovery advances into gen 1 with
+    // the newer gen-0 prefix preserved.
+    write_atomic(
+        &dir.join("window-0000000005.json"),
+        serde_json::to_string(&snapshot::test_envelope(5, 1, run.clone(), 7))
+            .unwrap()
+            .as_bytes(),
+    );
+    std::fs::remove_file(dir.join("window-0000000004.json")).unwrap();
+    drain_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        "PREVIOUS EPOCH gen=0 ",
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "follow keeps running after gen-changing recovery"
+    );
+    // Settle: the uncertainty continuations trail the base
+    // line, so drain one more poll before indexing them.
+    std::thread::sleep(Duration::from_secs(2));
+    while let Ok((is_out, line)) = rx.try_recv() {
+        if is_out {
+            out_lines.push(line);
+        } else {
+            err_lines.push(line);
+        }
+    }
+    let at = out_lines
+        .iter()
+        .position(|l| l.contains("PREVIOUS EPOCH gen=0 "))
+        .unwrap();
+    let prev = out_lines[at].clone();
+    assert!(
+        prev.contains("calls=53") && prev.contains("win=3"),
+        "the line reports gen 0's FINAL prefix counts (3+20+30, not the stale published 3): {prev:?}"
+    );
+    assert_eq!(
+        out_lines[at + 1],
+        "  prev-unstable=completeness.epoch_partial_by_class,counts.by_outcome,counts.calls_total,counts.lanes,histograms,loss.epoch_by_cause,members.retired_epoch,stream.drops",
+        "the tail reports gen 0's uncertainty flags"
+    );
+    assert_eq!(
+        out_lines[at + 2],
+        "  prev-unmeasured=[[0, 3]]",
+        "the tail reports gen 0's hole span"
+    );
+    // The committed checkpoint persists the newer prefix.
+    let ckpt = ckpt_for(&dir);
+    let ckpt_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ckpt).unwrap()).unwrap();
+    assert_eq!(
+        ckpt_json["accumulators"]["previous_epoch"]["calls_total"],
+        serde_json::json!(53),
+        "the checkpoint persists the final prefix"
+    );
+    // Stage 4: a fresh follow loop over the same out-DIR (a
+    // checkpoint reopen) shows the newer prefix on its first
+    // frame.
+    drop(child);
+    let mut child = OwnedChild(spawn());
+    let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    let tx2 = tx.clone();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send((true, line)).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx2.send((false, line)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut out_lines: Vec<String> = vec![];
+    let mut err_lines: Vec<String> = vec![];
+    drain_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        "PREVIOUS EPOCH gen=0 ",
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the reopened follow keeps running"
+    );
+    let at = out_lines
+        .iter()
+        .position(|l| l.contains("PREVIOUS EPOCH gen=0 "))
+        .unwrap();
+    assert!(
+        out_lines[at].contains("calls=53") && out_lines[at].contains("win=3"),
+        "the reopen shows the newer prefix: {:?}",
+        out_lines[at]
+    );
+    let _ = child.0.kill();
+}
+
+#[test]
+fn new71_published_prefix_through_follow_json() {
+    // P2fix12 NEW-71 (+ NEW-P2c-OPEN — JSON current-frame
+    // format): the same published-tenure recovery through the
+    // RUNNING public follow loop in JSON mode — the gen-1
+    // frame carries the preserved gen-0 final state WITH its
+    // uncertainty as `previous_epoch`. Pre-fix: no
+    // `previous_epoch` object exists (RED).
+    use std::io::BufRead;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+    let dir = out_dir("new71-follow-json");
+    let win0 =
+        snapshot::test_envelope_with_doc(0, 0, run.clone(), snapshot::test_document(3, "partial"));
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&win0).unwrap(),
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "watch",
+            "--out",
+            dir.to_str().unwrap(),
+            "--follow",
+            "--poll-seconds",
+            "1",
+            "--format",
+            "json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = OwnedChild(child);
+    let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    let tx2 = tx.clone();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send((true, line)).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx2.send((false, line)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut out_lines: Vec<String> = vec![];
+    let mut err_lines: Vec<String> = vec![];
+    let frames_of = |lines: &[String]| -> Vec<serde_json::Value> {
+        let mut frames: Vec<serde_json::Value> = vec![];
+        let mut current: Vec<String> = vec![];
+        let mut seen_banner = false;
+        for line in lines {
+            if line.starts_with("--- frame") {
+                if seen_banner && !current.is_empty() {
+                    if let Ok(v) = serde_json::from_str(&current.join("\n")) {
+                        frames.push(v);
+                    }
+                }
+                current.clear();
+                seen_banner = true;
+                continue;
+            }
+            if seen_banner {
+                current.push(line.clone());
+            }
+        }
+        frames
+    };
+    let drain_frames_until = |rx: &std::sync::mpsc::Receiver<(bool, String)>,
+                              out_lines: &mut Vec<String>,
+                              err_lines: &mut Vec<String>,
+                              deadline: Instant,
+                              want: &dyn Fn(&serde_json::Value) -> bool,
+                              what: &str|
+     -> Vec<serde_json::Value> {
+        loop {
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for {what}; out={out_lines:?} err={err_lines:?}");
+            }
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok((is_out, line)) => {
+                    if is_out {
+                        out_lines.push(line);
+                    } else {
+                        err_lines.push(line);
+                    }
+                }
+                Err(_) => continue,
+            }
+            let frames = frames_of(out_lines);
+            if frames.iter().any(want) {
+                return frames;
+            }
+        }
+    };
+    // Stage 1: gen-0 JSON frame publishes at tip 0.
+    drain_frames_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        &|v: &serde_json::Value| v["source"]["generation"] == serde_json::json!(0),
+        "a gen-0 JSON frame",
+    );
+    // Stage 2: bad tail first, then MORE gen-0 windows after
+    // a hole — the scan folds the newer prefix and rejects
+    // the tail.
+    let mut bad = snapshot::test_envelope(4, 0, run.clone(), 10);
+    bad["schema"] = serde_json::json!("service-window-v9");
+    write_atomic(
+        &dir.join("window-0000000004.json"),
+        serde_json::to_string(&bad).unwrap().as_bytes(),
+    );
+    for (seq, calls) in [(2u64, 20u64), (3, 30)] {
+        write_atomic(
+            &dir.join(format!("window-{seq:010}.json")),
+            serde_json::to_string(&snapshot::test_envelope(seq, 0, run.clone(), calls))
+                .unwrap()
+                .as_bytes(),
+        );
+    }
+    // Fresh-outage wait (P2fix12 NEW-65): settle past two
+    // polls, then require a NEW note naming the tail.
+    std::thread::sleep(Duration::from_millis(2200));
+    while let Ok((is_out, line)) = rx.try_recv() {
+        if is_out {
+            out_lines.push(line);
+        } else {
+            err_lines.push(line);
+        }
+    }
+    let fresh_from = err_lines.len();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for the fresh tail outage; err={err_lines:?}");
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok((is_out, line)) => {
+                if is_out {
+                    out_lines.push(line);
+                } else {
+                    err_lines.push(line);
+                }
+            }
+            Err(_) => continue,
+        }
+        if err_lines[fresh_from..]
+            .iter()
+            .any(|l| l.contains("service-window-v1") && l.contains("retaining last-good"))
+        {
+            break;
+        }
+    }
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "follow must survive the rejected tail"
+    );
+    // Stage 3: retention removes the bad tail after the valid
+    // gen-1 window lands — the gen-1 JSON frame carries the
+    // preserved gen 0 WITH its uncertainty.
+    write_atomic(
+        &dir.join("window-0000000005.json"),
+        serde_json::to_string(&snapshot::test_envelope(5, 1, run.clone(), 7))
+            .unwrap()
+            .as_bytes(),
+    );
+    std::fs::remove_file(dir.join("window-0000000004.json")).unwrap();
+    let frames = drain_frames_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        &|v: &serde_json::Value| {
+            v["source"]["generation"] == serde_json::json!(1)
+                && v["previous_epoch"]["generation"] == serde_json::json!(0)
+        },
+        "a gen-1 JSON frame with preserved gen 0",
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "follow keeps running after gen-changing recovery"
+    );
+    let frame = frames
+        .iter()
+        .find(|v| {
+            v["source"]["generation"] == serde_json::json!(1)
+                && v["previous_epoch"]["generation"] == serde_json::json!(0)
+        })
+        .unwrap();
+    assert_eq!(
+        frame["previous_epoch"]["calls_total"],
+        serde_json::json!(53),
+        "the JSON frame reports gen 0's FINAL prefix counts: {frame:?}"
+    );
+    assert_eq!(
+        frame["previous_epoch"]["window_seq"],
+        serde_json::json!(3),
+        "the JSON frame reports gen 0's final window: {frame:?}"
+    );
+    assert!(
+        frame["previous_epoch"]["unstable"].as_array().is_some_and(
+            |flags| flags.len() == 8 && flags.iter().any(|f| f == "counts.calls_total")
+        ) && frame["previous_epoch"]["unmeasured"] == serde_json::json!([[0, 3]]),
+        "the JSON frame reports gen 0's uncertainty: {frame:?}"
+    );
+    for v in frames.iter() {
+        if v.get("previous_epoch").is_some_and(|p| !p.is_null()) {
+            assert_eq!(
+                v["previous_epoch"]["generation"],
+                serde_json::json!(0),
+                "no mislabeled previous epoch: {v:?}"
+            );
+        }
+    }
+    let _ = child.0.kill();
+}
+
+#[test]
+fn new65_same_generation_recovery_through_follow_json() {
+    // P2fix12 NEW-65 (JSON same-generation format — the twin
+    // of the human same-generation pin): same-generation
+    // recovery through the RUNNING public follow loop in JSON
+    // mode — a retention hole + a valid prefix + a rejected
+    // tail, then the tail is repaired in the SAME generation.
+    // Recovery publishes WITH the missing span (exact counts
+    // + hole ranges + flags) and the loop keeps running. The
+    // outage wait is FRESH (a NEW note naming the tail after
+    // the prefix landed — a generic pre-prefix note cannot
+    // satisfy it). Guard (the behavior holds; the JSON format
+    // + exact-state waits are the new coverage).
+    use std::io::BufRead;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+    let dir = out_dir("new65-follow-samegen-json");
+    let win0 =
+        snapshot::test_envelope_with_doc(0, 0, run.clone(), snapshot::test_document(3, "partial"));
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&win0).unwrap(),
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "watch",
+            "--out",
+            dir.to_str().unwrap(),
+            "--follow",
+            "--poll-seconds",
+            "1",
+            "--format",
+            "json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = OwnedChild(child);
+    let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    let tx2 = tx.clone();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send((true, line)).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx2.send((false, line)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut out_lines: Vec<String> = vec![];
+    let mut err_lines: Vec<String> = vec![];
+    let frames_of = |lines: &[String]| -> Vec<serde_json::Value> {
+        let mut frames: Vec<serde_json::Value> = vec![];
+        let mut current: Vec<String> = vec![];
+        let mut seen_banner = false;
+        for line in lines {
+            if line.starts_with("--- frame") {
+                if seen_banner && !current.is_empty() {
+                    if let Ok(v) = serde_json::from_str(&current.join("\n")) {
+                        frames.push(v);
+                    }
+                }
+                current.clear();
+                seen_banner = true;
+                continue;
+            }
+            if seen_banner {
+                current.push(line.clone());
+            }
+        }
+        frames
+    };
+    let drain_frames_until = |rx: &std::sync::mpsc::Receiver<(bool, String)>,
+                              out_lines: &mut Vec<String>,
+                              err_lines: &mut Vec<String>,
+                              deadline: Instant,
+                              want: &dyn Fn(&serde_json::Value) -> bool,
+                              what: &str|
+     -> Vec<serde_json::Value> {
+        loop {
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for {what}; out={out_lines:?} err={err_lines:?}");
+            }
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok((is_out, line)) => {
+                    if is_out {
+                        out_lines.push(line);
+                    } else {
+                        err_lines.push(line);
+                    }
+                }
+                Err(_) => continue,
+            }
+            let frames = frames_of(out_lines);
+            if frames.iter().any(want) {
+                return frames;
+            }
+        }
+    };
+    // Stage 1: gen-0 JSON frame publishes.
+    drain_frames_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        &|v: &serde_json::Value| v["source"]["generation"] == serde_json::json!(0),
+        "a gen-0 JSON frame",
+    );
+    // Stage 2: bad tail first, then the valid gen-1 prefix
+    // after the hole — the scan folds the prefix and rejects
+    // the tail (outage, no exit).
+    let mut bad = snapshot::test_envelope_with_doc(3, 1, run.clone(), trace_doc(1, false));
+    bad["schema"] = serde_json::json!("service-window-v9");
+    write_atomic(
+        &dir.join("window-0000000003.json"),
+        serde_json::to_string(&bad).unwrap().as_bytes(),
+    );
+    let win2 = snapshot::test_envelope_with_doc(2, 1, run.clone(), trace_doc(1, false));
+    write_atomic(
+        &dir.join("window-0000000002.json"),
+        serde_json::to_string(&win2).unwrap().as_bytes(),
+    );
+    // Fresh-outage wait: settle past two polls, then require
+    // a NEW note naming the tail (proving a post-prefix poll
+    // folded the prefix before rejecting the tail).
+    std::thread::sleep(Duration::from_millis(2200));
+    while let Ok((is_out, line)) = rx.try_recv() {
+        if is_out {
+            out_lines.push(line);
+        } else {
+            err_lines.push(line);
+        }
+    }
+    let fresh_from = err_lines.len();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for the fresh tail outage; err={err_lines:?}");
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok((is_out, line)) => {
+                if is_out {
+                    out_lines.push(line);
+                } else {
+                    err_lines.push(line);
+                }
+            }
+            Err(_) => continue,
+        }
+        if err_lines[fresh_from..]
+            .iter()
+            .any(|l| l.contains("service-window-v1") && l.contains("retaining last-good"))
+        {
+            break;
+        }
+    }
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "follow must survive the rejected tail"
+    );
+    // Stage 3: repair the tail in the SAME generation —
+    // recovery publishes WITH the missing span.
+    let repaired = snapshot::test_envelope_with_doc(3, 1, run.clone(), trace_doc(1, false));
+    write_atomic(
+        &dir.join("window-0000000003.json"),
+        serde_json::to_string(&repaired).unwrap().as_bytes(),
+    );
+    let frames = drain_frames_until(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        Instant::now() + Duration::from_secs(15),
+        &|v: &serde_json::Value| {
+            v["source"]["generation"] == serde_json::json!(1)
+                && v["source"]["window_seq"] == serde_json::json!(3)
+        },
+        "a gen-1 JSON frame at the repaired tip",
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "follow keeps running after same-generation recovery"
+    );
+    let frame = frames
+        .iter()
+        .find(|v| {
+            v["source"]["generation"] == serde_json::json!(1)
+                && v["source"]["window_seq"] == serde_json::json!(3)
+        })
+        .unwrap();
+    assert_eq!(
+        frame["counts"]["calls_total"],
+        serde_json::json!(6),
+        "recovery publishes the exact prefix counts (3+3): {frame:?}"
+    );
+    assert_eq!(
+        frame["trace"]["unmeasured_seqs"],
+        serde_json::json!([[1, 1]]),
+        "recovery publishes WITH the hole range: {frame:?}"
+    );
+    assert!(
+        frame["unknown"].as_array().is_some_and(|u| u
+            .iter()
+            .any(|e| e["reason"] == serde_json::json!("unstable_snapshot"))),
+        "recovery publishes the hole flags: {frame:?}"
+    );
+    let _ = child.0.kill();
 }

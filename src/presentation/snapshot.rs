@@ -1219,6 +1219,36 @@ fn read_previous_epoch_strict(v: &serde_json::Value) -> Option<PreservedEpoch> {
     })
 }
 
+/// Canonical preserved-epoch flags (P2fix12 NEW-72): sorted +
+/// unique over the closed vocabulary (the writer emits a
+/// `BTreeSet` iteration — unsorted, duplicated, or foreign
+/// flags are crafted content, never writer output).
+fn preserved_flags_canonical(unstable: &[String]) -> bool {
+    unstable.windows(2).all(|w| w[0] < w[1])
+}
+
+/// Canonical preserved-epoch ranges (P2fix12 NEW-72): every
+/// range well-formed (`[a, b]` with `a <= b`) and the list
+/// sorted + merged (each start clears the previous end by ≥
+/// 2 — reversed, unsorted, overlapping, or
+/// adjacency-mergeable pairs are crafted content; the
+/// writer's push/union merge both).
+fn preserved_ranges_canonical(unmeasured: &[[u64; 2]]) -> bool {
+    let mut prev_end: Option<u64> = None;
+    for [a, b] in unmeasured {
+        if a > b {
+            return false;
+        }
+        if let Some(end) = prev_end {
+            if a.saturating_sub(end) < 2 {
+                return false;
+            }
+        }
+        prev_end = Some(*b);
+    }
+    true
+}
+
 /// Canonical checkpoint-parent identity for directory anchoring
 /// (P2fix6 NEW-34): the (device, inode) the presenter binds at
 /// open (or at first resolution when the dir is absent —
@@ -1644,6 +1674,83 @@ fn open_validated_checkpoint_parent(
     })?;
     let id = validate_opened_parent(&dir_fd, parent, out_dir, display)?;
     Ok((dir_fd, id))
+}
+
+/// Unlink a dirfd-relative name, CHECKED (P2fix12 NEW-69 —
+/// cleanup must not ignore unlink failures: the caller
+/// surfaces the failure loudly — the operator must know a
+/// stage/target leaked).
+fn unlink_checked(dir_fd: &std::fs::File, name: &std::ffi::CString) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+    // SAFETY: dir_fd is live; the name is a NUL-free file name in it.
+    if unsafe { libc::unlinkat(dir_fd.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Attach a failed-cleanup note to a primary write error
+/// (P2fix12 NEW-69): the primary error LEADS (kind + text
+/// preserved — callers matching on it keep working) and the
+/// cleanup failure rides along loudly (never swallowed).
+fn with_stage_cleanup_note(primary: std::io::Error, cleanup: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        primary.kind(),
+        format!("{primary} (stage cleanup failed: {cleanup})"),
+    )
+}
+
+/// Snapshot the CURRENT checkpoint target bytes (P2fix12
+/// NEW-70 — dirfd-relative, no links followed): the
+/// preservation source for a post-commit refusal. Absent
+/// target ⇒ first commit (nothing to preserve). A
+/// present-but-unreadable target refuses BEFORE the rename
+/// (preservation is impossible — replacing the bytes would
+/// destroy them).
+fn read_checkpoint_target(
+    dir_fd: &std::fs::File,
+    target: &std::ffi::CString,
+    display: &Path,
+) -> std::io::Result<Option<Vec<u8>>> {
+    use std::os::unix::io::AsRawFd as _;
+    // SAFETY: dir_fd is live; the name is a NUL-free file name in it.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            target.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "osslscope: checkpoint target unreadable — cannot preserve committed bytes across the commit (refusing before rename; not {}): {e}",
+                display.display()
+            ),
+        ));
+    }
+    // SAFETY: openat returned a fresh owned fd.
+    let mut file = unsafe {
+        use std::os::fd::FromRawFd as _;
+        std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(fd))
+    };
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    if let Err(e) = file.read_to_end(&mut bytes) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "osslscope: checkpoint target unreadable — cannot preserve committed bytes across the commit (refusing before rename; not {}): {e}",
+                display.display()
+            ),
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 // --- Shared document signals (the C-08 dual path) ---
@@ -2229,6 +2336,14 @@ pub struct Presenter {
     /// publication — staged-only builds don't publish).
     /// Runtime-only (never persisted).
     published_generation: Option<u64>,
+    /// Watermark tip at the last framed publication (P2fix12
+    /// NEW-71 — the published tip: a reset preserves the
+    /// tenure's FINAL accepted prefix when it advanced past
+    /// this tip or accrued failure since, instead of clearing
+    /// it just because the generation matches). Runtime-only
+    /// (never persisted; always set/cleared with
+    /// `published_generation`).
+    published_tip: Option<u64>,
     /// Generation current when the last scan/build failure fired
     /// (runtime-only). A successful scan heals it; a reset
     /// clears it (the new tenure starts clean).
@@ -2312,6 +2427,7 @@ impl Presenter {
             policy_status_active: None,
             previous_epoch: None,
             published_generation: None,
+            published_tip: None,
             failed_generation: None,
             epoch_folded: false,
             epoch_preview: None,
@@ -2471,8 +2587,12 @@ impl Presenter {
         // Framed publication (P2fix11 NEW-67): this generation is
         // published — and any preserved record OF it is stale
         // (same-generation recovery supersedes the mid-failure
-        // capture; last-good covers it now).
+        // capture; last-good covers it now). The published tip
+        // pins the watermark last-good covers (P2fix12 NEW-71
+        // — a later reset compares the FINAL prefix against
+        // it).
         self.published_generation = self.generation;
+        self.published_tip = self.watermark;
         if self
             .previous_epoch
             .as_ref()
@@ -3040,15 +3160,44 @@ impl Presenter {
             // uncertainty survive as the previous-epoch record
             // (captured from the preview — the outgoing epoch's
             // finals, never the current scan's own gap
-            // detections). A published outgoing epoch clears
-            // any older record (last-good covers it); a clean
+            // detections). A published outgoing epoch with no
+            // post-publication advance or failure clears any
+            // older record (last-good covers it — P2fix12
+            // NEW-71 keeps the clear there, and preserves the
+            // FINAL prefix + uncertainty otherwise); a clean
             // unpublished outgoing epoch clears too (resets
             // without failure keep existing behavior — the
             // preserved record always describes the immediately
             // previous epoch or nothing).
             if let Some(old) = self.generation {
                 if self.published_generation == Some(old) {
-                    self.previous_epoch = None;
+                    // Published tenure (P2fix12 NEW-71):
+                    // last-good covers the PUBLISHED tip — but
+                    // windows accepted AFTER publication (or
+                    // uncertainty accrued since a rejected tail)
+                    // are NOT in last-good, so a reset that
+                    // cleared on the generation match would drop
+                    // the final accepted prefix + uncertainty
+                    // (and the terminal would show stale
+                    // last-good counts). Preserve the final
+                    // prefix when it advanced past the
+                    // published tip or the tenure failed since;
+                    // only a tenure with no post-publication
+                    // advance AND no failure clears (last-good
+                    // is exact there).
+                    let advanced = matches!(
+                        (&self.epoch_preview, self.published_tip),
+                        (Some(p), Some(t)) if p.generation == old && p.window_seq > t
+                    );
+                    let failed = self.failed_generation == Some(old);
+                    if (advanced || failed)
+                        && let Some(preview) = self.epoch_preview.clone()
+                        && preview.generation == old
+                    {
+                        self.previous_epoch = Some(preview);
+                    } else {
+                        self.previous_epoch = None;
+                    }
                 } else if self.epoch_folded
                     && self.failed_generation == Some(old)
                     && let Some(preview) = self.epoch_preview.clone()
@@ -3975,6 +4124,33 @@ impl Presenter {
             None | Some(serde_json::Value::Null) => None,
             Some(p) => Some(read_previous_epoch_strict(p).ok_or_else(|| bad("previous_epoch"))?),
         };
+        // Previous-epoch binding (P2fix12 NEW-72): a present
+        // record binds to a DISTINCT preceding epoch with an
+        // EARLIER tip and canonical flags + ranges — a
+        // hash-valid record with no current watermark, a
+        // same-generation tag, a tip at-or-after the current
+        // tip, or non-canonical uncertainty refuses loudly
+        // (never applied as earlier evidence).
+        if let Some(p) = previous_epoch.as_ref() {
+            let Some(wm) = watermark else {
+                return Err(bad("previous_epoch without watermark"));
+            };
+            let Some(g) = generation else {
+                return Err(bad("previous_epoch without generation"));
+            };
+            if p.generation == g {
+                return Err(bad("previous_epoch not preceding"));
+            }
+            if p.window_seq >= wm {
+                return Err(bad("previous_epoch tip not earlier"));
+            }
+            if !preserved_flags_canonical(&p.unstable) {
+                return Err(bad("previous_epoch flags not canonical"));
+            }
+            if !preserved_ranges_canonical(&p.unmeasured) {
+                return Err(bad("previous_epoch ranges not canonical"));
+            }
+        }
         // Validated: apply.
         self.generation = generation;
         self.watermark = watermark;
@@ -4008,45 +4184,31 @@ impl Presenter {
         // above ties watermark+latest+generation together); the
         // preview initializes from the restored accumulators so
         // a first-scan reset captures them exactly; no tenure has
-        // published or failed under this presenter yet.
+        // published or failed under this presenter yet (the
+        // published tip clears with its generation — P2fix12
+        // NEW-71).
         self.epoch_folded = watermark.is_some();
         self.published_generation = None;
+        self.published_tip = None;
         self.failed_generation = None;
         self.refresh_epoch_preview();
         Ok(())
     }
 
-    /// Atomic checkpoint write (tmp + fsync + rename + fsync dir).
-    fn write_checkpoint(&mut self) -> std::io::Result<()> {
-        // Placement at every write (P2fix4 NEW-13/NEW-18): an
-        // initially absent directory that became available after
-        // open still holds the outside-producer condition — the
-        // write refuses loudly instead of landing inside.
-        check_checkpoint_placement(&self.out_dir, &self.checkpoint_path).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("osslscope: {e}"))
-        })?;
-        // Validated staging/rename directory (P2fix5 NEW-26,
-        // P2fix7 NEW-44): OPEN the checkpoint parent first, then
-        // prove containment + identity on the SAME opened
-        // directory — no pathname-check-then-reopen gap (a path
-        // that vanished, moved inside, or was substituted between
-        // open and validation fails closed). Every step below is
-        // dirfd-relative (openat/renameat), never a path string.
-        let parent = self
-            .checkpoint_path
-            .parent()
-            .unwrap_or_else(|| Path::new(""));
-        let parent = if parent.as_os_str().is_empty() {
-            std::env::current_dir()?
-        } else {
-            parent.to_path_buf()
-        };
+    /// Establish the checkpoint-write placement precondition
+    /// (P2fix12 NEW-69 — the SINGLE establishment point, run
+    /// BEFORE any mutation): open the checkpoint parent, prove
+    /// occupancy + fd-anchored outside-ness on the SAME opened
+    /// directory (P2fix5 NEW-26, P2fix7 NEW-44 — no
+    /// pathname-check-then-reopen gap), and bind its identity
+    /// to the open-time binding (P2fix6 NEW-34 — a replaced
+    /// parent fails closed, a first resolution binds, the
+    /// NEW-18 absent-dir deferral). Refusal here performs ZERO
+    /// mutations (no stage exists yet, nothing to clean — the
+    /// loud error is the whole effect).
+    fn establish_write_precondition(&mut self, parent: &Path) -> std::io::Result<std::fs::File> {
         let (dir_fd, parent_id) =
-            open_validated_checkpoint_parent(&parent, &self.out_dir, &self.checkpoint_path)?;
-        // Directory binding (P2fix6 NEW-34): compare against the
-        // open-time binding — a replaced parent fails closed
-        // (loudly), and a first resolution binds (the NEW-18
-        // absent-dir deferral).
+            open_validated_checkpoint_parent(parent, &self.out_dir, &self.checkpoint_path)?;
         match self.checkpoint_parent_id {
             Some(bound) if bound == parent_id => {}
             Some(_) => {
@@ -4062,6 +4224,159 @@ impl Presenter {
                 self.checkpoint_parent_id = Some(parent_id);
             }
         }
+        Ok(dir_fd)
+    }
+
+    /// Restore preserved target bytes (P2fix12 NEW-70): a fresh
+    /// exclusively-owned stage + write + fsync + rename over
+    /// the target, all dirfd-relative (the same object the
+    /// commit touched). Best-effort dir sync (carried parity).
+    fn restore_target(
+        &self,
+        dir_fd: &std::fs::File,
+        target_c: &std::ffi::CString,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::io::AsRawFd as _;
+        let pid = std::process::id();
+        let seq = self.checkpoint_seq;
+        let target_lossy = target_c.to_string_lossy();
+        for attempt in 0..16u32 {
+            let name = format!("{target_lossy}.restore-{pid}-{seq}.{attempt}.tmp");
+            let stage_c = std::ffi::CString::new(name).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "osslscope: checkpoint path without a file name",
+                )
+            })?;
+            // SAFETY: dir_fd is a live open directory fd; the
+            // name is a NUL-free file name (it extends the
+            // target's own file name).
+            let fd = unsafe {
+                libc::openat(
+                    dir_fd.as_raw_fd(),
+                    stage_c.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                    0o644,
+                )
+            };
+            if fd < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(e);
+            }
+            // SAFETY: openat returned a fresh owned fd (O_EXCL
+            // created it — exclusively ours).
+            let mut file = unsafe { std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(fd)) };
+            let staged = (|| -> std::io::Result<()> {
+                use std::io::Write as _;
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                // SAFETY: dir_fd is live; both names are
+                // NUL-free file names in it.
+                if unsafe {
+                    libc::renameat(
+                        dir_fd.as_raw_fd(),
+                        stage_c.as_ptr(),
+                        dir_fd.as_raw_fd(),
+                        target_c.as_ptr(),
+                    )
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })();
+            if let Err(e) = staged {
+                if let Err(cleanup) = unlink_checked(dir_fd, &stage_c) {
+                    return Err(with_stage_cleanup_note(e, cleanup));
+                }
+                return Err(e);
+            }
+            let _ = dir_fd.sync_all();
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "osslscope: checkpoint restore crowded (not {})",
+                self.checkpoint_path.display()
+            ),
+        ))
+    }
+
+    /// Post-commit refusal with durability preservation
+    /// (P2fix12 NEW-70): the commit rename already replaced the
+    /// target when the final re-proof failed — restore the last
+    /// COMMITTED bytes over the just-committed target (a
+    /// refusal must never unlink durability into
+    /// nonexistence). First commit (nothing preserved) ⇒
+    /// remove the just-committed target, CHECKED. Every
+    /// cleanup step is checked (P2fix12 NEW-69) — a failed
+    /// restore/unlink returns LOUDLY (the operator must know
+    /// durability is at risk). Always an error (the write
+    /// refused); the placement refusal leads.
+    fn rollback_post_commit(
+        &self,
+        dir_fd: &std::fs::File,
+        target_c: &std::ffi::CString,
+        preserved: Option<Vec<u8>>,
+        placement: std::io::Error,
+    ) -> std::io::Error {
+        match preserved {
+            Some(bytes) => match self.restore_target(dir_fd, target_c, &bytes) {
+                Ok(()) => std::io::Error::new(
+                    placement.kind(),
+                    format!("{placement} (previous committed checkpoint restored)"),
+                ),
+                Err(restore) => std::io::Error::new(
+                    placement.kind(),
+                    format!(
+                        "{placement} (RESTORE FAILED: {restore} — durability at risk; operator must intervene)"
+                    ),
+                ),
+            },
+            None => match unlink_checked(dir_fd, target_c) {
+                Ok(()) => std::io::Error::new(
+                    placement.kind(),
+                    format!("{placement} (no previous checkpoint; just-committed target removed)"),
+                ),
+                Err(cleanup) => std::io::Error::new(
+                    placement.kind(),
+                    format!(
+                        "{placement} (ROLLBACK UNLINK FAILED: {cleanup} — the just-committed bytes may persist; operator must intervene)"
+                    ),
+                ),
+            },
+        }
+    }
+
+    /// Atomic checkpoint write (tmp + fsync + rename + fsync dir).
+    fn write_checkpoint(&mut self) -> std::io::Result<()> {
+        // Placement at every write (P2fix4 NEW-13/NEW-18): an
+        // initially absent directory that became available after
+        // open still holds the outside-producer condition — the
+        // write refuses loudly instead of landing inside.
+        check_checkpoint_placement(&self.out_dir, &self.checkpoint_path).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("osslscope: {e}"))
+        })?;
+        // Placement precondition (P2fix12 NEW-69): establish
+        // BEFORE any mutation — refusal here performs ZERO
+        // mutations. Every step below is dirfd-relative
+        // (openat/renameat/unlinkat), never a path string.
+        let parent = self
+            .checkpoint_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        let parent = if parent.as_os_str().is_empty() {
+            std::env::current_dir()?
+        } else {
+            parent.to_path_buf()
+        };
+        let dir_fd = self.establish_write_precondition(&parent)?;
         // Fault injection (P2fix8 NEW-50, test-only): run the
         // armed relocation after validation, before the first
         // staging write (placement must stabilize through the
@@ -4218,20 +4533,21 @@ impl Presenter {
         match opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path) {
             Ok(true) => {}
             Ok(false) => {
-                unsafe {
-                    libc::unlinkat(dir_fd.as_raw_fd(), stage_c.as_ptr(), 0);
-                }
-                return Err(std::io::Error::new(
+                let placement = std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
                         "osslscope: checkpoint dir no longer outside the producer out-DIR at stage creation (post) (reparented during write; not {})",
                         self.checkpoint_path.display()
                     ),
-                ));
+                );
+                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
+                    return Err(with_stage_cleanup_note(placement, cleanup));
+                }
+                return Err(placement);
             }
             Err(e) => {
-                unsafe {
-                    libc::unlinkat(dir_fd.as_raw_fd(), stage_c.as_ptr(), 0);
+                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
+                    return Err(with_stage_cleanup_note(e, cleanup));
                 }
                 return Err(e);
             }
@@ -4314,8 +4630,8 @@ impl Presenter {
             // the 16-attempt bound and wedge export offline after
             // storage recovers.
             if let Err(e) = staged {
-                unsafe {
-                    libc::unlinkat(dir_fd.as_raw_fd(), stage_c.as_ptr(), 0);
+                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
+                    return Err(with_stage_cleanup_note(e, cleanup));
                 }
                 return Err(e);
             }
@@ -4336,20 +4652,21 @@ impl Presenter {
         match opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path) {
             Ok(true) => {}
             Ok(false) => {
-                unsafe {
-                    libc::unlinkat(dir_fd.as_raw_fd(), stage_c.as_ptr(), 0);
-                }
-                return Err(std::io::Error::new(
+                let placement = std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
                         "osslscope: checkpoint dir no longer outside the producer out-DIR at commit (reparented during write; not {})",
                         self.checkpoint_path.display()
                     ),
-                ));
+                );
+                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
+                    return Err(with_stage_cleanup_note(placement, cleanup));
+                }
+                return Err(placement);
             }
             Err(e) => {
-                unsafe {
-                    libc::unlinkat(dir_fd.as_raw_fd(), stage_c.as_ptr(), 0);
+                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
+                    return Err(with_stage_cleanup_note(e, cleanup));
                 }
                 return Err(e);
             }
@@ -4373,24 +4690,45 @@ impl Presenter {
         match opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path) {
             Ok(true) => {}
             Ok(false) => {
-                unsafe {
-                    libc::unlinkat(dir_fd.as_raw_fd(), stage_c.as_ptr(), 0);
-                }
-                return Err(std::io::Error::new(
+                let placement = std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
                         "osslscope: checkpoint dir no longer outside the producer out-DIR at commit rename (reparented during write; not {})",
                         self.checkpoint_path.display()
                     ),
-                ));
+                );
+                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
+                    return Err(with_stage_cleanup_note(placement, cleanup));
+                }
+                return Err(placement);
             }
             Err(e) => {
-                unsafe {
-                    libc::unlinkat(dir_fd.as_raw_fd(), stage_c.as_ptr(), 0);
+                if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
+                    return Err(with_stage_cleanup_note(e, cleanup));
                 }
                 return Err(e);
             }
         }
+        // Committed-bytes preservation read (P2fix12 NEW-70):
+        // snapshot the CURRENT target bytes BEFORE the commit
+        // rename (dirfd-relative — the same object the rename
+        // replaces), so a post-commit refusal restores them
+        // instead of unlinking durability into nonexistence.
+        // Absent target ⇒ first commit (nothing to preserve);
+        // present-but-unreadable ⇒ clean the owned stage
+        // (CHECKED) and refuse BEFORE the rename (preservation
+        // is impossible — replacing the bytes would destroy
+        // them).
+        let preserved_target =
+            match read_checkpoint_target(&dir_fd, &target_c, &self.checkpoint_path) {
+                Ok(preserved) => preserved,
+                Err(e) => {
+                    if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
+                        return Err(with_stage_cleanup_note(e, cleanup));
+                    }
+                    return Err(e);
+                }
+            };
         // Fault injection (P2fix11 NEW-66, test-only): run the
         // armed relocation AFTER the fused pre-rename proof
         // SUCCEEDS (the FINAL successful check on the mutation
@@ -4410,53 +4748,57 @@ impl Presenter {
         } != 0
         {
             let e = std::io::Error::last_os_error();
-            // Best-effort cleanup of OUR stage (exclusively owned
-            // — created this call, never shared, never another
-            // writer's).
-            unsafe {
-                libc::unlinkat(dir_fd.as_raw_fd(), stage_c.as_ptr(), 0);
+            // Cleanup of OUR stage (exclusively owned — created
+            // this call, never shared, never another writer's),
+            // CHECKED (P2fix12 NEW-69).
+            if let Err(cleanup) = unlink_checked(&dir_fd, &stage_c) {
+                return Err(with_stage_cleanup_note(e, cleanup));
             }
             return Err(e);
         }
+        // Directory fsync BEFORE the final re-proof (P2fix12
+        // NEW-69): no placement-sensitive mutation follows the
+        // last proof — only fd-stable rollback cleanup (which
+        // is declared cleanup, never proof-covered mutation).
+        // Best-effort (carried parity — the stage file itself
+        // is fsynced above; a dir-sync failure must not fail
+        // the commit).
+        let _ = dir_fd.sync_all();
         // Outside placement AFTER the commit (P2fix11 NEW-66):
         // re-prove fd-anchored ancestry on the SAME fd fused with
         // the renameat above (no hook point between the rename
         // and this re-proof — a relocation after the fused
         // pre-rename check, sequential or concurrent, is caught
-        // HERE). On failure the JUST-COMMITTED target is unlinked
-        // (rollback — nothing persists beneath the producer
-        // out-DIR) and the write refuses LOUDLY. The previous
-        // checkpoint is NOT restored (restoring would itself
-        // write beneath the out-DIR); post-completion external
-        // renames are outside any writer's control. An unreadable
-        // ancestry fails closed the same way. Ancestry-only
-        // (same rule as above — the NEW-50 outside→outside move
-        // at the last instant still commits).
+        // HERE). On failure the write refuses LOUDLY and the
+        // last COMMITTED bytes are restored over the
+        // just-committed target (P2fix12 NEW-70 — a refusal must
+        // never unlink durability into nonexistence);
+        // post-completion external renames are outside any
+        // writer's control. An unreadable ancestry fails closed
+        // the same way. Ancestry-only (same rule as above —
+        // the NEW-50 outside→outside move at the last instant
+        // still commits).
         match opened_dir_is_outside(&dir_fd, &self.out_dir, &self.checkpoint_path) {
             Ok(true) => {}
             Ok(false) => {
-                unsafe {
-                    libc::unlinkat(dir_fd.as_raw_fd(), target_c.as_ptr(), 0);
-                }
-                return Err(std::io::Error::new(
+                let placement = std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
                         "osslscope: checkpoint dir no longer outside the producer out-DIR at commit (post) (reparented during write; not {})",
                         self.checkpoint_path.display()
                     ),
+                );
+                return Err(self.rollback_post_commit(
+                    &dir_fd,
+                    &target_c,
+                    preserved_target,
+                    placement,
                 ));
             }
             Err(e) => {
-                unsafe {
-                    libc::unlinkat(dir_fd.as_raw_fd(), target_c.as_ptr(), 0);
-                }
-                return Err(e);
+                return Err(self.rollback_post_commit(&dir_fd, &target_c, preserved_target, e));
             }
         }
-        // Directory fsync stays best-effort (parity with the
-        // pre-NEW-34 write — the stage file itself is fsynced
-        // above; a dir-sync failure must not fail the commit).
-        let _ = dir_fd.sync_all();
         Ok(())
     }
 
@@ -6341,17 +6683,20 @@ mod tests {
     }
 
     #[test]
-    fn new66_reparent_after_final_check_rolls_back_commit() {
-        // P2fix11 NEW-66 (+ NEW-50/NEW-56-OPEN): the hook fires
-        // AFTER the fused pre-rename proof SUCCEEDS (the FINAL
-        // successful check on the mutation path), before the
-        // commit renameat — the POST-commit re-proof must
-        // refuse and roll the just-committed target BACK (the
-        // target name never persists inside; zero stage
-        // residue). The previous checkpoint is NOT restored
-        // (restoring would itself write beneath the out-DIR).
-        // Pre-fix: the rename commits inside SILENTLY (Ok) —
-        // the un-undoable write (RED).
+    fn new70_post_rename_refusal_preserves_committed_bytes() {
+        // P2fix12 NEW-70 (+ NEW-2/NEW-9/NEW-16/NEW-22/NEW-33/
+        // NEW-50/NEW-56/NEW-66-OPEN — SUPERSEDES the P2fix11
+        // NEW-66 rollback-to-nonexistence pin: codex R12
+        // rejects destroying the durable checkpoint on
+        // refusal). The hook fires AFTER the fused pre-rename
+        // proof SUCCEEDS (the FINAL successful check on the
+        // mutation path), before the commit renameat — the
+        // POST-commit re-proof must refuse AND the last
+        // COMMITTED bytes must survive (restored over the
+        // just-committed target — a refusal must never unlink
+        // the durable checkpoint into nonexistence); zero
+        // stage residue. Pre-fix: the target is unlinked
+        // (missing — restart continuity destroyed) (RED).
         let base = unique_dir("reparent-after-final-check");
         let out = base.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -6367,6 +6712,7 @@ mod tests {
         let mut presenter =
             Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
         presenter.build_service().expect("first fold commits");
+        let before = std::fs::read(&ckpt).unwrap();
         let target = out.join("p-moved");
         let (p2, target2) = (p.clone(), target.clone());
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -6387,13 +6733,14 @@ mod tests {
             format!("{err:?}").contains("at commit (post)"),
             "the refusal names the post-commit re-proof: {err:?}"
         );
-        assert!(
-            !target.join("ckpt.json").exists(),
-            "the just-committed target is rolled back (nothing persists inside)"
+        assert_eq!(
+            std::fs::read(target.join("ckpt.json")).unwrap(),
+            before,
+            "the last COMMITTED bytes survive the refusal (restored, never unlinked into nonexistence)"
         );
         assert!(
             staging_residue(&target).is_empty(),
-            "zero stage residue on rollback: {:?}",
+            "zero stage residue on refusal: {:?}",
             staging_residue(&target)
         );
         let _ = std::fs::remove_dir_all(&base);
@@ -7058,6 +7405,836 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert!(inner_entries.is_empty(), "inside stays empty at the end");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new70_unreadable_target_refuses_before_rename() {
+        // P2fix12 NEW-70 (+ NEW-22/NEW-56-OPEN): preservation
+        // must be POSSIBLE before the commit rename runs — a
+        // pre-existing checkpoint target that cannot be read
+        // back (EACCES) refuses BEFORE the rename (its bytes
+        // cannot be preserved, so replacing them is durability
+        // loss). Pre-fix: the flush succeeds and the
+        // unreadable bytes are destroyed (RED).
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = unique_dir("unreadable-target");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let before = std::fs::read(&ckpt).unwrap();
+        std::fs::set_permissions(&ckpt, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = presenter
+            .flush_checkpoint()
+            .expect_err("an unreadable target must refuse before the rename");
+        assert!(
+            format!("{err:?}").contains("preserve"),
+            "the refusal names preservation: {err:?}"
+        );
+        std::fs::set_permissions(&ckpt, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            before,
+            "the unreadable target is never replaced"
+        );
+        assert!(
+            staging_residue(&p).is_empty(),
+            "zero stage residue on pre-rename refusal: {:?}",
+            staging_residue(&p)
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new69_cleanup_unlink_failure_surfaces() {
+        // P2fix12 NEW-69 (+ NEW-26/NEW-45 scope): cleanup must
+        // not ignore unlink failures — an EIO stage-write
+        // failure in a directory that then resists the
+        // cleanup unlink (read-only) surfaces BOTH the write
+        // failure AND the cleanup failure (loudly — the
+        // operator must know the stage leaked). Pre-fix: the
+        // error is the bare EIO (the failed unlink is
+        // swallowed) (RED).
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = unique_dir("cleanup-unlink-failure");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        // After stage creation, before the first byte: lock
+        // the dir read-only (the cleanup unlink then fails
+        // EACCES) + inject the EIO write failure.
+        let p2 = p.clone();
+        super::pre_first_write_hook::arm(move || {
+            std::fs::set_permissions(&p2, std::fs::Permissions::from_mode(0o555)).unwrap();
+        });
+        super::stage_fault::arm(1);
+        let err = presenter
+            .flush_checkpoint()
+            .expect_err("the injected EIO must fail the flush");
+        super::pre_first_write_hook::disarm();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The primary error LEADS (the EIO text survives) and
+        // the failed cleanup rides along (composite message —
+        // the codebase idiom; `Error::new` keeps kind + text).
+        assert!(
+            format!("{err:?}").contains("Input/output error"),
+            "the injected EIO stays the primary error: {err:?}"
+        );
+        assert!(
+            format!("{err:?}").contains("cleanup"),
+            "the failed cleanup unlink surfaces in the error: {err:?}"
+        );
+        assert!(
+            !staging_residue(&p).is_empty(),
+            "premise: the stage really leaked (the unlink genuinely failed)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new69_movement_within_mutation_interval_accounted() {
+        // P2fix12 NEW-69 (+ NEW-13/NEW-26/NEW-34/NEW-50/NEW-56/
+        // NEW-61/NEW-66-OPEN): movement scheduled at EVERY
+        // hook point WITHIN the mutation interval refuses
+        // with zero stage residue and the last committed
+        // bytes intact — establishment-phase moves refuse
+        // BEFORE any mutation; the final-gap move (after the
+        // last proof) refuses with the committed bytes
+        // restored (NEW-70). Pre-fix: the final-gap schedule
+        // unlinks the checkpoint into nonexistence (RED).
+        let points = [
+            "post_validation",
+            "post_staging_check",
+            "post_create_check",
+            "pre_first_write",
+            "mid_write",
+            "pre_commit",
+            "post_commit_check",
+            "pre_rename",
+        ];
+        for point in points {
+            let base = unique_dir(&format!("mutation-interval-{point}"));
+            let out = base.join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+            std::fs::write(
+                out.join("window-0000000000.json"),
+                serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+            )
+            .unwrap();
+            let p = base.join("p");
+            std::fs::create_dir_all(&p).unwrap();
+            let ckpt = p.join("ckpt.json");
+            let mut presenter =
+                Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+            presenter.build_service().expect("first fold commits");
+            let before = std::fs::read(&ckpt).unwrap();
+            let target = out.join("p-moved");
+            let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mk = || {
+                let (p2, target2, ran2) = (p.clone(), target.clone(), ran.clone());
+                move || {
+                    std::fs::rename(&p2, &target2).unwrap();
+                    ran2.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            };
+            match point {
+                "post_validation" => super::post_validation_hook::arm(mk()),
+                "post_staging_check" => super::post_staging_check_hook::arm(mk()),
+                "post_create_check" => super::post_create_check_hook::arm(mk()),
+                "pre_first_write" => super::pre_first_write_hook::arm(mk()),
+                "mid_write" => super::mid_write_hook::arm(mk()),
+                "pre_commit" => super::pre_commit_hook::arm(mk()),
+                "post_commit_check" => super::post_commit_check_hook::arm(mk()),
+                "pre_rename" => super::pre_rename_hook::arm(mk()),
+                _ => unreachable!(),
+            }
+            let err = presenter
+                .flush_checkpoint()
+                .expect_err(&format!("a move at {point} must refuse"));
+            match point {
+                "post_validation" => super::post_validation_hook::disarm(),
+                "post_staging_check" => super::post_staging_check_hook::disarm(),
+                "post_create_check" => super::post_create_check_hook::disarm(),
+                "pre_first_write" => super::pre_first_write_hook::disarm(),
+                "mid_write" => super::mid_write_hook::disarm(),
+                "pre_commit" => super::pre_commit_hook::disarm(),
+                "post_commit_check" => super::post_commit_check_hook::disarm(),
+                "pre_rename" => super::pre_rename_hook::disarm(),
+                _ => unreachable!(),
+            }
+            assert!(
+                ran.load(std::sync::atomic::Ordering::Relaxed),
+                "the {point} hook ran"
+            );
+            assert!(
+                format!("{err:?}").contains("outside the producer out-DIR"),
+                "the {point} refusal names placement: {err:?}"
+            );
+            assert!(
+                staging_residue(&target).is_empty(),
+                "zero stage residue after a {point} move: {:?}",
+                staging_residue(&target)
+            );
+            assert_eq!(
+                std::fs::read(target.join("ckpt.json")).unwrap(),
+                before,
+                "the committed bytes survive a {point} move"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// Re-hash a mutated checkpoint body (P2fix12 NEW-72
+    /// negative controls): the sha covers the bare body, so
+    /// removing + re-adding it last keeps a crafted body
+    /// hash-valid.
+    fn rehash_checkpoint(v: &mut serde_json::Value) {
+        v.as_object_mut().unwrap().remove("sha256");
+        let bytes = serde_json::to_vec(&v).unwrap();
+        let hex = sha256_hex(&bytes);
+        v.as_object_mut()
+            .unwrap()
+            .insert("sha256".to_string(), serde_json::json!(hex));
+    }
+
+    /// Traced window envelope (P2fix12 NEW-73): a
+    /// producer-shaped document carrying a REAL valid
+    /// summarized trace plane, so the fold counts as MEASURED
+    /// (folded-but-null windows merge into the unmeasured span
+    /// instead of breaking it into separate ranges).
+    fn traced_envelope(
+        seq: u64,
+        generation: u64,
+        run: serde_json::Value,
+        calls: u64,
+    ) -> serde_json::Value {
+        use crate::provider_observation::trace as t;
+        let mut p = t::TraceProducer::new();
+        p.set_mode(t::TRACE_MODE_LATENCY);
+        let k = t::PairKey {
+            pid: 1,
+            tid: 2,
+            generation: 1,
+            cookie: 9000,
+            invocation: 1,
+        };
+        p.attempt(t::AttemptEdge {
+            key: k,
+            api: 20,
+            monotonic_ns: 1000,
+            start_time_ns: 1,
+            seed: 1,
+        });
+        p.result(t::ResultEdge {
+            key: k,
+            api: 20,
+            monotonic_ns: 1050,
+            outcome: 1,
+            start_time_ns: 1,
+            seed: 1,
+        });
+        let window = p.close_window(0, 9000, [0; 8]);
+        let totals = p.totals();
+        let summary = t::summarize(&window, &totals, "latency", None);
+        summary.validate().expect("test trace validates");
+        let mut doc = test_document(calls, "complete");
+        doc["schema"] = serde_json::json!("observed-crypto-v2.9");
+        doc["trace_summary"] = serde_json::to_value(&summary).unwrap();
+        test_envelope_with_doc(seq, generation, run, doc)
+    }
+
+    /// Scenario checkpoint carrying a VALID preserved record
+    /// (P2fix12 NEW-72 controls): publish gen 0, fail a gen-1
+    /// prefix after a hole, recover into gen 2. Returns the
+    /// out-DIR, the checkpoint path, and the live record.
+    fn scenario_checkpoint_with_record(tag: &str) -> (PathBuf, PathBuf, PreservedEpoch) {
+        let base = unique_dir(tag);
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt = base.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("gen 0 publishes");
+        std::fs::write(
+            out.join("window-0000000002.json"),
+            serde_json::to_string(&test_envelope(2, 1, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let mut bad = test_envelope(3, 1, run.clone(), 10);
+        bad["schema"] = serde_json::json!("service-window-v9");
+        std::fs::write(
+            out.join("window-0000000003.json"),
+            serde_json::to_string(&bad).unwrap(),
+        )
+        .unwrap();
+        presenter
+            .build_service_staged()
+            .expect_err("the rejected tail fails the scan");
+        std::fs::remove_file(out.join("window-0000000003.json")).unwrap();
+        std::fs::write(
+            out.join("window-0000000004.json"),
+            serde_json::to_string(&test_envelope(4, 2, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        presenter.build_service().expect("recovery builds");
+        let prev = presenter
+            .previous_epoch()
+            .expect("the gen-2 reset preserves gen 1");
+        // Forget the base path (the caller owns teardown via
+        // the out-DIR's parent).
+        let _ = base;
+        (out, ckpt, prev)
+    }
+
+    #[test]
+    fn new72_hash_valid_previous_epoch_binds_to_preceding_epoch() {
+        // P2fix12 NEW-72 (+ NEW-67-OPEN): a HASH-VALID
+        // checkpoint's `previous_epoch` binds to a DISTINCT
+        // preceding epoch with an EARLIER tip and canonical
+        // flags + ranges — no-watermark, tip-at-or-after-
+        // current, same-generation, reversed/unsorted/
+        // overlapping/adjacent ranges, and unsorted/dup/
+        // foreign flags all refuse loudly (never applied as
+        // earlier evidence). Pre-fix: every crafted body
+        // opens fine (RED).
+        let (out, ckpt, prev) = scenario_checkpoint_with_record("restore-binding");
+        assert_eq!(prev.generation, 1, "premise: the record is gen 1");
+        let live: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        let watermark = live["watermark_seq"].as_u64().expect("premise: watermark");
+        let generation = live["generation"].as_u64().expect("premise: generation");
+        assert_eq!((generation, watermark), (2, 4), "premise: gen 2 @ tip 4");
+        assert_eq!(prev.window_seq, 2, "premise: the record tip is 2");
+        // Premise: the untouched body round-trips hash-valid
+        // (parse + re-hash without mutation still opens).
+        let mut roundtrip = live.clone();
+        rehash_checkpoint(&mut roundtrip);
+        std::fs::write(&ckpt, serde_json::to_vec(&roundtrip).unwrap()).unwrap();
+        drop(
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+                .expect("premise: the rehashed body opens"),
+        );
+        let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>)> = vec![
+            (
+                "no-watermark",
+                Box::new(|v: &mut serde_json::Value| {
+                    v["generation"] = serde_json::Value::Null;
+                    v["watermark_seq"] = serde_json::Value::Null;
+                    v["accumulators"]["latest"] = serde_json::Value::Null;
+                }),
+            ),
+            (
+                "tip-at-current",
+                Box::new(move |v: &mut serde_json::Value| {
+                    v["accumulators"]["previous_epoch"]["window_seq"] =
+                        serde_json::json!(watermark);
+                }),
+            ),
+            (
+                "tip-after-current",
+                Box::new(move |v: &mut serde_json::Value| {
+                    v["accumulators"]["previous_epoch"]["window_seq"] =
+                        serde_json::json!(watermark + 7);
+                }),
+            ),
+            (
+                "same-generation",
+                Box::new(move |v: &mut serde_json::Value| {
+                    v["accumulators"]["previous_epoch"]["generation"] =
+                        serde_json::json!(generation);
+                }),
+            ),
+            (
+                "reversed-range",
+                Box::new(|v: &mut serde_json::Value| {
+                    v["accumulators"]["previous_epoch"]["unmeasured"] = serde_json::json!([[5, 2]]);
+                }),
+            ),
+            (
+                "unsorted-ranges",
+                Box::new(|v: &mut serde_json::Value| {
+                    v["accumulators"]["previous_epoch"]["unmeasured"] =
+                        serde_json::json!([[5, 6], [1, 2]]);
+                }),
+            ),
+            (
+                "overlapping-ranges",
+                Box::new(|v: &mut serde_json::Value| {
+                    v["accumulators"]["previous_epoch"]["unmeasured"] =
+                        serde_json::json!([[1, 3], [2, 4]]);
+                }),
+            ),
+            (
+                "adjacent-ranges",
+                Box::new(|v: &mut serde_json::Value| {
+                    v["accumulators"]["previous_epoch"]["unmeasured"] =
+                        serde_json::json!([[1, 2], [3, 4]]);
+                }),
+            ),
+            (
+                "unsorted-flags",
+                Box::new(|v: &mut serde_json::Value| {
+                    let flags = v["accumulators"]["previous_epoch"]["unstable"]
+                        .as_array()
+                        .unwrap()
+                        .clone();
+                    assert!(flags.len() > 1, "premise: several flags to reorder");
+                    let mut rev = flags;
+                    rev.reverse();
+                    v["accumulators"]["previous_epoch"]["unstable"] = serde_json::Value::Array(rev);
+                }),
+            ),
+            (
+                "dup-flag",
+                Box::new(|v: &mut serde_json::Value| {
+                    let first = v["accumulators"]["previous_epoch"]["unstable"][0].clone();
+                    v["accumulators"]["previous_epoch"]["unstable"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(first);
+                }),
+            ),
+            (
+                "foreign-flag",
+                Box::new(|v: &mut serde_json::Value| {
+                    v["accumulators"]["previous_epoch"]["unstable"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!("bogus.flag"));
+                }),
+            ),
+        ];
+        for (name, mutate) in cases {
+            let mut crafted = live.clone();
+            mutate(&mut crafted);
+            rehash_checkpoint(&mut crafted);
+            std::fs::write(&ckpt, serde_json::to_vec(&crafted).unwrap()).unwrap();
+            let err = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+                .expect_err(&format!("{name}: a misbound record must refuse"));
+            assert!(
+                format!("{err:?}").contains("previous_epoch"),
+                "{name}: the refusal names the record: {err:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(out.parent().unwrap());
+    }
+
+    #[test]
+    fn new72_legacy_checkpoint_without_previous_epoch_restores() {
+        // P2fix12 NEW-72 (legacy-absence control): a hash-valid
+        // checkpoint WITHOUT the record (old writer) restores
+        // with no preservation (absence keeps its meaning).
+        // Guard (holds pre/post).
+        let (out, ckpt, _) = scenario_checkpoint_with_record("restore-legacy");
+        let live: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        let mut stripped = live.clone();
+        stripped["accumulators"]
+            .as_object_mut()
+            .unwrap()
+            .remove("previous_epoch");
+        rehash_checkpoint(&mut stripped);
+        std::fs::write(&ckpt, serde_json::to_vec(&stripped).unwrap()).unwrap();
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("a legacy checkpoint without the record opens");
+        assert_eq!(
+            q.previous_epoch(),
+            None,
+            "absence restores to no preservation"
+        );
+        assert_eq!(q.watermark, Some(4), "the watermark restores");
+        let _ = std::fs::remove_dir_all(out.parent().unwrap());
+    }
+
+    #[test]
+    fn new72_valid_previous_epoch_reopens_exact() {
+        // P2fix12 NEW-72 (valid-reopen control): a hash-valid
+        // checkpoint WITH a well-bound record reopens with the
+        // record intact (gen, tip, counts, lanes, flags,
+        // ranges — exactly). Guard (holds pre/post).
+        let (out, ckpt, prev) = scenario_checkpoint_with_record("restore-valid");
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("a well-bound checkpoint opens");
+        assert_eq!(q.previous_epoch(), Some(prev), "the record reopens exactly");
+        let _ = std::fs::remove_dir_all(out.parent().unwrap());
+    }
+
+    #[test]
+    fn new71_published_prefix_and_uncertainty_survive_reset() {
+        // P2fix12 NEW-71 (+ NEW-P2c/NEW-67-OPEN): publish an
+        // epoch, then accept MORE windows in that same epoch
+        // before a rejected tail — recovery into the next
+        // generation preserves the FINAL accepted prefix +
+        // uncertainty (not the stale published tip). Two
+        // schedules: (A) the tip advances past publication;
+        // (B) the tip holds but the failed scan accrues hole
+        // uncertainty. Both observe the EXACT failed prefix
+        // BEFORE advancing. Pre-fix: the published shortcut
+        // clears the newer prefix (None) (RED).
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        // Schedule A: tip advances past publication.
+        {
+            let base = unique_dir("published-prefix-advanced");
+            let out = base.join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(
+                out.join("window-0000000000.json"),
+                serde_json::to_string(&test_envelope(0, 0, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+            let ckpt = base.join("ckpt.json");
+            let mut presenter =
+                Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+            presenter.build_service().expect("gen 0 publishes at tip 0");
+            assert_eq!(presenter.published_generation, Some(0));
+            assert_eq!(presenter.watermark, Some(0));
+            for (seq, calls) in [(1u64, 20u64), (2, 30)] {
+                std::fs::write(
+                    out.join(format!("window-{seq:010}.json")),
+                    serde_json::to_string(&test_envelope(seq, 0, run.clone(), calls)).unwrap(),
+                )
+                .unwrap();
+            }
+            let mut bad = test_envelope(3, 0, run.clone(), 10);
+            bad["schema"] = serde_json::json!("service-window-v9");
+            std::fs::write(
+                out.join("window-0000000003.json"),
+                serde_json::to_string(&bad).unwrap(),
+            )
+            .unwrap();
+            presenter
+                .build_service()
+                .expect_err("the rejected tail fails the scan");
+            // The EXACT failed prefix, observed BEFORE advancing.
+            assert_eq!(presenter.generation, Some(0), "still gen 0");
+            assert_eq!(presenter.watermark, Some(2), "the prefix tip is 2");
+            assert_eq!(presenter.calls_total, 60, "10 + 20 + 30 accepted");
+            assert_eq!(presenter.lanes, [60, 0, 0, 0]);
+            assert_eq!(
+                presenter.trace_unmeasured,
+                vec![[0u64, 2u64]],
+                "the folded-but-null span survives"
+            );
+            assert!(
+                presenter.unstable.is_empty(),
+                "no hole flags on a contiguous prefix: {:?}",
+                presenter.unstable
+            );
+            assert_eq!(presenter.failed_generation, Some(0), "the tenure failed");
+            // Recovery into gen 1 after retention removes the tail.
+            std::fs::remove_file(out.join("window-0000000003.json")).unwrap();
+            std::fs::write(
+                out.join("window-0000000004.json"),
+                serde_json::to_string(&test_envelope(4, 1, run.clone(), 7)).unwrap(),
+            )
+            .unwrap();
+            let snap = presenter.build_service().expect("recovery builds");
+            assert_eq!(snap.source.generation, Some(1));
+            let prev = presenter
+                .previous_epoch()
+                .expect("the reset preserves the newer prefix");
+            assert_eq!(prev.generation, 0);
+            assert_eq!(
+                prev.window_seq, 2,
+                "the preserved tip is 2, not the stale 0"
+            );
+            assert_eq!(
+                prev.calls_total, 60,
+                "the preserved counts are final, not stale"
+            );
+            assert_eq!(prev.lanes, [60, 0, 0, 0]);
+            assert_eq!(prev.unmeasured, vec![[0u64, 2u64]]);
+            // Persist + reopen.
+            let ckpt_json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&ckpt).unwrap()).unwrap();
+            assert_eq!(
+                ckpt_json["accumulators"]["previous_epoch"]["calls_total"],
+                serde_json::json!(60),
+                "the checkpoint persists the final prefix"
+            );
+            drop(presenter);
+            let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+                .expect("the recovery checkpoint reloads");
+            assert_eq!(
+                q.previous_epoch(),
+                Some(prev),
+                "the newer prefix survives the reopen"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+        // Schedule B: the tip holds at publication but the
+        // failed scan accrues hole uncertainty.
+        {
+            let base = unique_dir("published-prefix-failed");
+            let out = base.join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(
+                out.join("window-0000000000.json"),
+                serde_json::to_string(&test_envelope(0, 0, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+            let ckpt = base.join("ckpt.json");
+            let mut presenter =
+                Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+            presenter.build_service().expect("gen 0 publishes at tip 0");
+            let mut bad = test_envelope(2, 0, run.clone(), 10);
+            bad["schema"] = serde_json::json!("service-window-v9");
+            std::fs::write(
+                out.join("window-0000000002.json"),
+                serde_json::to_string(&bad).unwrap(),
+            )
+            .unwrap();
+            presenter
+                .build_service()
+                .expect_err("the rejected tail fails the scan");
+            // The EXACT failed prefix, observed BEFORE advancing.
+            assert_eq!(presenter.watermark, Some(0), "no new tip folded");
+            assert_eq!(presenter.calls_total, 10, "only the published window");
+            assert_eq!(
+                presenter.trace_unmeasured,
+                vec![[0u64, 1u64]],
+                "the published span + the hole"
+            );
+            assert_eq!(presenter.unstable.len(), 8, "the hole flags accrue");
+            assert_eq!(presenter.failed_generation, Some(0), "the tenure failed");
+            // Recovery into gen 1 after retention removes the tail.
+            std::fs::remove_file(out.join("window-0000000002.json")).unwrap();
+            std::fs::write(
+                out.join("window-0000000003.json"),
+                serde_json::to_string(&test_envelope(3, 1, run.clone(), 7)).unwrap(),
+            )
+            .unwrap();
+            let snap = presenter.build_service().expect("recovery builds");
+            assert_eq!(snap.source.generation, Some(1));
+            let prev = presenter
+                .previous_epoch()
+                .expect("the reset preserves the failed prefix");
+            assert_eq!(prev.generation, 0);
+            assert_eq!(prev.window_seq, 0, "the tip holds at publication");
+            assert_eq!(prev.calls_total, 10);
+            assert_eq!(prev.unstable.len(), 8, "the accrued flags survive");
+            assert_eq!(
+                prev.unmeasured,
+                vec![[0u64, 1u64]],
+                "the hole span survives"
+            );
+            drop(presenter);
+            let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+                .expect("the recovery checkpoint reloads");
+            assert_eq!(
+                q.previous_epoch(),
+                Some(prev),
+                "the failed prefix survives the reopen"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    #[test]
+    fn new65_same_generation_failed_prefix_exact_before_repair() {
+        // P2fix12 NEW-65 (+ NEW-67 scope): the same-generation
+        // failed prefix is EXACT before repair — a retention
+        // hole + a valid prefix + a rejected tail, observed
+        // field-for-field (watermark, counts, lanes, ranges,
+        // flags, failure mark), THEN repaired in the same
+        // generation. Recovery publishes WITH the missing
+        // span. Guard (the behavior holds; the exactness is
+        // the new coverage).
+        let base = unique_dir("samegen-exact-prefix");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt = base.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("gen 0 publishes");
+        std::fs::write(
+            out.join("window-0000000002.json"),
+            serde_json::to_string(&test_envelope(2, 1, run.clone(), 5)).unwrap(),
+        )
+        .unwrap();
+        let mut bad = test_envelope(3, 1, run.clone(), 10);
+        bad["schema"] = serde_json::json!("service-window-v9");
+        std::fs::write(
+            out.join("window-0000000003.json"),
+            serde_json::to_string(&bad).unwrap(),
+        )
+        .unwrap();
+        presenter
+            .build_service()
+            .expect_err("the rejected tail fails the scan");
+        // The EXACT failed prefix, observed BEFORE repair.
+        assert_eq!(presenter.generation, Some(1), "gen 1 adopted");
+        assert_eq!(presenter.watermark, Some(2), "the prefix tip is 2");
+        assert_eq!(presenter.calls_total, 5, "the prefix counts only");
+        assert_eq!(presenter.lanes, [5, 0, 0, 0]);
+        assert_eq!(
+            presenter.trace_unmeasured,
+            vec![[1u64, 2u64]],
+            "the hole + the folded-but-null span"
+        );
+        assert_eq!(presenter.unstable.len(), 8, "the hole flags");
+        assert_eq!(presenter.failed_generation, Some(1), "the tenure failed");
+        assert!(presenter.epoch_folded, "the tenure folded");
+        // Same-generation repair: the tail heals in place.
+        std::fs::write(
+            out.join("window-0000000003.json"),
+            serde_json::to_string(&test_envelope(3, 1, run.clone(), 7)).unwrap(),
+        )
+        .unwrap();
+        let snap = presenter.build_service().expect("recovery builds");
+        assert_eq!(snap.source.generation, Some(1), "same generation");
+        assert_eq!(snap.source.window_seq, Some(3), "the repaired tip");
+        assert_eq!(presenter.watermark, Some(3));
+        assert_eq!(presenter.calls_total, 12, "5 + 7 across the repair");
+        assert_eq!(
+            presenter.trace_unmeasured,
+            vec![[1u64, 3u64]],
+            "recovery publishes WITH the missing span"
+        );
+        assert_eq!(presenter.unstable.len(), 8, "the flags survive repair");
+        assert_eq!(
+            presenter.previous_epoch(),
+            None,
+            "same-generation recovery preserves nothing (last-good supersedes)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new73_bounded_ranges_render_complete_with_exact_omitted_count() {
+        // P2fix12 NEW-73 (+ NEW-67-OPEN): a preserved epoch
+        // with a 36-range payload through the REAL pipeline
+        // (fold 37 windows with 36 retention gaps, fail, reset
+        // into the next generation) — the human tail renders
+        // COMPLETE bounded entries with an EXACT omitted-range
+        // count (never a mid-list cut), the checkpoint persists
+        // the full record, and the reopen restores it. Pre-fix:
+        // the 200-char cap cuts the line mid-list (RED).
+        let base = unique_dir("bounded-ranges");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        for k in 0..37u64 {
+            let seq = k * 3;
+            std::fs::write(
+                out.join(format!("window-{seq:010}.json")),
+                serde_json::to_string(&traced_envelope(seq, 0, run.clone(), 1)).unwrap(),
+            )
+            .unwrap();
+        }
+        let ckpt = base.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        // Staged (no publication marking — gen 0 stays
+        // unpublished, so the NEW-67 arm preserves it
+        // pre-fix too and this pin's RED is purely the
+        // rendering cut, not the NEW-71 shortcut).
+        presenter.build_service_staged().expect("gen 0 folds");
+        assert_eq!(
+            presenter.trace_unmeasured.len(),
+            36,
+            "36 retention gaps: {:?}",
+            presenter.trace_unmeasured
+        );
+        let mut bad = test_envelope(109, 0, run.clone(), 1);
+        bad["schema"] = serde_json::json!("service-window-v9");
+        std::fs::write(
+            out.join("window-0000000109.json"),
+            serde_json::to_string(&bad).unwrap(),
+        )
+        .unwrap();
+        presenter
+            .build_service()
+            .expect_err("the rejected tail fails the scan");
+        std::fs::remove_file(out.join("window-0000000109.json")).unwrap();
+        std::fs::write(
+            out.join("window-0000000110.json"),
+            serde_json::to_string(&test_envelope(110, 1, run.clone(), 1)).unwrap(),
+        )
+        .unwrap();
+        let snap = presenter.build_service().expect("recovery builds");
+        let prev = presenter
+            .previous_epoch()
+            .expect("the reset preserves gen 0");
+        assert_eq!(prev.unmeasured.len(), 36, "the 36 ranges survive");
+        // The human tail: bounded, complete entries, exact count.
+        let frame = crate::presentation::watch::render_frame_with_prev(
+            &snap,
+            Some(crate::presentation::watch::PrevEpoch::Preserved(&prev)),
+            0,
+            &snap.markers,
+        );
+        let line = frame
+            .lines()
+            .find(|l| l.starts_with("  prev-unmeasured="))
+            .expect("the tail carries the ranges")
+            .to_string();
+        assert!(
+            line.len() <= 200,
+            "the line respects the 200-char bound ({}): {line:?}",
+            line.len()
+        );
+        assert!(!line.contains('…'), "no mid-list cut marker: {line:?}");
+        // Every shown entry is complete: count `[<digits>,` entry
+        // openings; the omitted count is exact.
+        let shown = line
+            .as_bytes()
+            .windows(2)
+            .filter(|w| w[0] == b'[' && w[1].is_ascii_digit())
+            .count();
+        assert!(shown > 0 && shown < 36, "bounded but nonempty: {line:?}");
+        assert!(
+            line.contains(&format!("+{} more", 36 - shown)),
+            "the exact omitted-range count: {line:?}"
+        );
+        assert!(
+            line.starts_with("  prev-unmeasured=[[1, 2], [4, 5]"),
+            "complete entries from the front: {line:?}"
+        );
+        // Persist + reopen: the full record survives.
+        drop(presenter);
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("the recovery checkpoint reloads");
+        assert_eq!(
+            q.previous_epoch().as_ref().map(|p| p.unmeasured.len()),
+            Some(36),
+            "the 36 ranges survive the reopen"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

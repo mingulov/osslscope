@@ -995,6 +995,23 @@ fn render_serve_exposition(qp: &QueuedPush, window_fallback_secs: u64) -> String
 #[cfg(test)]
 thread_local! { static FAIL_NEXT_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
+/// Test-only shutdown-report capture (P2fix12 NEW-70): serve
+/// pushes its shutdown-flush report line here AND to stderr
+/// (the test harness captures `eprintln!` output globally, so
+/// fd-level capture cannot observe the report — this buffer
+/// is the observable half; production output is unchanged).
+/// A static (serve reports off-thread — a thread-local would
+/// strand the line on the serve thread).
+#[cfg(test)]
+static SHUTDOWN_REPORT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Drain captured shutdown-report lines (P2fix12 NEW-70 —
+/// test-only).
+#[cfg(test)]
+pub(crate) fn take_shutdown_reports() -> Vec<String> {
+    SHUTDOWN_REPORT.lock().unwrap().drain(..).collect()
+}
+
 /// Export-loop refresh state (P2fix3 NEW-9): the budget,
 /// accumulation starts, and generation tracker live here so the
 /// first-refresh sequence (restore → compare → admit →
@@ -1114,12 +1131,15 @@ fn refresh_once(presenter: &mut Presenter, state: &mut RefreshState) -> Result<Q
 /// after its last refresh. It must persist WITHOUT folding newly
 /// landed windows (a fresh fold without admission would commit a
 /// new watermark beside a stale admission — the shutdown bypass).
-fn shutdown_flush(presenter: &mut Presenter) {
+/// The flush result REPORTS (P2fix12 NEW-70 — a failed shutdown
+/// persist is durability loss, never a silent discard: the
+/// caller surfaces it to the operator).
+fn shutdown_flush(presenter: &mut Presenter) -> std::io::Result<()> {
     // Flush ONLY (P2fix5 NEW-22 — the old final build folded
     // newly landed windows without admission, checkpointing a new
     // watermark beside a stale admission; the next open folds
     // those windows normally, so nothing is lost).
-    let _ = presenter.flush_checkpoint();
+    presenter.flush_checkpoint()
 }
 
 /// Serve until `stop` is set (export loop with shared admission +
@@ -1213,8 +1233,10 @@ pub fn serve_with_shutdown(
             // Shutdown flush (P2fix2 item 13, P2fix5 NEW-22):
             // persist WITHOUT folding (the checkpoint write is
             // the point — a fresh fold without admission is the
-            // shutdown bypass).
-            shutdown_flush(&mut presenter);
+            // shutdown bypass). The result REPORTS (P2fix12
+            // NEW-70 — the collector returns it; serve logs it
+            // loudly below).
+            shutdown_flush(&mut presenter)
         })
     };
     let mut last_push = std::time::Instant::now();
@@ -1272,11 +1294,23 @@ pub fn serve_with_shutdown(
     }
     // Join the collector (it ran the shutdown flush above),
     // then close the handoff (the worker drains-then-ends with
-    // accounting) and join it.
-    let _ = collector.join();
+    // accounting) and join it. A failed shutdown flush reports
+    // LOUDLY on stderr (P2fix12 NEW-70 — durability loss
+    // reaches the operator, never a silent discard) and serve
+    // still exits SUCCESS (outages are routine — serve kept
+    // serving last-good throughout; the exit code signals
+    // serve health, and the stderr line carries the persist
+    // failure).
+    let shutdown = collector.join().unwrap_or(Ok(()));
     handoff.close();
     if let Some(worker) = worker {
         let _ = worker.join();
+    }
+    if let Err(e) = shutdown {
+        let line = format!("osslscope: shutdown checkpoint flush failed: {e}");
+        eprintln!("{line}");
+        #[cfg(test)]
+        SHUTDOWN_REPORT.lock().unwrap().push(line);
     }
     ExitCode::SUCCESS
 }
@@ -1711,7 +1745,7 @@ mod tests {
             serde_json::to_string(&snapshot::test_envelope(1, 0, run, 10)).unwrap(),
         )
         .unwrap();
-        shutdown_flush(&mut p);
+        shutdown_flush(&mut p).expect("the shutdown flush succeeds");
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
         assert_eq!(
             v["watermark_seq"], 0,
@@ -1878,7 +1912,7 @@ mod tests {
                 refresh_once(&mut p, &mut state).is_err(),
                 "the injected commit failure must fail the refresh"
             );
-            shutdown_flush(&mut p);
+            shutdown_flush(&mut p).expect("the shutdown flush succeeds");
         }
         // The checkpoint file still carries the committed values
         // (no null-overwrite of admission/starts).
@@ -3330,5 +3364,230 @@ mod tests {
         assert!(!out.pushed);
         assert_eq!(calls, 0);
         assert!(out.note.unwrap().contains("deadline"));
+    }
+
+    #[test]
+    fn new70_shutdown_flush_failure_reports() {
+        // P2fix12 NEW-70 (+ NEW-9-OPEN): a shutdown flush that
+        // FAILS reports its error (no silent discard) — the
+        // shutdown path returns the failure to its caller
+        // instead of dropping it. Pre-fix: `shutdown_flush`
+        // returns `()` and the EACCES vanishes (RED —
+        // compile-RED on the `()` type, then a value-RED on
+        // the missing error).
+        use super::super::snapshot;
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix12-new70-shutdown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        // Sibling checkpoint dir (OUTSIDE the out-DIR —
+        // placement) with a read-only gate for the failure arm.
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("ckpt.json");
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::default();
+        refresh_once(&mut p, &mut state).expect("first refresh commits");
+        // Success reports success.
+        super::shutdown_flush(&mut p).expect("a writable shutdown flush succeeds");
+        // Failure reports failure (read-only checkpoint dir —
+        // staging cannot create).
+        std::fs::set_permissions(&ckpt_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = super::shutdown_flush(&mut p)
+            .expect_err("a failing shutdown flush must report its error");
+        assert!(
+            format!("{err:?}").contains("Permission denied")
+                || format!("{err:?}").contains("EACCES")
+                || err.raw_os_error() == Some(libc::EACCES),
+            "the reported error names the failure: {err:?}"
+        );
+        std::fs::set_permissions(&ckpt_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new70_serve_shutdown_flush_failure_reports() {
+        // P2fix12 NEW-70 (+ NEW-9-OPEN — the serve boundary):
+        // a shutdown flush that fails REPORTS loudly (the
+        // exact stderr line, captured in the test-only buffer
+        // — the harness captures `eprintln!` globally, so the
+        // buffer is the observable half) while serve still
+        // exits SUCCESS (outages are routine — the
+        // outage-shutdown contract stays green). Pre-fix: no
+        // shutdown report exists (RED).
+        use super::super::snapshot;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::{Arc, atomic::AtomicBool};
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix12-new70-serve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        // Sibling checkpoint dir (OUTSIDE the out-DIR —
+        // placement), read-only BEFORE serve starts: every
+        // refresh fails (outage — serve survives) and the
+        // shutdown flush fails.
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let checkpoint = ckpt_dir.join("ckpt.json");
+        std::fs::set_permissions(&ckpt_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            port
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let out = dir.clone();
+        let _ = super::take_shutdown_reports();
+        let handle = std::thread::spawn(move || {
+            serve_with_shutdown(
+                Options {
+                    out,
+                    listen: format!("127.0.0.1:{port}"),
+                    poll_secs: 1,
+                    otlp: None,
+                    checkpoint: Some(checkpoint),
+                },
+                stop2,
+                None,
+            )
+        });
+        // A couple of failed ticks (outage), then stop.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let code = handle.join().unwrap();
+        std::fs::set_permissions(&ckpt_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            code,
+            std::process::ExitCode::SUCCESS,
+            "serve stays outage-compatible"
+        );
+        let reports = super::take_shutdown_reports();
+        assert!(
+            reports
+                .iter()
+                .any(|l| l.contains("osslscope: shutdown checkpoint flush failed")),
+            "the shutdown failure reports loudly: {reports:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new70_failed_refresh_then_retention_reopen_recovers() {
+        // P2fix12 NEW-70 (+ NEW-2/NEW-33-OPEN): a FAILED
+        // refresh (injected commit failure) followed by a
+        // restart AFTER retention removed already-folded
+        // windows (seq ≤ watermark — allowed) reopens on the
+        // last committed checkpoint and folds the retained
+        // suffix as best-prefix (gap flagged, ranges
+        // recorded — the §6C-1c retention contract). Guard
+        // (the behavior holds; the failed-refresh + retention
+        // + reopen sequence is the new coverage).
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix12-new70-retention-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        for seq in 0..3u64 {
+            std::fs::write(
+                dir.join(format!("window-{seq:010}.json")),
+                serde_json::to_string(&snapshot::test_envelope(seq, 0, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+        }
+        let ckpt = std::path::PathBuf::from(format!("{}.checkpoint.json", dir.display()));
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::default();
+        refresh_once(&mut p, &mut state).expect("first refresh commits watermark 2");
+        let file_before = std::fs::read(&ckpt).unwrap();
+        // Retention removes the already-folded windows (seq ≤
+        // watermark — deleting them loses nothing); a new
+        // fold-pending window lands past a gap.
+        for seq in 0..3u64 {
+            std::fs::remove_file(dir.join(format!("window-{seq:010}.json"))).unwrap();
+        }
+        std::fs::write(
+            dir.join("window-0000000004.json"),
+            serde_json::to_string(&snapshot::test_envelope(4, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        // The next refresh FAILS (injected) — the checkpoint
+        // file keeps the last committed bytes.
+        FAIL_NEXT_COMMIT.with(|f| f.set(true));
+        assert!(
+            refresh_once(&mut p, &mut state).is_err(),
+            "the injected failure fails the refresh"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            file_before,
+            "a failed refresh keeps the committed checkpoint bytes"
+        );
+        // Restart: reopen on the committed checkpoint and
+        // refresh — the retained suffix folds best-prefix.
+        drop(p);
+        drop(state);
+        let mut p2 = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+            .expect("reopen on the committed checkpoint");
+        let mut state2 = RefreshState::restore(&mut p2);
+        let qp = refresh_once(&mut p2, &mut state2).expect("post-reopen refresh recovers");
+        assert_eq!(qp.snap.source.window_seq, Some(4), "the tip advances");
+        assert_eq!(
+            qp.snap.source.generation,
+            Some(0),
+            "same generation across the reopen"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        assert_eq!(
+            body["watermark_seq"],
+            serde_json::json!(4),
+            "the checkpoint advances past the retained suffix"
+        );
+        assert_eq!(
+            body["accumulators"]["trace_unmeasured"],
+            serde_json::json!([[0, 4]]),
+            "the restored span + the retention gap + the folded-but-null tip merge"
+        );
+        assert!(
+            body["accumulators"]["unstable"]
+                .as_array()
+                .is_some_and(|fs| !fs.is_empty()),
+            "the gap flags the epoch"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&ckpt);
     }
 }
