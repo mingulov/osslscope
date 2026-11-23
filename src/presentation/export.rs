@@ -5205,9 +5205,18 @@ mod tests {
         let gate2 = gate_open.clone();
         // Pending post-gate plant (P2fix20 NEW-129 — set
         // by the test thread while quiesced, consumed on
-        // the collector thread at the next tick start).
+        // the collector thread at the next tick start;
+        // capture paths P2fix21 NEW-138).
         let plant_pending: Arc<
-            std::sync::Mutex<Option<(std::path::PathBuf, std::path::PathBuf, String)>>,
+            std::sync::Mutex<
+                Option<(
+                    std::path::PathBuf,
+                    std::path::PathBuf,
+                    String,
+                    std::path::PathBuf,
+                    std::path::PathBuf,
+                )>,
+            >,
         > = Arc::new(std::sync::Mutex::new(None));
         let plant2 = plant_pending.clone();
         super::set_collector_pre_refresh(Some(Arc::new(move || {
@@ -5219,7 +5228,8 @@ mod tests {
             // THIS THREAD (the collector's own
             // thread-local) — the substitution lands
             // AFTER the early gate passes, mid-flush.
-            if let Some((record, aside, shape)) = plant2.lock().unwrap().take() {
+            if let Some((record, aside, shape, checkpoint, capdir)) = plant2.lock().unwrap().take()
+            {
                 snapshot::post_record_gate_hook::arm(move || {
                     std::fs::rename(&record, &aside).unwrap();
                     if shape == "fifo" {
@@ -5238,6 +5248,33 @@ mod tests {
                     } else {
                         std::fs::write(&record, vec![0x41u8; 2 * 1024 * 1024]).unwrap();
                     }
+                    // Capture identity + bytes AT the plant
+                    // (P2fix21 NEW-138 — only the plant
+                    // itself sees the exact objects).
+                    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+                    let md = std::fs::symlink_metadata(&record).unwrap();
+                    let kind = if md.file_type().is_fifo() {
+                        "fifo"
+                    } else if md.file_type().is_file() {
+                        "file"
+                    } else if md.file_type().is_symlink() {
+                        "symlink"
+                    } else {
+                        "other"
+                    };
+                    std::fs::write(
+                        capdir.join("capture-n113-subst-id"),
+                        format!("{kind}:{}:{}", md.dev(), md.ino()),
+                    )
+                    .unwrap();
+                    if shape != "fifo" {
+                        let planted = std::fs::read(&record).unwrap();
+                        std::fs::write(capdir.join("capture-n113-subst-bytes"), &planted).unwrap();
+                    }
+                    let aside_bytes = std::fs::read(&aside).unwrap();
+                    std::fs::write(capdir.join("capture-n113-aside"), &aside_bytes).unwrap();
+                    let target_bytes = std::fs::read(&checkpoint).unwrap();
+                    std::fs::write(capdir.join("capture-n113-target"), &target_bytes).unwrap();
                 });
             }
         })));
@@ -5289,8 +5326,13 @@ mod tests {
             // never planted up front).
             let _quiesced = quiesce();
             let aside = record.with_extension("aside-n113");
-            *plant_pending.lock().unwrap() =
-                Some((record.clone(), aside.clone(), plant.to_string()));
+            *plant_pending.lock().unwrap() = Some((
+                record.clone(),
+                aside.clone(),
+                plant.to_string(),
+                checkpoint.clone(),
+                ckpt_dir.clone(),
+            ));
             let reports_before = super::peek_refresh_reports().len();
             drop(_quiesced);
             // The planting tick fails at the LATE boundary
@@ -5320,9 +5362,50 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
+            // Exact preservation BEFORE restoring
+            // (P2fix21 NEW-138): the substitute, the aside
+            // marker, and the durable target match the
+            // plant-time capture EXACTLY (a swapped fifo
+            // or a same-length rewrite fails here).
+            let _quiesced = quiesce();
+            {
+                use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+                let want_id = std::fs::read(ckpt_dir.join("capture-n113-subst-id")).unwrap();
+                let md = std::fs::symlink_metadata(&record).unwrap();
+                let kind = if md.file_type().is_fifo() {
+                    "fifo"
+                } else if md.file_type().is_file() {
+                    "file"
+                } else if md.file_type().is_symlink() {
+                    "symlink"
+                } else {
+                    "other"
+                };
+                assert_eq!(
+                    format!("{kind}:{}:{}", md.dev(), md.ino()).as_bytes(),
+                    want_id.as_slice(),
+                    "{tag}: the substitute identity matches the plant exactly"
+                );
+                if plant != "fifo" {
+                    assert_eq!(
+                        std::fs::read(&record).unwrap(),
+                        std::fs::read(ckpt_dir.join("capture-n113-subst-bytes")).unwrap(),
+                        "{tag}: the substitute bytes match the plant exactly"
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(&aside).unwrap(),
+                    std::fs::read(ckpt_dir.join("capture-n113-aside")).unwrap(),
+                    "{tag}: the aside marker matches the plant exactly"
+                );
+                assert_eq!(
+                    std::fs::read(&checkpoint).unwrap(),
+                    std::fs::read(ckpt_dir.join("capture-n113-target")).unwrap(),
+                    "{tag}: the durable target matches the plant exactly"
+                );
+            }
             // Restoring the record recovers live ticks
             // (ticks quiesced — never inside a flush).
-            let _quiesced = quiesce();
             std::fs::remove_file(&record).unwrap();
             std::fs::rename(&aside, &record).unwrap();
             drop(_quiesced);
@@ -6106,8 +6189,15 @@ mod tests {
                 // Pending post-gate plants (P2fix20 NEW-129 —
                 // set by this thread, consumed on the
                 // collector thread): one for a refresh
-                // tick, one for the shutdown flush.
-                type PlantSpec = Option<(std::path::PathBuf, std::path::PathBuf, String)>;
+                // tick, one for the shutdown flush
+                // (capture paths P2fix21 NEW-138).
+                type PlantSpec = Option<(
+                    std::path::PathBuf,
+                    std::path::PathBuf,
+                    String,
+                    std::path::PathBuf,
+                    std::path::PathBuf,
+                )>;
                 let tick_plant: Arc<std::sync::Mutex<PlantSpec>> =
                     Arc::new(std::sync::Mutex::new(None));
                 let tick_plant2 = tick_plant.clone();
@@ -6138,7 +6228,7 @@ mod tests {
                                 // hook ON THIS THREAD (the
                                 // collector's own
                                 // thread-local).
-                                if let Some((record, aside, shape)) =
+                                if let Some((record, aside, shape, checkpoint, capdir)) =
                                     tick_plant2.lock().unwrap().take()
                                 {
                                     snapshot::post_record_gate_hook::arm(move || {
@@ -6163,6 +6253,46 @@ mod tests {
                                             std::fs::write(&record, vec![0x41u8; 2 * 1024 * 1024])
                                                 .unwrap();
                                         }
+                                        // Capture identity + bytes AT
+                                        // the plant (P2fix21 NEW-138).
+                                        use std::os::unix::fs::{
+                                            FileTypeExt as _, MetadataExt as _,
+                                        };
+                                        let md = std::fs::symlink_metadata(&record).unwrap();
+                                        let kind = if md.file_type().is_fifo() {
+                                            "fifo"
+                                        } else if md.file_type().is_file() {
+                                            "file"
+                                        } else if md.file_type().is_symlink() {
+                                            "symlink"
+                                        } else {
+                                            "other"
+                                        };
+                                        std::fs::write(
+                                            capdir.join("capture-n122-subst-id"),
+                                            format!("{kind}:{}:{}", md.dev(), md.ino()),
+                                        )
+                                        .unwrap();
+                                        if shape != "fifo" {
+                                            let planted = std::fs::read(&record).unwrap();
+                                            std::fs::write(
+                                                capdir.join("capture-n122-subst-bytes"),
+                                                &planted,
+                                            )
+                                            .unwrap();
+                                        }
+                                        let aside_bytes = std::fs::read(&aside).unwrap();
+                                        std::fs::write(
+                                            capdir.join("capture-n122-aside"),
+                                            &aside_bytes,
+                                        )
+                                        .unwrap();
+                                        let target_bytes = std::fs::read(&checkpoint).unwrap();
+                                        std::fs::write(
+                                            capdir.join("capture-n122-target"),
+                                            &target_bytes,
+                                        )
+                                        .unwrap();
                                     });
                                 }
                             })),
@@ -6174,7 +6304,7 @@ mod tests {
                                 // arming (runs once, on this
                                 // thread, before the
                                 // shutdown flush).
-                                if let Some((record, aside, shape)) =
+                                if let Some((record, aside, shape, checkpoint, capdir)) =
                                     shutdown_plant2.lock().unwrap().take()
                                 {
                                     snapshot::post_record_gate_hook::arm(move || {
@@ -6215,6 +6345,40 @@ mod tests {
                                             std::fs::write(&record, vec![0x41u8; 2 * 1024 * 1024])
                                                 .unwrap();
                                         }
+                                        // Capture identity + bytes AT
+                                        // the plant (P2fix21 NEW-138).
+                                        use std::os::unix::fs::{
+                                            FileTypeExt as _, MetadataExt as _,
+                                        };
+                                        let md = std::fs::symlink_metadata(&record).unwrap();
+                                        let kind = if md.file_type().is_fifo() {
+                                            "fifo"
+                                        } else if md.file_type().is_file() {
+                                            "file"
+                                        } else if md.file_type().is_symlink() {
+                                            "symlink"
+                                        } else {
+                                            "other"
+                                        };
+                                        std::fs::write(
+                                            capdir.join("capture-n122-subst-id"),
+                                            format!("{kind}:{}:{}", md.dev(), md.ino()),
+                                        )
+                                        .unwrap();
+                                        if shape != "fifo" {
+                                            let planted = std::fs::read(&record).unwrap();
+                                            std::fs::write(
+                                                capdir.join("capture-n122-subst-bytes"),
+                                                &planted,
+                                            )
+                                            .unwrap();
+                                        }
+                                        let target_bytes = std::fs::read(&checkpoint).unwrap();
+                                        std::fs::write(
+                                            capdir.join("capture-n122-target"),
+                                            &target_bytes,
+                                        )
+                                        .unwrap();
                                     });
                                 }
                             })),
@@ -6238,7 +6402,6 @@ mod tests {
                     );
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-                let durable_before = std::fs::read(&checkpoint).unwrap();
                 // Quiesce helper (the instance counter
                 // stable for 200ms means no flush runs —
                 // each arming/restore below quiesces
@@ -6280,8 +6443,13 @@ mod tests {
                 // BOUNDARY (observed via the PRODUCTION
                 // diagnostic in our own capture).
                 let _quiesced = quiesce();
-                *tick_plant.lock().unwrap() =
-                    Some((record.clone(), aside.clone(), plant.to_string()));
+                *tick_plant.lock().unwrap() = Some((
+                    record.clone(),
+                    aside.clone(),
+                    plant.to_string(),
+                    checkpoint.clone(),
+                    ckpt_dir.clone(),
+                ));
                 let lines_before = sink.lock().unwrap().len();
                 drop(_quiesced);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -6311,11 +6479,51 @@ mod tests {
                     );
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
+                // Exact preservation BEFORE restoring
+                // (P2fix21 NEW-138): the substitute, the
+                // aside marker, and the durable target
+                // match the plant-time capture EXACTLY.
+                let _quiesced = quiesce();
+                {
+                    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+                    let want_id = std::fs::read(ckpt_dir.join("capture-n122-subst-id")).unwrap();
+                    let md = std::fs::symlink_metadata(&record).unwrap();
+                    let kind = if md.file_type().is_fifo() {
+                        "fifo"
+                    } else if md.file_type().is_file() {
+                        "file"
+                    } else if md.file_type().is_symlink() {
+                        "symlink"
+                    } else {
+                        "other"
+                    };
+                    assert_eq!(
+                        format!("{kind}:{}:{}", md.dev(), md.ino()).as_bytes(),
+                        want_id.as_slice(),
+                        "{tag}: the substitute identity matches the plant exactly"
+                    );
+                    if plant != "fifo" {
+                        assert_eq!(
+                            std::fs::read(&record).unwrap(),
+                            std::fs::read(ckpt_dir.join("capture-n122-subst-bytes")).unwrap(),
+                            "{tag}: the substitute bytes match the plant exactly"
+                        );
+                    }
+                    assert_eq!(
+                        std::fs::read(&aside).unwrap(),
+                        std::fs::read(ckpt_dir.join("capture-n122-aside")).unwrap(),
+                        "{tag}: the aside marker matches the plant exactly"
+                    );
+                    assert_eq!(
+                        std::fs::read(&checkpoint).unwrap(),
+                        std::fs::read(ckpt_dir.join("capture-n122-target")).unwrap(),
+                        "{tag}: the durable target matches the plant exactly"
+                    );
+                }
                 // Restoring the record recovers clean ticks
                 // (ticks advance with the capture quiet —
                 // every failure would log, so quiet +
                 // advancing ticks are clean).
-                let _quiesced = quiesce();
                 std::fs::remove_file(&record).unwrap();
                 std::fs::rename(&aside, &record).unwrap();
                 drop(_quiesced);
@@ -6345,8 +6553,13 @@ mod tests {
                 // loud late refusal, exit SUCCESS (serve
                 // health — the stderr line carries the
                 // persist failure).
-                *shutdown_plant.lock().unwrap() =
-                    Some((record.clone(), aside.clone(), plant.to_string()));
+                *shutdown_plant.lock().unwrap() = Some((
+                    record.clone(),
+                    aside.clone(),
+                    plant.to_string(),
+                    checkpoint.clone(),
+                    ckpt_dir.clone(),
+                ));
                 stop.store(true, Ordering::Relaxed);
                 let code = rx
                     .recv_timeout(std::time::Duration::from_secs(10))
@@ -6374,24 +6587,38 @@ mod tests {
                             && l.contains("changed after the gate")),
                     "{tag}: the production shutdown diagnostic reports the late boundary: {lines:?}"
                 );
-                // Every object preserved: the substitute
-                // stands, the aside record is intact, and the
-                // durable target never moved.
-                if plant == "fifo" {
-                    use std::os::unix::fs::FileTypeExt as _;
-                    assert!(
-                        std::fs::symlink_metadata(&record)
-                            .unwrap()
-                            .file_type()
-                            .is_fifo(),
-                        "{tag}: the FIFO stands"
-                    );
-                } else {
+                // Every object preserved EXACTLY (P2fix21
+                // NEW-138): the substitute, the aside
+                // marker, and the durable target match the
+                // plant-time capture byte-for-byte (a
+                // swapped fifo or a same-length rewrite
+                // fails here — the old type/length checks
+                // could not see them).
+                {
+                    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+                    let want_id = std::fs::read(ckpt_dir.join("capture-n122-subst-id")).unwrap();
+                    let md = std::fs::symlink_metadata(&record).unwrap();
+                    let kind = if md.file_type().is_fifo() {
+                        "fifo"
+                    } else if md.file_type().is_file() {
+                        "file"
+                    } else if md.file_type().is_symlink() {
+                        "symlink"
+                    } else {
+                        "other"
+                    };
                     assert_eq!(
-                        std::fs::read(&record).unwrap().len(),
-                        2 * 1024 * 1024,
-                        "{tag}: the oversize substitute stands"
+                        format!("{kind}:{}:{}", md.dev(), md.ino()).as_bytes(),
+                        want_id.as_slice(),
+                        "{tag}: the substitute identity matches the plant exactly"
                     );
+                    if plant != "fifo" {
+                        assert_eq!(
+                            std::fs::read(&record).unwrap(),
+                            std::fs::read(ckpt_dir.join("capture-n122-subst-bytes")).unwrap(),
+                            "{tag}: the substitute bytes match the plant exactly"
+                        );
+                    }
                 }
                 // The aside record survives byte-identical
                 // to the exact pre-plant bytes (snapshotted
@@ -6407,22 +6634,14 @@ mod tests {
                     std::fs::read(aside.with_file_name(moved_name)).unwrap(),
                     "{tag}: the aside record survives byte-identical"
                 );
-                // The durable target keeps its VALUES (later
-                // ticks legitimately re-commit with a new
-                // sequence — only the values bind).
-                let durable_after: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap();
-                let durable_before: serde_json::Value =
-                    serde_json::from_slice(&durable_before).unwrap();
-                for key in ["calls_total", "lanes"] {
-                    assert_eq!(
-                        durable_after["accumulators"][key], durable_before["accumulators"][key],
-                        "{tag}: the durable {key} never moved"
-                    );
-                }
+                // The durable target matches the
+                // shutdown-plant capture byte-identical
+                // (no commit ran between the plant and
+                // this check — the shutdown flush failed).
                 assert_eq!(
-                    durable_after["watermark_seq"], durable_before["watermark_seq"],
-                    "{tag}: the durable watermark never moved"
+                    std::fs::read(&checkpoint).unwrap(),
+                    std::fs::read(ckpt_dir.join("capture-n122-target")).unwrap(),
+                    "{tag}: the durable target matches the plant exactly"
                 );
                 // Restore + exact reopen (the shutdown persist
                 // failed, so the last commit stands).
@@ -7178,6 +7397,246 @@ mod tests {
     }
 
     #[test]
+    fn new135_no_entry_failure_carries_no_decision() {
+        // P2fix21 NEW-135 (explicit durably-verified entry
+        // transition): a no-entry refresh whose staged
+        // flush fails at the post-decision cleanup (the
+        // prior marker restored at the boundary) carries
+        // NOTHING back — live's record, directory
+        // bindings, and fold still match the PRIOR (final
+        // decision state never crosses on failure). The
+        // next refresh refuses at the fused gate (the
+        // target no longer carries the settled prior),
+        // never at continuity — and reopen agrees with
+        // last-good. Pre-fix: live's record advances to
+        // the failed decision while its fold stays at the
+        // prior, and the next refresh refuses at
+        // continuity (RED).
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix21-new135-no-carry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("n135.json");
+        let record = ckpt_dir.join(snapshot::SETTLED_DIR_NAME).join("n135.json");
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::restore(&mut p);
+        refresh_once(&mut p, &mut state).expect("first refresh commits");
+        let prior_record = std::fs::read(&record).unwrap();
+        let prior_marker_dir = p.test_marker_dir_id();
+        let prior_parent = p.test_checkpoint_parent_id();
+        assert_eq!(
+            p.test_verified_record_bytes().as_ref(),
+            Some(&prior_record),
+            "premise: live binds the prior record"
+        );
+        std::fs::write(
+            dir.join("window-0000000001.json"),
+            serde_json::to_string(&snapshot::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        // At the post-decision cleanup boundary, the old
+        // authority returns (no entry ran — the slot held
+        // the prior throughout).
+        let aside = record.with_extension("aside-n135");
+        let (record2, prior2, aside2) = (record.clone(), prior_record.clone(), aside.clone());
+        snapshot::pre_cleanup_hook::arm(move || {
+            let ours = std::fs::read(&record2).unwrap();
+            std::fs::write(&aside2, &ours).unwrap();
+            std::fs::write(&record2, &prior2).unwrap();
+        });
+        let err = match refresh_once(&mut p, &mut state) {
+            Ok(_) => panic!("authority loss fails the refresh (never publishes)"),
+            Err(e) => e,
+        };
+        snapshot::pre_cleanup_hook::disarm();
+        assert!(
+            err.contains("lost its settlement authority"),
+            "the failure names the authority loss: {err:?}"
+        );
+        assert!(aside.is_file(), "premise: the hook ran at the boundary");
+        // Live still matches the PRIOR: record, directory
+        // bindings, and fold (nothing crossed).
+        assert_eq!(
+            p.test_verified_record_bytes().as_ref(),
+            Some(&prior_record),
+            "live's record still matches the prior"
+        );
+        assert_eq!(
+            p.test_marker_dir_id(),
+            prior_marker_dir,
+            "live's marker binding is unchanged"
+        );
+        assert_eq!(
+            p.test_checkpoint_parent_id(),
+            prior_parent,
+            "live's parent binding is unchanged"
+        );
+        assert_eq!(p.folded_tip(), (Some(0), Some(0)), "live tip frozen");
+        assert_eq!(p.fold_totals(), (10, [10, 0, 0, 0]), "live totals frozen");
+        // The next refresh refuses at the fused gate (the
+        // target carries the orphaned new bytes, not the
+        // settled prior) — never at continuity.
+        let err2 = match refresh_once(&mut p, &mut state) {
+            Ok(_) => panic!("the orphaned target refuses at the gate"),
+            Err(e) => e,
+        };
+        assert!(
+            err2.contains("no longer carries the settled checkpoint"),
+            "the retry refuses at the gate, not continuity: {err2:?}"
+        );
+        // Reopen AGREES with last-good (the governing
+        // prior record adopts the preserved prior).
+        drop(state);
+        let q = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+            .expect("reopen converges");
+        assert_eq!(q.folded_tip(), (Some(0), Some(0)), "reopen tip agrees");
+        assert_eq!(q.fold_totals(), (10, [10, 0, 0, 0]), "reopen totals agree");
+        drop(q);
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new127_public_mid_removal_loss_preserves_prior() {
+        // P2fix21 NEW-127 (public mid-removal pin): a
+        // refresh whose staged flush loses authority
+        // MID-REMOVAL (the valid prior marker restored
+        // inside the data cleanup's trash interval) fails
+        // WITHOUT removal — the displaced prior restores
+        // to its stage name, live last-good stays EXACT
+        // at the prior (record, bindings, and fold), and
+        // reopen agrees with last-good exactly.
+        // Pre-fix: the prior is already removed when the
+        // loss is detected (RED).
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix21-new127-mid-removal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("n127c.json");
+        let record = ckpt_dir.join(snapshot::SETTLED_DIR_NAME).join("n127c.json");
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::restore(&mut p);
+        refresh_once(&mut p, &mut state).expect("first refresh commits");
+        let prior_bytes = std::fs::read(&ckpt).unwrap();
+        let prior_record = std::fs::read(&record).unwrap();
+        let prior_marker_dir = p.test_marker_dir_id();
+        std::fs::write(
+            dir.join("window-0000000001.json"),
+            serde_json::to_string(&snapshot::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        // Restore the VALID prior marker for the DATA
+        // cleanup removal ONLY (earlier removals re-arm).
+        fn arm_at_data_cleanup(
+            record: std::path::PathBuf,
+            prior: Vec<u8>,
+            data_dir: std::path::PathBuf,
+        ) {
+            snapshot::unlink_trash_hook::arm(move || {
+                let data_trash = std::fs::read_dir(&data_dir)
+                    .unwrap()
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().contains(".staging-trash-"));
+                if data_trash {
+                    std::fs::write(&record, &prior).unwrap();
+                } else {
+                    arm_at_data_cleanup(record, prior, data_dir);
+                }
+            });
+        }
+        arm_at_data_cleanup(record.clone(), prior_record.clone(), ckpt_dir.clone());
+        let err = match refresh_once(&mut p, &mut state) {
+            Ok(_) => panic!("a mid-removal authority loss fails the refresh"),
+            Err(e) => e,
+        };
+        snapshot::unlink_trash_hook::disarm();
+        assert!(
+            err.contains("during the prior-bytes cleanup"),
+            "the failure names the during-removal loss: {err:?}"
+        );
+        // The displaced prior RESTORES to its stage name;
+        // the new payload stands at the target.
+        let stages: Vec<_> = std::fs::read_dir(&ckpt_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".staging-") && !n.contains(".staging-trash-"))
+            .collect();
+        assert_eq!(
+            stages.len(),
+            1,
+            "one prior stage stands restored: {stages:?}"
+        );
+        assert_eq!(
+            std::fs::read(ckpt_dir.join(&stages[0])).unwrap(),
+            prior_bytes,
+            "the prior payload survives byte-identical"
+        );
+        assert_ne!(
+            std::fs::read(&ckpt).unwrap(),
+            prior_bytes,
+            "the new payload stands at the target"
+        );
+        // Live last-good stays EXACT at the prior
+        // (record, bindings, and fold — nothing crossed).
+        assert_eq!(
+            p.test_verified_record_bytes().as_ref(),
+            Some(&prior_record),
+            "live's record still matches the prior"
+        );
+        assert_eq!(
+            p.test_marker_dir_id(),
+            prior_marker_dir,
+            "live's marker binding is unchanged"
+        );
+        assert_eq!(p.folded_tip(), (Some(0), Some(0)), "live tip frozen");
+        assert_eq!(p.fold_totals(), (10, [10, 0, 0, 0]), "live totals frozen");
+        // Reopen AGREES with last-good exactly.
+        drop(state);
+        let q = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+            .expect("reopen converges");
+        assert_eq!(q.folded_tip(), (Some(0), Some(0)), "reopen tip agrees");
+        assert_eq!(q.fold_totals(), (10, [10, 0, 0, 0]), "reopen totals agree");
+        assert!(
+            q.recovered_unsettled_prior(),
+            "the reopen reports the marker-bound recovery"
+        );
+        drop(q);
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
     fn new133_namespace_replacement_after_entry_refuses() {
         // P2fix20 NEW-133 (entry record + directory binding
         // carried together): a failed staged flush that
@@ -7320,6 +7779,66 @@ mod tests {
             .expect("reopen on the committed tree");
         assert_eq!(q.folded_tip(), (Some(0), Some(1)), "the new tip stands");
         assert_eq!(q.fold_totals(), (20, [20, 0, 0, 0]), "the new totals stand");
+        assert!(
+            !q.recovered_unsettled_prior(),
+            "a settled commit reopens directly (no recovery)"
+        );
+        drop(q);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new135_failed_entry_carries_nothing_retry_commits() {
+        // P2fix21 NEW-135 (Tier-1 adjacent edge — only a
+        // DURABLE entry transitions): a first refresh
+        // whose entry commit fails (marker-dir sync
+        // fault) carries nothing back — the slot stands
+        // restored-absent, the same-instance retry
+        // commits whole, and reopen is exact. (Only the
+        // landed entry sets the transition.)
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix21-new135-failed-entry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("n135b.json");
+        let record = ckpt_dir.join(snapshot::SETTLED_DIR_NAME).join("n135b.json");
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::restore(&mut p);
+        snapshot::marker_sync_fault::arm(1);
+        let first = refresh_once(&mut p, &mut state);
+        snapshot::marker_sync_fault::arm(0);
+        assert!(first.is_err(), "premise: the faulted entry fails");
+        assert!(
+            !record.is_file(),
+            "the failed entry restores the absent slot"
+        );
+        assert_eq!(
+            p.test_verified_record_bytes(),
+            None,
+            "live verified nothing (no carry)"
+        );
+        refresh_once(&mut p, &mut state).expect("the retry commits");
+        drop(state);
+        drop(p);
+        let q = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+            .expect("reopen on the committed tree");
+        assert_eq!(q.folded_tip(), (Some(0), Some(0)), "the tip stands");
+        assert_eq!(q.fold_totals(), (10, [10, 0, 0, 0]), "the totals stand");
         assert!(
             !q.recovered_unsettled_prior(),
             "a settled commit reopens directly (no recovery)"
