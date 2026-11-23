@@ -576,6 +576,177 @@ mod tests {
     }
 
     #[test]
+    fn new121_fifo_out_refuses_promptly_at_watch_startup() {
+        // P2fix19 NEW-121 (bounded producer-path open at
+        // watch startup): an existing checkpoint parent +
+        // a FIFO at `--out` refuses BOUNDEDLY (exit 1 —
+        // the producer directory opens nonblocking, never
+        // wedging on the FIFO) — never a hung startup.
+        // Pre-fix: the blocking open hangs (RED — the
+        // bounded wait expires). Controls: an ordinary
+        // directory renders one frame (exit 0), and an
+        // absent checkpoint parent takes the fresh path
+        // (no hang for a FIFO either — the frame then
+        // fails only on persist, exit 1, identically for
+        // both out kinds).
+        let base = std::env::temp_dir().join(format!(
+            "p2fix19-new121-watch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        // A FIFO at `--out`, checkpoint parent existing.
+        let fifo = base.join("out-fifo");
+        // SAFETY: mkfifo on a fresh private path.
+        assert_eq!(
+            unsafe {
+                libc::mkfifo(
+                    std::ffi::CString::new(fifo.to_str().unwrap())
+                        .unwrap()
+                        .as_ptr(),
+                    0o600,
+                )
+            },
+            0
+        );
+        let ckpt_dir = base.join("ckptdir");
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("n121.json");
+        let args = vec![
+            "watch".to_string(),
+            "--out".to_string(),
+            fifo.display().to_string(),
+            "--checkpoint".to_string(),
+            ckpt.display().to_string(),
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let code = super::run(&args);
+            let _ = tx.send(code);
+        });
+        let code = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("watch startup refuses within the bound (never hangs)");
+        assert_eq!(
+            code,
+            std::process::ExitCode::from(1),
+            "a FIFO producer path refuses at startup"
+        );
+        // Control: an ordinary directory renders one
+        // frame (non-TTY — exit 0).
+        let dir = base.join("out-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ckpt2 = ckpt_dir.join("n121b.json");
+        let code = super::run(&[
+            "watch".to_string(),
+            "--out".to_string(),
+            dir.display().to_string(),
+            "--checkpoint".to_string(),
+            ckpt2.display().to_string(),
+        ]);
+        assert_eq!(
+            code,
+            std::process::ExitCode::SUCCESS,
+            "an ordinary directory starts"
+        );
+        // Control: an absent checkpoint parent takes the
+        // fresh path — the FIFO causes no hang there (the
+        // frame then fails to persist, exit 1, identically
+        // for a FIFO and an ordinary directory — the
+        // failure is the missing parent, never the open).
+        for (tag, out) in [("fifo", fifo.clone()), ("ordinary", dir.clone())] {
+            let ckpt3 = base.join(format!("no-such-{tag}")).join("n121c.json");
+            let args = vec![
+                "watch".to_string(),
+                "--out".to_string(),
+                out.display().to_string(),
+                "--checkpoint".to_string(),
+                ckpt3.display().to_string(),
+            ];
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let code = super::run(&args);
+                let _ = tx.send(code);
+            });
+            let code = rx
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the fresh path never hangs");
+            assert_eq!(
+                code,
+                std::process::ExitCode::from(1),
+                "{tag}: an absent checkpoint parent fails only on persist"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new121_symlinked_out_resolves_regular_file_refuses() {
+        // P2fix19 NEW-121 (Tier-1 adjacent edge — neighboring
+        // out kinds): a symlink to a directory still
+        // resolves (exit 0 — only the object kind binds,
+        // never the path spelling), while a regular file at
+        // `--out` refuses promptly (exit 1 — ENOTDIR, never
+        // a hang).
+        let base = std::env::temp_dir().join(format!(
+            "p2fix19-new121-kinds-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let ckpt_dir = base.join("ckptdir");
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let dir = base.join("out-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = base.join("out-link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let file = base.join("out-file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        // The symlink resolves (one frame, exit 0).
+        let code = super::run(&[
+            "watch".to_string(),
+            "--out".to_string(),
+            link.display().to_string(),
+            "--checkpoint".to_string(),
+            ckpt_dir.join("n121d.json").display().to_string(),
+        ]);
+        assert_eq!(
+            code,
+            std::process::ExitCode::SUCCESS,
+            "a symlinked out-DIR resolves"
+        );
+        // The regular file refuses promptly (bounded —
+        // never a hang).
+        let args = vec![
+            "watch".to_string(),
+            "--out".to_string(),
+            file.display().to_string(),
+            "--checkpoint".to_string(),
+            ckpt_dir.join("n121e.json").display().to_string(),
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let code = super::run(&args);
+            let _ = tx.send(code);
+        });
+        let code = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("a regular-file out-DIR refuses within the bound");
+        assert_eq!(
+            code,
+            std::process::ExitCode::from(1),
+            "a regular-file out-DIR refuses"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn new73_unstable_line_never_hits_the_bound() {
         // P2fix12 NEW-73 (sibling-line guard): the closed
         // 8-word flag vocabulary caps the `prev-unstable` line

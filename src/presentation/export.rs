@@ -46,6 +46,24 @@ pub struct Options {
     pub poll_secs: u64,
     pub otlp: Option<OtlpConfig>,
     pub checkpoint: Option<PathBuf>,
+    /// Per-instance pre-refresh hook (P2fix19 NEW-122,
+    /// test-only): invoked on the COLLECTOR thread before
+    /// every `refresh_once` — like the global
+    /// `COLLECTOR_PRE_REFRESH`, but scoped to THIS serve
+    /// instance (parallel tests cannot consume each
+    /// other's hooks). `None` (the default) falls back to
+    /// the global hook; production never sets either.
+    #[cfg(test)]
+    pub pre_refresh: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Per-instance production-diagnostic capture (P2fix19
+    /// NEW-122, test-only): every serve diagnostic this
+    /// instance emits on stderr is ALSO pushed here (the
+    /// SAME production strings — the pin observes the
+    /// production diagnostic, never a test-only report
+    /// string). `None` (the default) emits stderr only;
+    /// production never sets it.
+    #[cfg(test)]
+    pub diagnostic_sink: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +144,10 @@ fn parse(args: &[String]) -> Result<Options, ()> {
         poll_secs,
         otlp,
         checkpoint,
+        #[cfg(test)]
+        pre_refresh: None,
+        #[cfg(test)]
+        diagnostic_sink: None,
     })
 }
 
@@ -1155,6 +1177,16 @@ fn refresh_once(presenter: &mut Presenter, state: &mut RefreshState) -> Result<Q
             // refresh instead of stalling on last-good.
             let pending = staged.take_pending_recovery();
             presenter.adopt_pending_recovery(pending);
+            // Verified durable entry transition (P2fix19
+            // NEW-117): the staged presenter may have
+            // committed an entry (migration or fresh
+            // authority — durable by its sync) before the
+            // failure — carry ONLY that transition back
+            // (staged fold and admission stay unadvanced),
+            // so the next refresh does not mistake its
+            // own self-written marker for a namespace
+            // conflict.
+            presenter.adopt_entry_transition(&staged);
             return Err(format!("osslscope: checkpoint flush: {e}"));
         }
     };
@@ -1219,6 +1251,14 @@ pub fn serve_with_shutdown(
         .checkpoint
         .clone()
         .unwrap_or_else(|| checkpoint_default(&opts.out));
+    // Per-instance test capture (P2fix19 NEW-122,
+    // test-only): every production diagnostic below ALSO
+    // lands here (the SAME strings — the pin observes
+    // production output, never a test-only report).
+    #[cfg(test)]
+    let diagnostic_sink = opts.diagnostic_sink.clone();
+    #[cfg(test)]
+    let pre_refresh = opts.pre_refresh.clone();
     let window_fallback_secs = super::snapshot::WINDOW_SECS_FALLBACK;
     let mut presenter = match Presenter::open_with_checkpoint(
         &opts.out,
@@ -1228,19 +1268,34 @@ pub fn serve_with_shutdown(
     ) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("osslscope: {e}");
+            let line = format!("osslscope: {e}");
+            eprintln!("{line}");
+            #[cfg(test)]
+            if let Some(sink) = diagnostic_sink.as_ref() {
+                sink.lock().unwrap().push(line);
+            }
             return ExitCode::from(1);
         }
     };
     let listener = match TcpListener::bind(opts.listen.as_str()) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("osslscope: listen {}: {e}", opts.listen);
+            let line = format!("osslscope: listen {}: {e}", opts.listen);
+            eprintln!("{line}");
+            #[cfg(test)]
+            if let Some(sink) = diagnostic_sink.as_ref() {
+                sink.lock().unwrap().push(line);
+            }
             return ExitCode::from(1);
         }
     };
     if let Err(e) = listener.set_nonblocking(true) {
-        eprintln!("osslscope: listen: {e}");
+        let line = format!("osslscope: listen: {e}");
+        eprintln!("{line}");
+        #[cfg(test)]
+        if let Some(sink) = diagnostic_sink.as_ref() {
+            sink.lock().unwrap().push(line);
+        }
         return ExitCode::from(1);
     }
     // Push worker (off the scrape path; only when OTLP configured).
@@ -1270,14 +1325,24 @@ pub fn serve_with_shutdown(
         let last_good = last_good.clone();
         #[cfg(test)]
         let tick_tag = tick_tag.clone();
+        #[cfg(test)]
+        let diagnostic_sink = diagnostic_sink.clone();
+        #[cfg(test)]
+        let pre_refresh = pre_refresh.clone();
         std::thread::spawn(move || {
             let mut state = RefreshState::restore(&mut presenter);
             loop {
                 // Pre-refresh hook (P2fix18 NEW-113,
                 // test-only — the public pin arms faults and
-                // gates ticks from the consuming thread).
+                // gates ticks from the consuming thread;
+                // P2fix19 NEW-122 — the instance hook wins
+                // when set, so parallel tests never consume
+                // each other's hooks).
                 #[cfg(test)]
-                if let Some(hook) = COLLECTOR_PRE_REFRESH.lock().unwrap().clone() {
+                if let Some(hook) = pre_refresh
+                    .clone()
+                    .or_else(|| COLLECTOR_PRE_REFRESH.lock().unwrap().clone())
+                {
                     hook();
                 }
                 match refresh_once(&mut presenter, &mut state) {
@@ -1288,7 +1353,14 @@ pub fn serve_with_shutdown(
                         // condition re-alerts per tick until the
                         // operator intervenes).
                         for r in qp.residue.iter() {
-                            eprintln!("osslscope: refresh: checkpoint committed with residue: {r}");
+                            let line = format!(
+                                "osslscope: refresh: checkpoint committed with residue: {r}"
+                            );
+                            eprintln!("{line}");
+                            #[cfg(test)]
+                            if let Some(sink) = diagnostic_sink.as_ref() {
+                                sink.lock().unwrap().push(line);
+                            }
                         }
                         // One tick line, tagged with the
                         // checkpoint name (P2fix18 NEW-113 —
@@ -1309,7 +1381,12 @@ pub fn serve_with_shutdown(
                         // Outage: last-good keeps serving (stale,
                         // frozen — never extrapolated, §6C-8;
                         // freshness advances at serve time).
-                        eprintln!("osslscope: refresh: {e}");
+                        let line = format!("osslscope: refresh: {e}");
+                        eprintln!("{line}");
+                        #[cfg(test)]
+                        if let Some(sink) = diagnostic_sink.as_ref() {
+                            sink.lock().unwrap().push(line);
+                        }
                         #[cfg(test)]
                         REFRESH_REPORT
                             .lock()
@@ -1417,6 +1494,10 @@ pub fn serve_with_shutdown(
             let line = format!("osslscope: shutdown checkpoint flush failed: {e}");
             eprintln!("{line}");
             #[cfg(test)]
+            if let Some(sink) = diagnostic_sink.as_ref() {
+                sink.lock().unwrap().push(line.clone());
+            }
+            #[cfg(test)]
             SHUTDOWN_REPORT.lock().unwrap().push(line);
         }
         // Settled with residue (P2fix15 NEW-89): the persist
@@ -1428,6 +1509,10 @@ pub fn serve_with_shutdown(
                 let line =
                     format!("osslscope: shutdown checkpoint flush committed with residue: {r}");
                 eprintln!("{line}");
+                #[cfg(test)]
+                if let Some(sink) = diagnostic_sink.as_ref() {
+                    sink.lock().unwrap().push(line.clone());
+                }
                 #[cfg(test)]
                 SHUTDOWN_REPORT.lock().unwrap().push(line);
             }
@@ -2270,6 +2355,10 @@ mod tests {
                     poll_secs: 1,
                     otlp: None,
                     checkpoint: Some(checkpoint),
+                    #[cfg(test)]
+                    pre_refresh: None,
+                    #[cfg(test)]
+                    diagnostic_sink: None,
                 },
                 stop2,
                 None,
@@ -3593,6 +3682,10 @@ mod tests {
                     poll_secs: 1,
                     otlp: None,
                     checkpoint: Some(checkpoint),
+                    #[cfg(test)]
+                    pre_refresh: None,
+                    #[cfg(test)]
+                    diagnostic_sink: None,
                 },
                 stop2,
                 None,
@@ -3862,6 +3955,10 @@ mod tests {
                     poll_secs: 1,
                     otlp: None,
                     checkpoint: Some(checkpoint),
+                    #[cfg(test)]
+                    pre_refresh: None,
+                    #[cfg(test)]
+                    diagnostic_sink: None,
                 },
                 stop2,
                 None,
@@ -4841,6 +4938,10 @@ mod tests {
                     poll_secs: 0,
                     otlp: None,
                     checkpoint: Some(checkpoint2),
+                    #[cfg(test)]
+                    pre_refresh: None,
+                    #[cfg(test)]
+                    diagnostic_sink: None,
                 },
                 stop2,
                 Some(Arc::new(move |body: &str| {
@@ -5026,6 +5127,10 @@ mod tests {
                     poll_secs: 0,
                     otlp: None,
                     checkpoint: Some(checkpoint2),
+                    #[cfg(test)]
+                    pre_refresh: None,
+                    #[cfg(test)]
+                    diagnostic_sink: None,
                 },
                 stop2,
                 None,
@@ -5051,8 +5156,63 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        // Tick gate (P2fix19 NEW-120 stabilization —
+        // choreography only, every assertion unchanged):
+        // the plant/restore below quiesce ticks first (an
+        // interference landing inside a tick's
+        // decision→cleanup window truthfully preserves
+        // its prior stage now — the interference must not
+        // race an in-flight flush).
+        let gate_open = Arc::new(AtomicBool::new(true));
+        let gate2 = gate_open.clone();
+        super::set_collector_pre_refresh(Some(Arc::new(move || {
+            while !gate2.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })));
+        struct ReopenOnDrop(Arc<AtomicBool>);
+        impl Drop for ReopenOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let quiesce = || {
+            gate_open.store(false, Ordering::Relaxed);
+            let guard = ReopenOnDrop(gate_open.clone());
+            // No new refresh starts past the closed gate;
+            // an in-flight one drains — a tick count
+            // stable for 200ms means quiescent (the
+            // per-tick report push is each tick's last
+            // act, so stability means no flush runs).
+            let count = || {
+                super::peek_refresh_reports()
+                    .iter()
+                    .filter(|l| l.contains("[n113b.json]"))
+                    .count()
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut last = count();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let now = count();
+                if now == last {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if count() == now {
+                        break;
+                    }
+                }
+                last = count();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "ticks quiesce behind the closed gate"
+                );
+            }
+            guard
+        };
         for (tag, plant) in [("fifo", "fifo"), ("oversize", "oversize")] {
-            // Plant the substitute at the record name.
+            // Plant the substitute at the record name
+            // (ticks quiesced — never inside a flush).
+            let _quiesced = quiesce();
             let aside = record.with_extension("aside-n113");
             std::fs::rename(&record, &aside).unwrap();
             if plant == "fifo" {
@@ -5071,6 +5231,7 @@ mod tests {
             } else {
                 std::fs::write(&record, vec![0x41u8; 2 * 1024 * 1024]).unwrap();
             }
+            drop(_quiesced);
             // Live ticks fail as an outage (bounded — the
             // intake never stalls on the substitute).
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -5094,9 +5255,12 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            // Restoring the record recovers live ticks.
+            // Restoring the record recovers live ticks
+            // (ticks quiesced — never inside a flush).
+            let _quiesced = quiesce();
             std::fs::remove_file(&record).unwrap();
             std::fs::rename(&aside, &record).unwrap();
+            drop(_quiesced);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
                 match last_tick() {
@@ -5116,6 +5280,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("shutdown completes within the bound");
         handle.join().unwrap();
+        super::set_collector_pre_refresh(None);
         assert_eq!(code, std::process::ExitCode::SUCCESS, "serve exits SUCCESS");
         let reports = super::take_shutdown_reports();
         assert!(
@@ -5196,6 +5361,10 @@ mod tests {
                     poll_secs: 0,
                     otlp: None,
                     checkpoint: Some(checkpoint2),
+                    #[cfg(test)]
+                    pre_refresh: None,
+                    #[cfg(test)]
+                    diagnostic_sink: None,
                 },
                 stop2,
                 None,
@@ -5240,6 +5409,779 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new117_failed_flush_carries_entry_transition() {
+        // P2fix19 NEW-117 (durable entry transition carried
+        // back on failed flush): a legacy-governed live
+        // collector migrates at entry (durable), then its
+        // data sync fails and the rollback succeeds — the
+        // failed refresh must carry the verified durable
+        // entry transition back WITHOUT advancing staged
+        // fold or admission state, so the same-instance
+        // retry (then shutdown, then reopen) is exact.
+        // Pre-fix: the retry sees its own self-written
+        // marker as a namespace conflict over verified
+        // legacy authority (RED).
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix19-new117-carryback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("ckpt.json");
+        // A committed tree, then rewritten to the legacy
+        // shape: the record governs from the beside-target
+        // `.settled` slot (byte-identical migration
+        // source), the new namespace stands empty.
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        p.build_service().expect("setup fold commits");
+        drop(p);
+        let record_path = ckpt_dir.join(snapshot::SETTLED_DIR_NAME).join("ckpt.json");
+        let legacy_path = ckpt_dir.join("ckpt.json.settled");
+        std::fs::copy(&record_path, &legacy_path).unwrap();
+        std::fs::remove_file(&record_path).unwrap();
+        // Reopen: legacy governs, the target adopts.
+        let mut live = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        assert_eq!(live.folded_tip(), (Some(0), Some(0)), "premise: prior tip");
+        std::fs::write(
+            dir.join("window-0000000001.json"),
+            serde_json::to_string(&snapshot::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let mut state = RefreshState::restore(&mut live);
+        let tip_before = live.folded_tip();
+        let totals_before = live.fold_totals();
+        let admission_before = live.peek_admission();
+        let epoch_before = state.epoch_start;
+        let run_before = state.run_start;
+        let gen_before = state.last_gen;
+        // Refresh 1: the entry migration commits (durable),
+        // then the data sync fails and the rollback
+        // succeeds — the refresh fails WITHOUT advancing
+        // live.
+        snapshot::dir_sync_fault::arm(1);
+        let err = match refresh_once(&mut live, &mut state) {
+            Ok(_) => panic!("the faulted refresh fails"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("sync failed"),
+            "the failure names the data sync: {err:?}"
+        );
+        assert_eq!(live.folded_tip(), tip_before, "live fold unadvanced");
+        assert_eq!(live.fold_totals(), totals_before, "live totals unadvanced");
+        assert_eq!(
+            live.peek_admission(),
+            admission_before,
+            "live admission unadvanced"
+        );
+        assert_eq!(state.epoch_start, epoch_before, "epoch start unadvanced");
+        assert_eq!(state.run_start, run_before, "run start unadvanced");
+        assert_eq!(state.last_gen, gen_before, "generation unadvanced");
+        // The entry migration stands durable (the staged
+        // presenter committed it before the sync fault).
+        assert!(record_path.is_file(), "the migrated record stands");
+        // Refresh 2 (same instance): the retry must NOT see
+        // a self-written namespace conflict — it commits.
+        let qp = refresh_once(&mut live, &mut state).expect("the retry commits");
+        assert_eq!(
+            qp.snap.source.window_seq,
+            Some(1),
+            "the served push carries the NEW tip"
+        );
+        drop(qp);
+        // Shutdown persists without folding; reopen is
+        // exact.
+        super::shutdown_flush(&mut live).expect("shutdown persists");
+        drop(live);
+        let q = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+            .expect("reopen on the recovered commit");
+        assert_eq!(q.folded_tip(), (Some(0), Some(1)), "the new tip stands");
+        assert_eq!(q.fold_totals(), (20, [20, 0, 0, 0]), "the new totals stand");
+        assert!(
+            !q.recovered_unsettled_prior(),
+            "a settled commit reopens directly (no recovery)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new117_fresh_entry_carries_back_after_sync_fault() {
+        // P2fix19 NEW-117 (Tier-1 adjacent edge — the
+        // fresh-start composition with NEW-118): a FRESH
+        // live collector commits its empty entry, then
+        // its data sync fails — the carry-back binds the
+        // self-written empty authority, so the same-
+        // instance retry commits (without the carry-back
+        // the first-contact rule would mistake the
+        // self-written record for a stranger).
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix19-new117-fresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("ckpt.json");
+        let mut live = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::restore(&mut live);
+        snapshot::dir_sync_fault::arm(1);
+        let err = match refresh_once(&mut live, &mut state) {
+            Ok(_) => panic!("the faulted refresh fails"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("sync failed"),
+            "the failure names the data sync: {err:?}"
+        );
+        let qp = refresh_once(&mut live, &mut state).expect("the retry commits");
+        assert_eq!(
+            qp.snap.source.window_seq,
+            Some(0),
+            "the served push carries the tip"
+        );
+        drop(qp);
+        drop(live);
+        let q = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+            .expect("reopen on the recovered commit");
+        assert_eq!(q.folded_tip(), (Some(0), Some(0)), "the tip stands");
+        assert_eq!(q.fold_totals(), (10, [10, 0, 0, 0]), "the totals stand");
+        assert!(
+            !q.recovered_unsettled_prior(),
+            "a settled commit reopens directly (no recovery)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new121_fifo_out_refuses_promptly_at_export_startup() {
+        // P2fix19 NEW-121 (bounded producer-path open at
+        // export startup): an existing checkpoint parent +
+        // a FIFO at `--out` refuses BOUNDEDLY (exit 1 —
+        // the producer directory opens nonblocking, never
+        // wedging on the FIFO) — never a hung startup.
+        // Pre-fix: the blocking open hangs (RED — the
+        // bounded wait expires). Controls: an ordinary
+        // directory serves (then shuts down clean), and an
+        // absent checkpoint parent serves fresh.
+        let base = std::env::temp_dir().join(format!(
+            "p2fix19-new121-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        // A FIFO at `--out`, checkpoint parent existing.
+        let fifo = base.join("out-fifo");
+        // SAFETY: mkfifo on a fresh private path.
+        assert_eq!(
+            unsafe {
+                libc::mkfifo(
+                    std::ffi::CString::new(fifo.to_str().unwrap())
+                        .unwrap()
+                        .as_ptr(),
+                    0o600,
+                )
+            },
+            0
+        );
+        let ckpt_dir = base.join("ckptdir");
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("n121.json");
+        let args = vec![
+            "export".to_string(),
+            "--out".to_string(),
+            fifo.display().to_string(),
+            "--checkpoint".to_string(),
+            ckpt.display().to_string(),
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let code = super::run(&args);
+            let _ = tx.send(code);
+        });
+        let code = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("export startup refuses within the bound (never hangs)");
+        assert_eq!(
+            code,
+            std::process::ExitCode::from(1),
+            "a FIFO producer path refuses at startup"
+        );
+        // Controls: an ordinary directory serves, and an
+        // absent checkpoint parent serves fresh (same
+        // startup path, stoppable serve).
+        for (tag, ckpt) in [
+            ("ordinary", ckpt_dir.join("n121b.json")),
+            ("absent-parent", base.join("no-such-dir").join("n121c.json")),
+        ] {
+            let dir = base.join(format!("out-{tag}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let port = {
+                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = probe.local_addr().unwrap().port();
+                drop(probe);
+                port
+            };
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop2 = stop.clone();
+            let (tx2, rx2) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let code = super::serve_with_shutdown(
+                    super::Options {
+                        out: dir,
+                        listen: format!("127.0.0.1:{port}"),
+                        poll_secs: 0,
+                        otlp: None,
+                        checkpoint: Some(ckpt),
+                        #[cfg(test)]
+                        pre_refresh: None,
+                        #[cfg(test)]
+                        diagnostic_sink: None,
+                    },
+                    stop2,
+                    None,
+                );
+                let _ = tx2.send(code);
+            });
+            // The listener serves (startup proceeded past
+            // the producer-path open).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+                    &addr,
+                    std::time::Duration::from_millis(200),
+                ) {
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .write_all(b"GET /metrics HTTP/1.0\r\nHost: x\r\n\r\n")
+                        .unwrap();
+                    let mut body = String::new();
+                    stream.read_to_string(&mut body).unwrap();
+                    assert!(
+                        body.contains("no snapshot yet") || body.contains("osslscope_"),
+                        "{tag}: the server serves: {body:?}"
+                    );
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{tag}: the listener accepts"
+                );
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let code = rx2
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("shutdown completes within the bound");
+            handle.join().unwrap();
+            assert_eq!(
+                code,
+                std::process::ExitCode::SUCCESS,
+                "{tag}: serve exits SUCCESS"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new122_public_late_substitution_refuses_at_shutdown() {
+        // P2fix19 NEW-122 (late substitution at the
+        // commit-time/shutdown boundary): a FIFO — resp. an
+        // oversize — substitute armed at the record name
+        // on the REAL collector STAYS armed through
+        // commit-time ticks AND the shutdown flush (never
+        // restored early): every outage tick refuses
+        // boundedly with last-good HTTP totals frozen, the
+        // shutdown flush refuses loudly, and every object
+        // is preserved. Observed via the PRODUCTION
+        // diagnostic through a per-instance capture (no
+        // test-only tick string). The two shapes run as
+        // CONCURRENT serve instances with instance-scoped
+        // hooks + captures (parallel-safe — neither
+        // consumes the other's).
+        use super::super::snapshot;
+        use std::sync::atomic::AtomicBool;
+        let run_shape: fn(&'static str, &'static str) -> (String, Vec<String>, &'static str) =
+            |tag, plant| {
+                let dir = std::env::temp_dir().join(format!(
+                    "p2fix19-new122-{tag}-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+                std::fs::write(
+                    dir.join("window-0000000000.json"),
+                    serde_json::to_string(&snapshot::test_envelope(0, 0, run, 10)).unwrap(),
+                )
+                .unwrap();
+                let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+                std::fs::create_dir_all(&ckpt_dir).unwrap();
+                let checkpoint = ckpt_dir.join(format!("n122{tag}.json"));
+                let record = ckpt_dir
+                    .join(snapshot::SETTLED_DIR_NAME)
+                    .join(format!("n122{tag}.json"));
+                let port = {
+                    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                    let port = probe.local_addr().unwrap().port();
+                    drop(probe);
+                    port
+                };
+                let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+                let scrape = |addr: &std::net::SocketAddr| -> String {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+                            addr,
+                            std::time::Duration::from_millis(200),
+                        ) {
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                                .unwrap();
+                            stream
+                                .write_all(b"GET /metrics HTTP/1.0\r\nHost: x\r\n\r\n")
+                                .unwrap();
+                            let mut body = String::new();
+                            stream.read_to_string(&mut body).unwrap();
+                            return body;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "{tag}: listener accepts"
+                        );
+                    }
+                };
+                // Per-instance hook (tick counter + gate) +
+                // capture — never the globals. The gate
+                // quiesces ticks around the plant below (a
+                // plant landing inside a tick's decision →
+                // post-decision window would abort the
+                // process — the mandated
+                // post-decision-rollback behavior over
+                // foreign bytes — so the interference never
+                // races an in-flight flush; the outage +
+                // shutdown phases run ungated).
+                let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let ticks2 = ticks.clone();
+                let gate_open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let gate2 = gate_open.clone();
+                let sink: Arc<std::sync::Mutex<Vec<String>>> =
+                    Arc::new(std::sync::Mutex::new(Vec::new()));
+                let sink2 = sink.clone();
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop2 = stop.clone();
+                let out = dir.clone();
+                let checkpoint2 = checkpoint.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let handle = std::thread::spawn(move || {
+                    let code = serve_with_shutdown(
+                        Options {
+                            out,
+                            listen: format!("127.0.0.1:{port}"),
+                            poll_secs: 0,
+                            otlp: None,
+                            checkpoint: Some(checkpoint2),
+                            #[cfg(test)]
+                            pre_refresh: Some(Arc::new(move || {
+                                ticks2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                while !gate2.load(std::sync::atomic::Ordering::Relaxed) {
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                            })),
+                            #[cfg(test)]
+                            diagnostic_sink: Some(sink2),
+                        },
+                        stop2,
+                        None,
+                    );
+                    let _ = tx.send(code);
+                });
+                // Tick 1 serves window 0 over real HTTP.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                loop {
+                    let body = scrape(&addr);
+                    if body.contains("osslscope_epoch_calls_total{lane=\"legacy_exclusive\"} 10\n")
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{tag}: first snapshot serves: {body:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                let durable_before = std::fs::read(&checkpoint).unwrap();
+                // Quiesce ticks around the plant (the
+                // instance counter stable for 200ms means
+                // no flush runs — the plant never lands in
+                // a decision window). The guard reopens on
+                // drop (panic-safe).
+                struct ReopenOnDrop(Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for ReopenOnDrop {
+                    fn drop(&mut self) {
+                        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                gate_open.store(false, std::sync::atomic::Ordering::Relaxed);
+                let _quiesced = ReopenOnDrop(gate_open.clone());
+                let quiesce_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(15);
+                let mut last = ticks.load(std::sync::atomic::Ordering::Relaxed);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let now = ticks.load(std::sync::atomic::Ordering::Relaxed);
+                    if now == last {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if ticks.load(std::sync::atomic::Ordering::Relaxed) == now {
+                            break;
+                        }
+                    }
+                    last = ticks.load(std::sync::atomic::Ordering::Relaxed);
+                    assert!(
+                        std::time::Instant::now() < quiesce_deadline,
+                        "{tag}: ticks quiesce behind the closed gate"
+                    );
+                }
+                // Arm the substitution at the record name (it
+                // STAYS armed through ticks + shutdown).
+                let aside = record.with_extension(format!("aside-n122{tag}"));
+                std::fs::rename(&record, &aside).unwrap();
+                let aside_bytes = std::fs::read(&aside).unwrap();
+                if plant == "fifo" {
+                    // SAFETY: mkfifo on a fresh private path.
+                    assert_eq!(
+                        unsafe {
+                            libc::mkfifo(
+                                std::ffi::CString::new(record.to_str().unwrap())
+                                    .unwrap()
+                                    .as_ptr(),
+                                0o600,
+                            )
+                        },
+                        0
+                    );
+                } else {
+                    std::fs::write(&record, vec![0x41u8; 2 * 1024 * 1024]).unwrap();
+                }
+                drop(_quiesced);
+                // Outage ticks refuse boundedly — observed via
+                // the PRODUCTION diagnostic in our own capture.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                loop {
+                    let lines = sink.lock().unwrap();
+                    if lines.iter().any(|l| l.starts_with("osslscope: refresh: ")) {
+                        break;
+                    }
+                    drop(lines);
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{tag}: the production diagnostic reports the outage"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                // Last-good keeps serving frozen over real HTTP.
+                for _ in 0..3 {
+                    let body = scrape(&addr);
+                    assert!(
+                        body.contains(
+                            "osslscope_epoch_calls_total{lane=\"legacy_exclusive\"} 10\n"
+                        ),
+                        "{tag}: last-good serves frozen through the outage: {body:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                // Shutdown WITH the substitution still armed:
+                // bounded completion, loud refusal, exit
+                // SUCCESS (serve health — the stderr line
+                // carries the persist failure).
+                stop.store(true, Ordering::Relaxed);
+                let code = rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("shutdown completes within the bound");
+                handle.join().unwrap();
+                assert_eq!(
+                    code,
+                    std::process::ExitCode::SUCCESS,
+                    "{tag}: serve exits SUCCESS"
+                );
+                assert!(
+                    ticks.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                    "{tag}: the instance hook ran on our collector"
+                );
+                let lines = sink.lock().unwrap().clone();
+                assert!(
+                    lines.iter().any(|l| l.starts_with("osslscope: refresh: ")),
+                    "{tag}: the production outage diagnostic reports: {lines:?}"
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("shutdown checkpoint flush failed")),
+                    "{tag}: the production shutdown diagnostic reports: {lines:?}"
+                );
+                // Every object preserved: the substitute
+                // stands, the aside record is intact, and the
+                // durable target never moved.
+                if plant == "fifo" {
+                    use std::os::unix::fs::FileTypeExt as _;
+                    assert!(
+                        std::fs::symlink_metadata(&record)
+                            .unwrap()
+                            .file_type()
+                            .is_fifo(),
+                        "{tag}: the FIFO stands"
+                    );
+                } else {
+                    assert_eq!(
+                        std::fs::read(&record).unwrap().len(),
+                        2 * 1024 * 1024,
+                        "{tag}: the oversize substitute stands"
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(&aside).unwrap(),
+                    aside_bytes,
+                    "{tag}: the aside record survives byte-identical"
+                );
+                // The durable target keeps its VALUES (later
+                // ticks legitimately re-commit with a new
+                // sequence — only the values bind).
+                let durable_after: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap();
+                let durable_before: serde_json::Value =
+                    serde_json::from_slice(&durable_before).unwrap();
+                for key in ["calls_total", "lanes"] {
+                    assert_eq!(
+                        durable_after["accumulators"][key], durable_before["accumulators"][key],
+                        "{tag}: the durable {key} never moved"
+                    );
+                }
+                assert_eq!(
+                    durable_after["watermark_seq"], durable_before["watermark_seq"],
+                    "{tag}: the durable watermark never moved"
+                );
+                // Restore + exact reopen (the shutdown persist
+                // failed, so the last commit stands).
+                std::fs::remove_file(&record).unwrap();
+                std::fs::rename(&aside, &record).unwrap();
+                drop(lines);
+                let q = snapshot::Presenter::open_with_checkpoint(&dir, &checkpoint, 1, "export")
+                    .expect("reopen on the committed tree");
+                assert_eq!(q.folded_tip(), (Some(0), Some(0)), "{tag}: the tip stands");
+                assert_eq!(
+                    q.fold_totals(),
+                    (10, [10, 0, 0, 0]),
+                    "{tag}: the totals stand"
+                );
+                assert!(
+                    !q.recovered_unsettled_prior(),
+                    "{tag}: a settled commit reopens directly (no recovery)"
+                );
+                drop(q);
+                // Return our capture + base for the no-crosstalk
+                // check (each instance saw ONLY its own tree).
+                let lines = sink.lock().unwrap().clone();
+                (dir.display().to_string(), lines, tag)
+            };
+        // Both shapes CONCURRENTLY (parallel-safe by
+        // construction — instance hooks + captures).
+        let fifo = std::thread::spawn(move || run_shape("fifo", "fifo"));
+        let over = std::thread::spawn(move || run_shape("oversize", "oversize"));
+        let (fifo_base, fifo_lines, _) = fifo.join().unwrap();
+        let (over_base, over_lines, _) = over.join().unwrap();
+        for l in fifo_lines.iter() {
+            assert!(
+                !l.contains(&over_base),
+                "no crosstalk into the fifo capture: {l:?}"
+            );
+        }
+        for l in over_lines.iter() {
+            assert!(
+                !l.contains(&fifo_base),
+                "no crosstalk into the oversize capture: {l:?}"
+            );
+        }
+        assert!(
+            !fifo_lines.is_empty() && !over_lines.is_empty(),
+            "both captures observed their own production diagnostics"
+        );
+    }
+
+    #[test]
+    fn new122_instance_hook_needs_no_global() {
+        // P2fix19 NEW-122 (hook scoping proof): with the
+        // GLOBAL pre-refresh hook set to panic, an
+        // instance-scoped serve still ticks + shuts down
+        // clean (the instance hook wins — the global is
+        // never consulted). The global resets before any
+        // assertion (never leaked, even when the serve
+        // thread dies).
+        use super::super::snapshot;
+        use std::sync::atomic::AtomicBool;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix19-new122-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let checkpoint = ckpt_dir.join("n122s.json");
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            port
+        };
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticks2 = ticks.clone();
+        super::set_collector_pre_refresh(Some(Arc::new(|| {
+            panic!("the global hook must never run here")
+        })));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let out = dir.clone();
+        let checkpoint2 = checkpoint.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let code = serve_with_shutdown(
+                Options {
+                    out,
+                    listen: format!("127.0.0.1:{port}"),
+                    poll_secs: 0,
+                    otlp: None,
+                    checkpoint: Some(checkpoint2),
+                    #[cfg(test)]
+                    pre_refresh: Some(Arc::new(move || {
+                        ticks2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    })),
+                    #[cfg(test)]
+                    diagnostic_sink: None,
+                },
+                stop2,
+                None,
+            );
+            let _ = tx.send(code);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        stop.store(true, Ordering::Relaxed);
+        let code = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("shutdown completes within the bound");
+        let joined = handle.join();
+        super::set_collector_pre_refresh(None);
+        joined.expect("the serve thread survives (the global hook never ran)");
+        assert_eq!(code, std::process::ExitCode::SUCCESS, "serve exits SUCCESS");
+        assert!(
+            ticks.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the instance hook ran"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new122_instance_capture_observes_open_failure() {
+        // P2fix19 NEW-122 (Tier-1 adjacent edge — the
+        // open-site forwarding): when serve's checkpoint
+        // open fails loudly, the SAME production string
+        // lands in the instance capture (exit 1, prompt —
+        // no ticks run at all).
+        let base = std::env::temp_dir().join(format!(
+            "p2fix19-new122-openfail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.join("out");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The checkpoint parent is a REGULAR FILE (a loud
+        // open failure — never fresh, never a hang).
+        let blocker = base.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let checkpoint = blocker.join("n122o.json");
+        let sink: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink2 = sink.clone();
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            port
+        };
+        let code = serve_with_shutdown(
+            Options {
+                out: dir,
+                listen: format!("127.0.0.1:{port}"),
+                poll_secs: 0,
+                otlp: None,
+                checkpoint: Some(checkpoint),
+                #[cfg(test)]
+                pre_refresh: None,
+                #[cfg(test)]
+                diagnostic_sink: Some(sink2),
+            },
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+        );
+        assert_eq!(
+            code,
+            std::process::ExitCode::from(1),
+            "a loud open failure refuses at startup"
+        );
+        let lines = sink.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "exactly the open line captures: {lines:?}");
+        assert!(
+            lines[0].starts_with("osslscope: "),
+            "the production open diagnostic captures: {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

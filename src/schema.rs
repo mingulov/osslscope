@@ -997,6 +997,50 @@ pub fn raw_top_string_members(text: &str, key: &str) -> Option<Vec<String>> {
     }
 }
 
+/// True iff the raw bytes carry an explicit `"schema":
+/// "<schema>"` discriminator ANYWHERE (P2fix19 NEW-119 —
+/// the malformed-content fallback for settlement-authority
+/// classification): the `"schema"` key, optional JSON
+/// whitespace, `:`, optional whitespace, then the exact
+/// quoted schema value. Byte-level (no UTF-8 requirement
+/// — malformed content may be binary), parse-free (a
+/// truncated tail cannot hide a complete discriminator).
+/// A complete discriminator followed by malformed content
+/// still CLAIMS (fail closed — never silently ignored);
+/// only a tear INSIDE the discriminator itself hides the
+/// claim (indistinguishable from junk — documented
+/// residual).
+pub fn raw_contains_schema_claim(bytes: &[u8], schema: &str) -> bool {
+    const KEY: &[u8; 8] = b"\"schema\"";
+    let val = schema.as_bytes();
+    let mut i = 0usize;
+    while i + KEY.len() <= bytes.len() {
+        let rel = match bytes[i..].windows(KEY.len()).position(|w| w == KEY) {
+            Some(p) => p,
+            None => return false,
+        };
+        let mut j = i + rel + KEY.len();
+        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b':' {
+            j += 1;
+            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
+                j += 1;
+            }
+            if j + 2 + val.len() <= bytes.len()
+                && bytes[j] == b'"'
+                && &bytes[j + 1..j + 1 + val.len()] == val
+                && bytes[j + 1 + val.len()] == b'"'
+            {
+                return true;
+            }
+        }
+        i = i + rel + 1;
+    }
+    false
+}
+
 /// NEW-33 fix9: raw-text document intake — the RAW section checks
 /// run FIRST (a `Value` has already collapsed duplicates), then
 /// the standard structural + semantic pipeline on the parsed
@@ -2590,6 +2634,49 @@ fn check_complete_reconciles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_schema_claim_spellings() {
+        // P2fix19 NEW-119: the explicit-discriminator scan
+        // claims on the canonical spelling, spaced
+        // spellings, and truncated/binary tails — and on
+        // nothing else (wrong value, non-string value, or
+        // a tear inside the discriminator itself).
+        let s = "osslscope-checkpoint-settled-v1";
+        assert!(super::raw_contains_schema_claim(
+            b"{\"schema\":\"osslscope-checkpoint-settled-v1\",\"x\":1}".as_slice(),
+            s
+        ));
+        assert!(super::raw_contains_schema_claim(
+            b"{ \"schema\" : \"osslscope-checkpoint-settled-v1\" ,".as_slice(),
+            s
+        ));
+        assert!(super::raw_contains_schema_claim(
+            b"{\"schema\":\"osslscope-checkpoint-settled-v1\",".as_slice(),
+            s
+        ));
+        assert!(super::raw_contains_schema_claim(
+            b"{\"schema\":\"osslscope-checkpoint-settled-v1\",\xff\xfe".as_slice(),
+            s
+        ));
+        assert!(!super::raw_contains_schema_claim(
+            b"{\"schema\":\"other-schema-v1\"}".as_slice(),
+            s
+        ));
+        assert!(!super::raw_contains_schema_claim(
+            b"{\"schema\":5}".as_slice(),
+            s
+        ));
+        assert!(!super::raw_contains_schema_claim(
+            b"{\"schema\":\"osslscope-checkpoint-settled-".as_slice(),
+            s
+        ));
+        assert!(!super::raw_contains_schema_claim(
+            b"not json at all".as_slice(),
+            s
+        ));
+        assert!(!super::raw_contains_schema_claim(b"".as_slice(), s));
+    }
 
     #[test]
     fn compat_matrix() {
