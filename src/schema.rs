@@ -997,29 +997,166 @@ pub fn raw_top_string_members(text: &str, key: &str) -> Option<Vec<String>> {
     }
 }
 
+/// Decode one JSON string starting at `bytes[pos]`
+/// (P2fix20 NEW-126 — the escape-aware discriminator scan):
+/// handles every JSON escape (short escapes plus
+/// `\uXXXX` with surrogate pairs). Byte-level (no UTF-8
+/// requirement — malformed content may be binary);
+/// lenient OUTSIDE escapes (a lone byte decodes to
+/// itself) but strict INSIDE them (a truncated or invalid
+/// escape fails THIS candidate — the scan advances one
+/// byte and tries the next). `want_len` caps the decoded
+/// length (the caller matches exact short discriminators
+/// — anything longer cannot match, so the candidate
+/// fails WITHOUT consuming the string; the cutoff keeps
+/// the whole scan linear-time on hostile quote-heavy
+/// input). Returns the decoded bytes + the position just
+/// past the closing quote.
+fn match_json_string(bytes: &[u8], pos: usize, want_len: usize) -> Option<(Vec<u8>, usize)> {
+    if bytes.get(pos) != Some(&b'"') {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(want_len.min(64));
+    let mut i = pos + 1;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'"' {
+            return Some((out, i + 1));
+        }
+        // Length cutoff (anything longer cannot equal the
+        // caller's short discriminator — fail fast).
+        if out.len() >= want_len {
+            return None;
+        }
+        if b != b'\\' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        let esc = *bytes.get(i + 1)?;
+        match esc {
+            b'"' => {
+                out.push(b'"');
+                i += 2;
+            }
+            b'\\' => {
+                out.push(b'\\');
+                i += 2;
+            }
+            b'/' => {
+                out.push(b'/');
+                i += 2;
+            }
+            b'b' => {
+                out.push(0x08);
+                i += 2;
+            }
+            b'f' => {
+                out.push(0x0c);
+                i += 2;
+            }
+            b'n' => {
+                out.push(b'\n');
+                i += 2;
+            }
+            b'r' => {
+                out.push(b'\r');
+                i += 2;
+            }
+            b't' => {
+                out.push(b'\t');
+                i += 2;
+            }
+            b'u' => {
+                let hex = bytes.get(i + 2..i + 6)?;
+                if hex.len() != 4 {
+                    return None;
+                }
+                let mut unit: u32 = 0;
+                for &h in hex {
+                    let d = match h {
+                        b'0'..=b'9' => (h - b'0') as u32,
+                        b'a'..=b'f' => (h - b'a' + 10) as u32,
+                        b'A'..=b'F' => (h - b'A' + 10) as u32,
+                        _ => return None,
+                    };
+                    unit = unit * 16 + d;
+                }
+                i += 6;
+                let scalar = if (0xd800..0xdc00).contains(&unit) {
+                    // High surrogate: a low surrogate must
+                    // follow (anything else fails this
+                    // candidate — a lone surrogate is not a
+                    // character).
+                    if bytes.get(i..i + 2) != Some(b"\\u".as_slice()) {
+                        return None;
+                    }
+                    let low_hex = bytes.get(i + 2..i + 6)?;
+                    if low_hex.len() != 4 {
+                        return None;
+                    }
+                    let mut low: u32 = 0;
+                    for &h in low_hex {
+                        let d = match h {
+                            b'0'..=b'9' => (h - b'0') as u32,
+                            b'a'..=b'f' => (h - b'a' + 10) as u32,
+                            b'A'..=b'F' => (h - b'A' + 10) as u32,
+                            _ => return None,
+                        };
+                        low = low * 16 + d;
+                    }
+                    if !(0xdc00..0xe000).contains(&low) {
+                        return None;
+                    }
+                    i += 6;
+                    0x10000 + ((unit - 0xd800) << 10) + (low - 0xdc00)
+                } else if (0xdc00..0xe000).contains(&unit) {
+                    return None;
+                } else {
+                    unit
+                };
+                let ch = char::from_u32(scalar)?;
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// True iff the raw bytes carry an explicit `"schema":
 /// "<schema>"` discriminator ANYWHERE (P2fix19 NEW-119 —
 /// the malformed-content fallback for settlement-authority
-/// classification): the `"schema"` key, optional JSON
-/// whitespace, `:`, optional whitespace, then the exact
-/// quoted schema value. Byte-level (no UTF-8 requirement
-/// — malformed content may be binary), parse-free (a
-/// truncated tail cannot hide a complete discriminator).
-/// A complete discriminator followed by malformed content
-/// still CLAIMS (fail closed — never silently ignored);
-/// only a tear INSIDE the discriminator itself hides the
-/// claim (indistinguishable from junk — documented
-/// residual).
+/// classification; escape-aware P2fix20 NEW-126): the
+/// `"schema"` key, optional JSON whitespace, `:`,
+/// optional whitespace, then the exact schema value —
+/// where BOTH strings match JSON-ESCAPED spellings too (a
+/// `\uXXXX`-spelled key or value is the same authority
+/// claim — never silently missed). Byte-level (no UTF-8
+/// requirement — malformed content may be binary),
+/// parse-free (a truncated tail cannot hide a complete
+/// discriminator). A complete discriminator followed by
+/// malformed content still CLAIMS (fail closed — never
+/// silently ignored); only a tear INSIDE the
+/// discriminator itself hides the claim
+/// (indistinguishable from junk — documented residual).
 pub fn raw_contains_schema_claim(bytes: &[u8], schema: &str) -> bool {
-    const KEY: &[u8; 8] = b"\"schema\"";
-    let val = schema.as_bytes();
     let mut i = 0usize;
-    while i + KEY.len() <= bytes.len() {
-        let rel = match bytes[i..].windows(KEY.len()).position(|w| w == KEY) {
-            Some(p) => p,
-            None => return false,
+    while i < bytes.len() {
+        // Candidate key strings start at a quote (any
+        // other byte cannot open one — skip it).
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let Some((key, mut j)) = match_json_string(bytes, i, "schema".len()) else {
+            i += 1;
+            continue;
         };
-        let mut j = i + rel + KEY.len();
+        if key.as_slice() != b"schema" {
+            i += 1;
+            continue;
+        }
         while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
             j += 1;
         }
@@ -1028,15 +1165,13 @@ pub fn raw_contains_schema_claim(bytes: &[u8], schema: &str) -> bool {
             while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
                 j += 1;
             }
-            if j + 2 + val.len() <= bytes.len()
-                && bytes[j] == b'"'
-                && &bytes[j + 1..j + 1 + val.len()] == val
-                && bytes[j + 1 + val.len()] == b'"'
-            {
-                return true;
+            if let Some((val, _)) = match_json_string(bytes, j, schema.len()) {
+                if val.as_slice() == schema.as_bytes() {
+                    return true;
+                }
             }
         }
-        i = i + rel + 1;
+        i += 1;
     }
     false
 }
@@ -2676,6 +2811,47 @@ mod tests {
             s
         ));
         assert!(!super::raw_contains_schema_claim(b"".as_slice(), s));
+    }
+
+    #[test]
+    fn raw_schema_claim_escape_spellings() {
+        // P2fix20 NEW-126: the explicit-discriminator scan
+        // claims on JSON-ESCAPED spellings of the key and the
+        // value (a `\uXXXX` spelling is the same authority
+        // claim — never silently missed), in complete and
+        // truncated tails alike — and still on nothing else
+        // (wrong value, invalid escapes, non-string value).
+        // Pre-fix: every escaped spelling misses (RED).
+        let s = "osslscope-checkpoint-settled-v1";
+        assert!(super::raw_contains_schema_claim(
+            b"{\"schema\":\"osslscope-checkpoint-settled\\u002dv1\"},".as_slice(),
+            s
+        ));
+        assert!(super::raw_contains_schema_claim(
+            b"{\"\\u0073chema\":\"osslscope-checkpoint-settled-v1\"},".as_slice(),
+            s
+        ));
+        assert!(super::raw_contains_schema_claim(
+            b"{\"\\u0073chema\" : \"osslscope\\u002dcheckpoint\\u002dsettled\\u002dv1\","
+                .as_slice(),
+            s
+        ));
+        assert!(super::raw_contains_schema_claim(
+            b"{\"schema\":\"osslscope-checkpoint-settled\\u002dv1\",".as_slice(),
+            s
+        ));
+        assert!(!super::raw_contains_schema_claim(
+            b"{\"schema\":\"osslscope-checkpoint-settled\\u002dv2\"},".as_slice(),
+            s
+        ));
+        assert!(!super::raw_contains_schema_claim(
+            b"{\"schema\":\"osslscope-checkpoint-settled-\\uxyz1\"},".as_slice(),
+            s
+        ));
+        assert!(!super::raw_contains_schema_claim(
+            b"{\"schema\":5}".as_slice(),
+            s
+        ));
     }
 
     #[test]

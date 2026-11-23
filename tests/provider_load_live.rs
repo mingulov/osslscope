@@ -1111,7 +1111,92 @@ fn stage_privileged_binary() -> Option<StagedBinary> {
         return None;
     }
     let binary = dir.join("osslscope");
+    let staged_obs = dir.join("osslscope-provider-observation");
+    let staged_count = dir.join("osslscope-focused-count");
+    // Staged-observer binding receipt (P2fix20 NEW-131):
+    // hash the SOURCES + the STAGED copies actually used;
+    // the copies must equal the sources (cp fidelity —
+    // the receipt binds the executed bytes, never an
+    // unbound staging).
+    let h_built = file_sha256(&built);
+    let h_obs = file_sha256(&obs);
+    let h_count = file_sha256(&count);
+    let s_built = file_sha256(&binary);
+    let s_obs = file_sha256(&staged_obs);
+    let s_count = file_sha256(&staged_count);
+    assert_eq!(h_built, s_built, "the staged observer equals its source");
+    assert_eq!(h_obs, s_obs, "the staged companion equals its source");
+    assert_eq!(h_count, s_count, "the staged companion equals its source");
+    eprintln!(
+        "staged-observer-source sha256={h_built} path={}",
+        built.display()
+    );
+    eprintln!(
+        "staged-companion-source sha256={h_obs} path={}",
+        obs.display()
+    );
+    eprintln!(
+        "staged-companion-source sha256={h_count} path={}",
+        count.display()
+    );
+    eprintln!("staged-observer sha256={s_built} path={}", binary.display());
+    eprintln!(
+        "staged-companion sha256={s_obs} path={}",
+        staged_obs.display()
+    );
+    eprintln!(
+        "staged-companion sha256={s_count} path={}",
+        staged_count.display()
+    );
     Some(StagedBinary { dir, binary })
+}
+
+/// sha256 of one file via `sha256sum` (P2fix20 NEW-131 —
+/// the staged-observer binding receipt; loud failure,
+/// never an unbound staging).
+fn file_sha256(path: &std::path::Path) -> String {
+    let out = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .expect("sha256sum runs for the staged-observer binding");
+    assert!(
+        out.status.success(),
+        "sha256sum hashes the staged file: {path:?}"
+    );
+    let text = String::from_utf8(out.stdout).expect("sha256sum output is utf8");
+    text.split_whitespace()
+        .next()
+        .expect("sha256sum prints a hash")
+        .to_string()
+}
+
+#[test]
+fn staged_binding_hashes_files() {
+    // P2fix20 NEW-131 (binding-helper unit pin —
+    // host-runnable): the receipt hash is 64 lowercase
+    // hex, deterministic, and content-sensitive.
+    let dir = std::env::temp_dir().join(format!(
+        "p2fix20-staged-hash-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a.bin");
+    let b = dir.join("b.bin");
+    std::fs::write(&a, b"staged-bytes-a").unwrap();
+    std::fs::write(&b, b"staged-bytes-b").unwrap();
+    let ha = file_sha256(&a);
+    assert_eq!(ha.len(), 64, "64 hex chars: {ha:?}");
+    assert!(
+        ha.bytes().all(|c| c.is_ascii_hexdigit()),
+        "lowercase hex: {ha:?}"
+    );
+    assert_eq!(file_sha256(&a), ha, "deterministic");
+    assert_ne!(file_sha256(&b), ha, "content-sensitive");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Parse the scan outfile as it stands: (records, sections with

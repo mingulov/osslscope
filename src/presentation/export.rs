@@ -64,6 +64,15 @@ pub struct Options {
     /// production never sets it.
     #[cfg(test)]
     pub diagnostic_sink: Option<Arc<Mutex<Vec<String>>>>,
+    /// Per-instance pre-shutdown hook (P2fix20 NEW-129,
+    /// test-only): invoked ONCE on the collector thread
+    /// immediately before the shutdown flush — the
+    /// shutdown-path counterpart of `pre_refresh` (a pin
+    /// arms mid-flush interference there that lands AFTER
+    /// the shutdown flush's own early gate). `None` (the
+    /// default) is a no-op; production never sets it.
+    #[cfg(test)]
+    pub pre_shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +157,8 @@ fn parse(args: &[String]) -> Result<Options, ()> {
         pre_refresh: None,
         #[cfg(test)]
         diagnostic_sink: None,
+        #[cfg(test)]
+        pre_shutdown: None,
     })
 }
 
@@ -1259,6 +1270,8 @@ pub fn serve_with_shutdown(
     let diagnostic_sink = opts.diagnostic_sink.clone();
     #[cfg(test)]
     let pre_refresh = opts.pre_refresh.clone();
+    #[cfg(test)]
+    let pre_shutdown = opts.pre_shutdown.clone();
     let window_fallback_secs = super::snapshot::WINDOW_SECS_FALLBACK;
     let mut presenter = match Presenter::open_with_checkpoint(
         &opts.out,
@@ -1329,6 +1342,8 @@ pub fn serve_with_shutdown(
         let diagnostic_sink = diagnostic_sink.clone();
         #[cfg(test)]
         let pre_refresh = pre_refresh.clone();
+        #[cfg(test)]
+        let pre_shutdown = pre_shutdown.clone();
         std::thread::spawn(move || {
             let mut state = RefreshState::restore(&mut presenter);
             loop {
@@ -1417,6 +1432,16 @@ pub fn serve_with_shutdown(
             // shutdown bypass). The result REPORTS (P2fix12
             // NEW-70 — the collector returns it; serve logs it
             // loudly below).
+            // Pre-shutdown hook (P2fix20 NEW-129, test-only —
+            // runs ONCE on this thread immediately before the
+            // shutdown flush, so a pin arms mid-flush
+            // interference that lands after the shutdown
+            // flush's own early gate; production never sets
+            // it).
+            #[cfg(test)]
+            if let Some(hook) = pre_shutdown.clone() {
+                hook();
+            }
             shutdown_flush(&mut presenter)
         })
     };
@@ -2359,6 +2384,8 @@ mod tests {
                     pre_refresh: None,
                     #[cfg(test)]
                     diagnostic_sink: None,
+                    #[cfg(test)]
+                    pre_shutdown: None,
                 },
                 stop2,
                 None,
@@ -3686,6 +3713,8 @@ mod tests {
                     pre_refresh: None,
                     #[cfg(test)]
                     diagnostic_sink: None,
+                    #[cfg(test)]
+                    pre_shutdown: None,
                 },
                 stop2,
                 None,
@@ -3959,6 +3988,8 @@ mod tests {
                     pre_refresh: None,
                     #[cfg(test)]
                     diagnostic_sink: None,
+                    #[cfg(test)]
+                    pre_shutdown: None,
                 },
                 stop2,
                 None,
@@ -4942,6 +4973,8 @@ mod tests {
                     pre_refresh: None,
                     #[cfg(test)]
                     diagnostic_sink: None,
+                    #[cfg(test)]
+                    pre_shutdown: None,
                 },
                 stop2,
                 Some(Arc::new(move |body: &str| {
@@ -5057,13 +5090,16 @@ mod tests {
     #[test]
     fn new113_public_marker_substitution_refuses() {
         // P2fix18 NEW-113 (late marker FIFO + oversize
-        // refusals through the same public boundary): with
-        // serve running for real, a FIFO planted at the
-        // record name (then an oversize substitute) fails
-        // live ticks as an outage — last-good keeps
+        // refusals through the same public boundary;
+        // post-gate arming P2fix20 NEW-129): with serve
+        // running for real, a FIFO planted at the record
+        // name AFTER the early gate passes (then an
+        // oversize substitute) fails live ticks as an
+        // outage AT THE LATE BOUNDARY — last-good keeps
         // serving frozen over real HTTP, the tick report
-        // carries the failure, and restoring the record
-        // recovers live ticks; shutdown stays clean.
+        // carries the late failure, and restoring the
+        // record recovers live ticks; shutdown stays
+        // clean.
         use super::super::snapshot;
         use std::sync::atomic::AtomicBool;
         let dir = std::env::temp_dir().join(format!(
@@ -5131,6 +5167,8 @@ mod tests {
                     pre_refresh: None,
                     #[cfg(test)]
                     diagnostic_sink: None,
+                    #[cfg(test)]
+                    pre_shutdown: None,
                 },
                 stop2,
                 None,
@@ -5165,9 +5203,42 @@ mod tests {
         // race an in-flight flush).
         let gate_open = Arc::new(AtomicBool::new(true));
         let gate2 = gate_open.clone();
+        // Pending post-gate plant (P2fix20 NEW-129 — set
+        // by the test thread while quiesced, consumed on
+        // the collector thread at the next tick start).
+        let plant_pending: Arc<
+            std::sync::Mutex<Option<(std::path::PathBuf, std::path::PathBuf, String)>>,
+        > = Arc::new(std::sync::Mutex::new(None));
+        let plant2 = plant_pending.clone();
         super::set_collector_pre_refresh(Some(Arc::new(move || {
             while !gate2.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // Post-gate arming (P2fix20 NEW-129): a
+            // pending plant arms the mid-flush hook ON
+            // THIS THREAD (the collector's own
+            // thread-local) — the substitution lands
+            // AFTER the early gate passes, mid-flush.
+            if let Some((record, aside, shape)) = plant2.lock().unwrap().take() {
+                snapshot::post_record_gate_hook::arm(move || {
+                    std::fs::rename(&record, &aside).unwrap();
+                    if shape == "fifo" {
+                        // SAFETY: mkfifo on a fresh private path.
+                        assert_eq!(
+                            unsafe {
+                                libc::mkfifo(
+                                    std::ffi::CString::new(record.to_str().unwrap())
+                                        .unwrap()
+                                        .as_ptr(),
+                                    0o600,
+                                )
+                            },
+                            0
+                        );
+                    } else {
+                        std::fs::write(&record, vec![0x41u8; 2 * 1024 * 1024]).unwrap();
+                    }
+                });
             }
         })));
         struct ReopenOnDrop(Arc<AtomicBool>);
@@ -5210,39 +5281,33 @@ mod tests {
             guard
         };
         for (tag, plant) in [("fifo", "fifo"), ("oversize", "oversize")] {
-            // Plant the substitute at the record name
-            // (ticks quiesced — never inside a flush).
+            // Arm the substitution AFTER the early gate
+            // (P2fix20 NEW-129 — ticks quiesced; the
+            // pre-refresh hook arms the mid-flush plant
+            // on the collector thread, and the plant
+            // lands mid-flush, after the gate passes —
+            // never planted up front).
             let _quiesced = quiesce();
             let aside = record.with_extension("aside-n113");
-            std::fs::rename(&record, &aside).unwrap();
-            if plant == "fifo" {
-                // SAFETY: mkfifo on a fresh private path.
-                assert_eq!(
-                    unsafe {
-                        libc::mkfifo(
-                            std::ffi::CString::new(record.to_str().unwrap())
-                                .unwrap()
-                                .as_ptr(),
-                            0o600,
-                        )
-                    },
-                    0
-                );
-            } else {
-                std::fs::write(&record, vec![0x41u8; 2 * 1024 * 1024]).unwrap();
-            }
+            *plant_pending.lock().unwrap() =
+                Some((record.clone(), aside.clone(), plant.to_string()));
+            let reports_before = super::peek_refresh_reports().len();
             drop(_quiesced);
-            // Live ticks fail as an outage (bounded — the
-            // intake never stalls on the substitute).
+            // The planting tick fails at the LATE boundary
+            // (bounded — the intake never stalls on the
+            // substitute; later ticks refuse at the early
+            // gate with the substitute standing).
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
-                match last_tick() {
-                    Some(line) if line.starts_with("tick fail:") => break,
-                    _ => {}
+                let late = super::peek_refresh_reports()[reports_before..]
+                    .iter()
+                    .any(|l| l.starts_with("tick fail:") && l.contains("changed after the gate"));
+                if late {
+                    break;
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "{tag}: the substituted tick fails"
+                    "{tag}: the substituted tick fails at the late boundary"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -5285,6 +5350,238 @@ mod tests {
         let reports = super::take_shutdown_reports();
         assert!(
             !reports.iter().any(|l| l.contains("n113b")),
+            "clean shutdown reports nothing for this tree: {reports:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new129_early_gate_still_refuses_upfront_plant() {
+        // P2fix20 NEW-129 (Tier-1 adjacent edge — the
+        // early gate still fail-fasts): a substitute
+        // planted UP FRONT (quiesced, before any flush)
+        // still refuses at the EARLY marker gate with
+        // zero staging — last-good frozen, the substitute
+        // preserved, restore recovers, shutdown clean.
+        // (The late boundary is the enforcement; the
+        // early gate stays the fail-fast.)
+        use super::super::snapshot;
+        use std::sync::atomic::AtomicBool;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix20-new129-early-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let checkpoint = ckpt_dir.join("n129e.json");
+        let record = ckpt_dir.join(snapshot::SETTLED_DIR_NAME).join("n129e.json");
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            port
+        };
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let scrape = |addr: &std::net::SocketAddr| -> String {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+                    addr,
+                    std::time::Duration::from_millis(200),
+                ) {
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .write_all(b"GET /metrics HTTP/1.0\r\nHost: x\r\n\r\n")
+                        .unwrap();
+                    let mut body = String::new();
+                    stream.read_to_string(&mut body).unwrap();
+                    return body;
+                }
+                assert!(std::time::Instant::now() < deadline, "listener accepts");
+            }
+        };
+        let _ = super::take_shutdown_reports();
+        let _ = super::take_refresh_reports();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let out = dir.clone();
+        let checkpoint2 = checkpoint.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let code = serve_with_shutdown(
+                Options {
+                    out,
+                    listen: format!("127.0.0.1:{port}"),
+                    poll_secs: 0,
+                    otlp: None,
+                    checkpoint: Some(checkpoint2),
+                    #[cfg(test)]
+                    pre_refresh: None,
+                    #[cfg(test)]
+                    diagnostic_sink: None,
+                    #[cfg(test)]
+                    pre_shutdown: None,
+                },
+                stop2,
+                None,
+            );
+            let _ = tx.send(code);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let body = scrape(&addr);
+            if body.contains("osslscope_epoch_calls_total{lane=\"legacy_exclusive\"} 10\n") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first snapshot serves: {body:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // Tick gate for the quiesced plant/restore.
+        let gate_open = Arc::new(AtomicBool::new(true));
+        let gate2 = gate_open.clone();
+        super::set_collector_pre_refresh(Some(Arc::new(move || {
+            while !gate2.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })));
+        struct ReopenOnDrop(Arc<AtomicBool>);
+        impl Drop for ReopenOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let quiesce = || {
+            gate_open.store(false, Ordering::Relaxed);
+            let guard = ReopenOnDrop(gate_open.clone());
+            let count = || {
+                super::peek_refresh_reports()
+                    .iter()
+                    .filter(|l| l.contains("[n129e.json]"))
+                    .count()
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut last = count();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let now = count();
+                if now == last {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if count() == now {
+                        break;
+                    }
+                }
+                last = count();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "ticks quiesce behind the closed gate"
+                );
+            }
+            guard
+        };
+        // Plant UP FRONT (quiesced — the early gate sees
+        // it before any staging).
+        let _quiesced = quiesce();
+        let aside = record.with_extension("aside-n129e");
+        std::fs::rename(&record, &aside).unwrap();
+        // SAFETY: mkfifo on a fresh private path.
+        assert_eq!(
+            unsafe {
+                libc::mkfifo(
+                    std::ffi::CString::new(record.to_str().unwrap())
+                        .unwrap()
+                        .as_ptr(),
+                    0o600,
+                )
+            },
+            0
+        );
+        let reports_before = super::peek_refresh_reports().len();
+        drop(_quiesced);
+        // The outage refuses at the EARLY gate (fail-fast
+        // wording, never the late string).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let early = super::peek_refresh_reports()[reports_before..]
+                .iter()
+                .any(|l| l.starts_with("tick fail:") && l.contains("slot holds foreign content"));
+            if early {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the upfront plant fails at the early gate"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !super::peek_refresh_reports()[reports_before..]
+                .iter()
+                .any(|l| l.contains("changed after the gate")),
+            "no late-boundary line for an upfront plant"
+        );
+        // Last-good frozen, substitute preserved.
+        let body = scrape(&addr);
+        assert!(
+            body.contains("osslscope_epoch_calls_total{lane=\"legacy_exclusive\"} 10\n"),
+            "last-good serves frozen through the outage: {body:?}"
+        );
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(
+            std::fs::symlink_metadata(&record)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the FIFO stands"
+        );
+        // Restore recovers; shutdown stays clean.
+        let _quiesced = quiesce();
+        std::fs::remove_file(&record).unwrap();
+        std::fs::rename(&aside, &record).unwrap();
+        drop(_quiesced);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let ok = super::peek_refresh_reports()
+                .into_iter()
+                .filter(|l| l.contains("[n129e.json]"))
+                .next_back()
+                .map(|l| l.starts_with("tick ok"))
+                .unwrap_or(false);
+            if ok {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live ticks recover after restore"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let code = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("shutdown completes within the bound");
+        handle.join().unwrap();
+        super::set_collector_pre_refresh(None);
+        assert_eq!(code, std::process::ExitCode::SUCCESS, "serve exits SUCCESS");
+        let reports = super::take_shutdown_reports();
+        assert!(
+            !reports.iter().any(|l| l.contains("n129e")),
             "clean shutdown reports nothing for this tree: {reports:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -5365,6 +5662,8 @@ mod tests {
                     pre_refresh: None,
                     #[cfg(test)]
                     diagnostic_sink: None,
+                    #[cfg(test)]
+                    pre_shutdown: None,
                 },
                 stop2,
                 None,
@@ -5668,6 +5967,8 @@ mod tests {
                         pre_refresh: None,
                         #[cfg(test)]
                         diagnostic_sink: None,
+                        #[cfg(test)]
+                        pre_shutdown: None,
                     },
                     stop2,
                     None,
@@ -5718,19 +6019,21 @@ mod tests {
     #[test]
     fn new122_public_late_substitution_refuses_at_shutdown() {
         // P2fix19 NEW-122 (late substitution at the
-        // commit-time/shutdown boundary): a FIFO — resp. an
-        // oversize — substitute armed at the record name
-        // on the REAL collector STAYS armed through
-        // commit-time ticks AND the shutdown flush (never
-        // restored early): every outage tick refuses
-        // boundedly with last-good HTTP totals frozen, the
-        // shutdown flush refuses loudly, and every object
-        // is preserved. Observed via the PRODUCTION
-        // diagnostic through a per-instance capture (no
-        // test-only tick string). The two shapes run as
-        // CONCURRENT serve instances with instance-scoped
-        // hooks + captures (parallel-safe — neither
-        // consumes the other's).
+        // commit-time/shutdown boundary; post-gate arming
+        // P2fix20 NEW-129): a FIFO — resp. an oversize —
+        // substitute armed at the record name AFTER the
+        // early gate passes, on the REAL collector AND
+        // the shutdown path: the planting tick refuses AT
+        // THE LATE BOUNDARY with last-good HTTP totals
+        // frozen, restoring the record recovers clean
+        // ticks, and the shutdown flush (armed separately,
+        // mid-flush) refuses loudly at the late boundary
+        // too — every object preserved throughout.
+        // Observed via the PRODUCTION diagnostic through
+        // a per-instance capture (no test-only tick
+        // string). The two shapes run as CONCURRENT serve
+        // instances with instance-scoped hooks + captures
+        // (parallel-safe — neither consumes the other's).
         use super::super::snapshot;
         use std::sync::atomic::AtomicBool;
         let run_shape: fn(&'static str, &'static str) -> (String, Vec<String>, &'static str) =
@@ -5786,16 +6089,13 @@ mod tests {
                         );
                     }
                 };
-                // Per-instance hook (tick counter + gate) +
-                // capture — never the globals. The gate
-                // quiesces ticks around the plant below (a
-                // plant landing inside a tick's decision →
-                // post-decision window would abort the
-                // process — the mandated
-                // post-decision-rollback behavior over
-                // foreign bytes — so the interference never
-                // races an in-flight flush; the outage +
-                // shutdown phases run ungated).
+                // Per-instance hook (tick counter + gate +
+                // post-gate plant arming) + capture — never
+                // the globals. The gate quiesces ticks
+                // around each arming (the arming never
+                // races an in-flight flush); the plant
+                // itself lands mid-flush, AFTER the early
+                // gate passes (P2fix20 NEW-129).
                 let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let ticks2 = ticks.clone();
                 let gate_open = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -5803,6 +6103,17 @@ mod tests {
                 let sink: Arc<std::sync::Mutex<Vec<String>>> =
                     Arc::new(std::sync::Mutex::new(Vec::new()));
                 let sink2 = sink.clone();
+                // Pending post-gate plants (P2fix20 NEW-129 —
+                // set by this thread, consumed on the
+                // collector thread): one for a refresh
+                // tick, one for the shutdown flush.
+                type PlantSpec = Option<(std::path::PathBuf, std::path::PathBuf, String)>;
+                let tick_plant: Arc<std::sync::Mutex<PlantSpec>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                let tick_plant2 = tick_plant.clone();
+                let shutdown_plant: Arc<std::sync::Mutex<PlantSpec>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                let shutdown_plant2 = shutdown_plant.clone();
                 let stop = Arc::new(AtomicBool::new(false));
                 let stop2 = stop.clone();
                 let out = dir.clone();
@@ -5822,9 +6133,91 @@ mod tests {
                                 while !gate2.load(std::sync::atomic::Ordering::Relaxed) {
                                     std::thread::sleep(std::time::Duration::from_millis(1));
                                 }
+                                // Post-gate arming: a pending
+                                // plant arms the mid-flush
+                                // hook ON THIS THREAD (the
+                                // collector's own
+                                // thread-local).
+                                if let Some((record, aside, shape)) =
+                                    tick_plant2.lock().unwrap().take()
+                                {
+                                    snapshot::post_record_gate_hook::arm(move || {
+                                        std::fs::rename(&record, &aside).unwrap();
+                                        if shape == "fifo" {
+                                            // SAFETY: mkfifo on a
+                                            // fresh private path.
+                                            assert_eq!(
+                                                unsafe {
+                                                    libc::mkfifo(
+                                                        std::ffi::CString::new(
+                                                            record.to_str().unwrap(),
+                                                        )
+                                                        .unwrap()
+                                                        .as_ptr(),
+                                                        0o600,
+                                                    )
+                                                },
+                                                0
+                                            );
+                                        } else {
+                                            std::fs::write(&record, vec![0x41u8; 2 * 1024 * 1024])
+                                                .unwrap();
+                                        }
+                                    });
+                                }
                             })),
                             #[cfg(test)]
                             diagnostic_sink: Some(sink2),
+                            #[cfg(test)]
+                            pre_shutdown: Some(Arc::new(move || {
+                                // Shutdown-path post-gate
+                                // arming (runs once, on this
+                                // thread, before the
+                                // shutdown flush).
+                                if let Some((record, aside, shape)) =
+                                    shutdown_plant2.lock().unwrap().take()
+                                {
+                                    snapshot::post_record_gate_hook::arm(move || {
+                                        // Snapshot the pre-plant
+                                        // bytes (ticks may
+                                        // commit between the
+                                        // test's read and this
+                                        // plant — only the
+                                        // plant itself sees
+                                        // the exact moved
+                                        // bytes).
+                                        let moved = std::fs::read(&record).unwrap();
+                                        let moved_name = aside
+                                            .file_name()
+                                            .unwrap()
+                                            .to_string_lossy()
+                                            .replacen("aside-n122", "moved-n122", 1);
+                                        std::fs::write(aside.with_file_name(moved_name), &moved)
+                                            .unwrap();
+                                        std::fs::rename(&record, &aside).unwrap();
+                                        if shape == "fifo" {
+                                            // SAFETY: mkfifo on a
+                                            // fresh private path.
+                                            assert_eq!(
+                                                unsafe {
+                                                    libc::mkfifo(
+                                                        std::ffi::CString::new(
+                                                            record.to_str().unwrap(),
+                                                        )
+                                                        .unwrap()
+                                                        .as_ptr(),
+                                                        0o600,
+                                                    )
+                                                },
+                                                0
+                                            );
+                                        } else {
+                                            std::fs::write(&record, vec![0x41u8; 2 * 1024 * 1024])
+                                                .unwrap();
+                                        }
+                                    });
+                                }
+                            })),
                         },
                         stop2,
                         None,
@@ -5846,71 +6239,64 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 let durable_before = std::fs::read(&checkpoint).unwrap();
-                // Quiesce ticks around the plant (the
-                // instance counter stable for 200ms means
-                // no flush runs — the plant never lands in
-                // a decision window). The guard reopens on
-                // drop (panic-safe).
+                // Quiesce helper (the instance counter
+                // stable for 200ms means no flush runs —
+                // each arming/restore below quiesces
+                // first). The guard reopens on drop
+                // (panic-safe).
                 struct ReopenOnDrop(Arc<std::sync::atomic::AtomicBool>);
                 impl Drop for ReopenOnDrop {
                     fn drop(&mut self) {
                         self.0.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                gate_open.store(false, std::sync::atomic::Ordering::Relaxed);
-                let _quiesced = ReopenOnDrop(gate_open.clone());
-                let quiesce_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(15);
-                let mut last = ticks.load(std::sync::atomic::Ordering::Relaxed);
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    let now = ticks.load(std::sync::atomic::Ordering::Relaxed);
-                    if now == last {
+                let quiesce = || {
+                    gate_open.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let guard = ReopenOnDrop(gate_open.clone());
+                    let quiesce_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(15);
+                    let mut last = ticks.load(std::sync::atomic::Ordering::Relaxed);
+                    loop {
                         std::thread::sleep(std::time::Duration::from_millis(100));
-                        if ticks.load(std::sync::atomic::Ordering::Relaxed) == now {
-                            break;
+                        let now = ticks.load(std::sync::atomic::Ordering::Relaxed);
+                        if now == last {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            if ticks.load(std::sync::atomic::Ordering::Relaxed) == now {
+                                break;
+                            }
                         }
+                        last = ticks.load(std::sync::atomic::Ordering::Relaxed);
+                        assert!(
+                            std::time::Instant::now() < quiesce_deadline,
+                            "{tag}: ticks quiesce behind the closed gate"
+                        );
                     }
-                    last = ticks.load(std::sync::atomic::Ordering::Relaxed);
-                    assert!(
-                        std::time::Instant::now() < quiesce_deadline,
-                        "{tag}: ticks quiesce behind the closed gate"
-                    );
-                }
-                // Arm the substitution at the record name (it
-                // STAYS armed through ticks + shutdown).
+                    guard
+                };
                 let aside = record.with_extension(format!("aside-n122{tag}"));
-                std::fs::rename(&record, &aside).unwrap();
-                let aside_bytes = std::fs::read(&aside).unwrap();
-                if plant == "fifo" {
-                    // SAFETY: mkfifo on a fresh private path.
-                    assert_eq!(
-                        unsafe {
-                            libc::mkfifo(
-                                std::ffi::CString::new(record.to_str().unwrap())
-                                    .unwrap()
-                                    .as_ptr(),
-                                0o600,
-                            )
-                        },
-                        0
-                    );
-                } else {
-                    std::fs::write(&record, vec![0x41u8; 2 * 1024 * 1024]).unwrap();
-                }
+                // Phase A (refresh path): arm the
+                // substitution AFTER the early gate — the
+                // planting tick refuses AT THE LATE
+                // BOUNDARY (observed via the PRODUCTION
+                // diagnostic in our own capture).
+                let _quiesced = quiesce();
+                *tick_plant.lock().unwrap() =
+                    Some((record.clone(), aside.clone(), plant.to_string()));
+                let lines_before = sink.lock().unwrap().len();
                 drop(_quiesced);
-                // Outage ticks refuse boundedly — observed via
-                // the PRODUCTION diagnostic in our own capture.
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
                 loop {
                     let lines = sink.lock().unwrap();
-                    if lines.iter().any(|l| l.starts_with("osslscope: refresh: ")) {
+                    if lines[lines_before..].iter().any(|l| {
+                        l.starts_with("osslscope: refresh: ")
+                            && l.contains("changed after the gate")
+                    }) {
                         break;
                     }
                     drop(lines);
                     assert!(
                         std::time::Instant::now() < deadline,
-                        "{tag}: the production diagnostic reports the outage"
+                        "{tag}: the planting tick fails at the late boundary"
                     );
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
@@ -5925,10 +6311,42 @@ mod tests {
                     );
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                // Shutdown WITH the substitution still armed:
-                // bounded completion, loud refusal, exit
-                // SUCCESS (serve health — the stderr line
-                // carries the persist failure).
+                // Restoring the record recovers clean ticks
+                // (ticks advance with the capture quiet —
+                // every failure would log, so quiet +
+                // advancing ticks are clean).
+                let _quiesced = quiesce();
+                std::fs::remove_file(&record).unwrap();
+                std::fs::rename(&aside, &record).unwrap();
+                drop(_quiesced);
+                let ticks_before = ticks.load(std::sync::atomic::Ordering::Relaxed);
+                let quiet_before = sink.lock().unwrap().len();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                loop {
+                    if ticks.load(std::sync::atomic::Ordering::Relaxed) >= ticks_before + 5
+                        && sink.lock().unwrap().len() == quiet_before
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        if sink.lock().unwrap().len() == quiet_before {
+                            break;
+                        }
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{tag}: clean ticks resume after restore"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                // Phase B (shutdown path): arm the
+                // substitution AFTER the shutdown flush's
+                // own early gate (via the instance
+                // pre-shutdown hook — deterministic, no
+                // quiesce needed). Bounded completion,
+                // loud late refusal, exit SUCCESS (serve
+                // health — the stderr line carries the
+                // persist failure).
+                *shutdown_plant.lock().unwrap() =
+                    Some((record.clone(), aside.clone(), plant.to_string()));
                 stop.store(true, Ordering::Relaxed);
                 let code = rx
                     .recv_timeout(std::time::Duration::from_secs(10))
@@ -5945,14 +6363,16 @@ mod tests {
                 );
                 let lines = sink.lock().unwrap().clone();
                 assert!(
-                    lines.iter().any(|l| l.starts_with("osslscope: refresh: ")),
-                    "{tag}: the production outage diagnostic reports: {lines:?}"
+                    lines.iter().any(|l| l.starts_with("osslscope: refresh: ")
+                        && l.contains("changed after the gate")),
+                    "{tag}: the production outage diagnostic reports the late boundary: {lines:?}"
                 );
                 assert!(
                     lines
                         .iter()
-                        .any(|l| l.contains("shutdown checkpoint flush failed")),
-                    "{tag}: the production shutdown diagnostic reports: {lines:?}"
+                        .any(|l| l.contains("shutdown checkpoint flush failed")
+                            && l.contains("changed after the gate")),
+                    "{tag}: the production shutdown diagnostic reports the late boundary: {lines:?}"
                 );
                 // Every object preserved: the substitute
                 // stands, the aside record is intact, and the
@@ -5973,9 +6393,18 @@ mod tests {
                         "{tag}: the oversize substitute stands"
                     );
                 }
+                // The aside record survives byte-identical
+                // to the exact pre-plant bytes (snapshotted
+                // by the plant itself — ticks may commit
+                // between the test's reads).
+                let moved_name = aside.file_name().unwrap().to_string_lossy().replacen(
+                    "aside-n122",
+                    "moved-n122",
+                    1,
+                );
                 assert_eq!(
                     std::fs::read(&aside).unwrap(),
-                    aside_bytes,
+                    std::fs::read(aside.with_file_name(moved_name)).unwrap(),
                     "{tag}: the aside record survives byte-identical"
                 );
                 // The durable target keeps its VALUES (later
@@ -6101,6 +6530,8 @@ mod tests {
                     })),
                     #[cfg(test)]
                     diagnostic_sink: None,
+                    #[cfg(test)]
+                    pre_shutdown: None,
                 },
                 stop2,
                 None,
@@ -6166,6 +6597,8 @@ mod tests {
                 pre_refresh: None,
                 #[cfg(test)]
                 diagnostic_sink: Some(sink2),
+                #[cfg(test)]
+                pre_shutdown: None,
             },
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
@@ -6617,6 +7050,281 @@ mod tests {
         let q = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
             .expect("reopen on the persisted checkpoint");
         assert_eq!(q.folded_tip(), (Some(0), Some(0)), "the tip stands");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new127_authority_loss_withholds_live_state() {
+        // P2fix20 NEW-127 (authority-bound cleanup through
+        // removal): a record change during the staged
+        // flush's post-decision removal fails the refresh
+        // — the exporter withholds the staged fold (live
+        // last-good stays EXACT at the prior), BOTH
+        // payloads survive, and reopen agrees with
+        // last-good. Restoring the committed record
+        // reopens onto the new transaction (durable truth
+        // intact — the failure orphaned live state, never
+        // the commit). Pre-fix: the refresh succeeds and
+        // publishes the staged fold over a record that no
+        // longer confirms it (RED).
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix20-new127-authority-withhold-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("n127.json");
+        let record = ckpt_dir.join(snapshot::SETTLED_DIR_NAME).join("n127.json");
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::restore(&mut p);
+        refresh_once(&mut p, &mut state).expect("first refresh commits");
+        assert_eq!(p.folded_tip(), (Some(0), Some(0)), "last-good tip");
+        assert_eq!(p.fold_totals(), (10, [10, 0, 0, 0]), "last-good totals");
+        let prior_bytes = std::fs::read(&ckpt).unwrap();
+        let prior_record = std::fs::read(&record).unwrap();
+        std::fs::write(
+            dir.join("window-0000000001.json"),
+            serde_json::to_string(&snapshot::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        // At the post-decision cleanup boundary, the old
+        // authority returns (the committed record saved
+        // aside for the restore leg below).
+        let aside = record.with_extension("aside-n127");
+        let (record2, prior2, aside2) = (record.clone(), prior_record.clone(), aside.clone());
+        snapshot::pre_cleanup_hook::arm(move || {
+            let ours = std::fs::read(&record2).unwrap();
+            std::fs::write(&aside2, &ours).unwrap();
+            std::fs::write(&record2, &prior2).unwrap();
+        });
+        let err = match refresh_once(&mut p, &mut state) {
+            Ok(_) => panic!("authority loss fails the refresh (never publishes)"),
+            Err(e) => e,
+        };
+        snapshot::pre_cleanup_hook::disarm();
+        assert!(
+            err.contains("lost its settlement authority"),
+            "the failure names the authority loss: {err:?}"
+        );
+        assert!(aside.is_file(), "premise: the hook ran at the boundary");
+        // Live last-good stays EXACT at the prior (the
+        // staged fold withheld — nothing advanced).
+        assert_eq!(p.folded_tip(), (Some(0), Some(0)), "live tip frozen");
+        assert_eq!(p.fold_totals(), (10, [10, 0, 0, 0]), "live totals frozen");
+        // BOTH payloads survive: the new bytes stand at
+        // the target, the prior payload at its stage.
+        let target_now = std::fs::read(&ckpt).unwrap();
+        assert_ne!(
+            target_now, prior_bytes,
+            "the new payload stands at the target"
+        );
+        let stages: Vec<_> = std::fs::read_dir(&ckpt_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".staging-"))
+            .collect();
+        assert_eq!(stages.len(), 1, "one prior stage stands: {stages:?}");
+        assert_eq!(
+            std::fs::read(ckpt_dir.join(&stages[0])).unwrap(),
+            prior_bytes,
+            "the prior payload survives byte-identical"
+        );
+        // Reopen AGREES with last-good (the governing
+        // prior record adopts the preserved prior).
+        drop(state);
+        let q = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+            .expect("reopen converges");
+        assert_eq!(q.folded_tip(), (Some(0), Some(0)), "reopen tip agrees");
+        assert_eq!(q.fold_totals(), (10, [10, 0, 0, 0]), "reopen totals agree");
+        assert!(
+            q.recovered_unsettled_prior(),
+            "the reopen reports the marker-bound recovery"
+        );
+        drop(q);
+        // Restoring the committed record reopens onto the
+        // new transaction (durable truth intact).
+        std::fs::remove_file(&record).unwrap();
+        std::fs::rename(&aside, &record).unwrap();
+        let q2 = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+            .expect("reopen on the restored tree");
+        assert_eq!(q2.folded_tip(), (Some(0), Some(1)), "the new tip stands");
+        assert_eq!(
+            q2.fold_totals(),
+            (20, [20, 0, 0, 0]),
+            "the new totals stand"
+        );
+        assert!(
+            !q2.recovered_unsettled_prior(),
+            "a settled commit reopens directly (no recovery)"
+        );
+        drop(q2);
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new133_namespace_replacement_after_entry_refuses() {
+        // P2fix20 NEW-133 (entry record + directory binding
+        // carried together): a failed staged flush that
+        // committed an entry carries the verified record
+        // AND its marker-directory binding back to live
+        // (fold/admission unadvanced) — a byte-identical
+        // namespace replacement then REFUSES (never binds
+        // the replacement and passes continuity), as does
+        // a byte-identical checkpoint-parent replacement
+        // (the parent binding crosses when first
+        // resolved). Pre-fix: the next refresh binds the
+        // replacement and commits (RED).
+        use super::super::snapshot;
+        for shape in ["marker-dir", "parent-dir"] {
+            let dir = std::env::temp_dir().join(format!(
+                "p2fix20-new133-ns-replace-{shape}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+            std::fs::write(
+                dir.join("window-0000000000.json"),
+                serde_json::to_string(&snapshot::test_envelope(0, 0, run, 10)).unwrap(),
+            )
+            .unwrap();
+            let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+            if shape == "marker-dir" {
+                std::fs::create_dir_all(&ckpt_dir).unwrap();
+            }
+            // (parent-dir: the parent starts ABSENT — the
+            // open defers unbound and the staged flush
+            // first-resolves it.)
+            let ckpt = ckpt_dir.join("n133.json");
+            let record = ckpt_dir.join(snapshot::SETTLED_DIR_NAME).join("n133.json");
+            let mut p =
+                snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+            let mut state = RefreshState::restore(&mut p);
+            let fresh_tip = p.folded_tip();
+            let fresh_totals = p.fold_totals();
+            if shape == "parent-dir" {
+                std::fs::create_dir_all(&ckpt_dir).unwrap();
+            }
+            // The staged flush commits its entry, then the
+            // data sync faults — live adopts the entry
+            // transition (record + bindings, fold unadvanced).
+            snapshot::stage_sync_fault::arm(1);
+            let first = refresh_once(&mut p, &mut state);
+            snapshot::stage_sync_fault::reset();
+            assert!(first.is_err(), "{shape}: premise: the faulted flush fails");
+            assert_eq!(p.folded_tip(), fresh_tip, "{shape}: live tip unadvanced");
+            assert_eq!(
+                p.fold_totals(),
+                fresh_totals,
+                "{shape}: live totals unadvanced"
+            );
+            // Byte-identical namespace replacement.
+            let record_bytes = std::fs::read(&record).unwrap();
+            if shape == "marker-dir" {
+                let marker_dir = record.parent().unwrap().to_path_buf();
+                std::fs::rename(&marker_dir, ckpt_dir.join("marker.aside-n133")).unwrap();
+                std::fs::create_dir_all(&marker_dir).unwrap();
+                std::fs::write(&marker_dir.join("n133.json"), &record_bytes).unwrap();
+            } else {
+                let aside = std::path::PathBuf::from(format!("{}.aside-n133", ckpt_dir.display()));
+                std::fs::rename(&ckpt_dir, &aside).unwrap();
+                std::fs::create_dir_all(&ckpt_dir).unwrap();
+                let marker_dir = ckpt_dir.join(snapshot::SETTLED_DIR_NAME);
+                std::fs::create_dir_all(&marker_dir).unwrap();
+                std::fs::write(&marker_dir.join("n133.json"), &record_bytes).unwrap();
+            }
+            let err = match refresh_once(&mut p, &mut state) {
+                Ok(_) => panic!("{shape}: a byte-identical namespace replacement refuses"),
+                Err(e) => e,
+            };
+            let want = if shape == "marker-dir" {
+                "record dir replaced"
+            } else {
+                "checkpoint dir replaced"
+            };
+            assert!(
+                err.contains(want),
+                "{shape}: the refusal names the replacement: {err:?}"
+            );
+            drop(state);
+            drop(p);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&ckpt_dir);
+            let _ = std::fs::remove_dir_all(format!("{}.aside-n133", ckpt_dir.display()));
+        }
+    }
+
+    #[test]
+    fn new133_no_transition_retry_commits() {
+        // P2fix20 NEW-133 (Tier-1 adjacent edge — the
+        // no-transition path is untouched): a failed flush
+        // that committed NO entry carries nothing back —
+        // the same-instance retry commits whole and
+        // reopens exact (the binding carry cannot poison
+        // a flush that never transitioned). (Control —
+        // GREEN both sides.)
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix20-new133-no-transition-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("n133b.json");
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::restore(&mut p);
+        refresh_once(&mut p, &mut state).expect("first refresh commits");
+        std::fs::write(
+            dir.join("window-0000000001.json"),
+            serde_json::to_string(&snapshot::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        snapshot::stage_sync_fault::arm(1);
+        let first = refresh_once(&mut p, &mut state);
+        snapshot::stage_sync_fault::reset();
+        assert!(first.is_err(), "premise: the faulted flush fails");
+        refresh_once(&mut p, &mut state).expect("the retry commits");
+        drop(state);
+        drop(p);
+        let q = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+            .expect("reopen on the committed tree");
+        assert_eq!(q.folded_tip(), (Some(0), Some(1)), "the new tip stands");
+        assert_eq!(q.fold_totals(), (20, [20, 0, 0, 0]), "the new totals stand");
+        assert!(
+            !q.recovered_unsettled_prior(),
+            "a settled commit reopens directly (no recovery)"
+        );
+        drop(q);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&ckpt_dir);
     }
