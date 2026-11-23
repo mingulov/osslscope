@@ -661,7 +661,7 @@ enum RawJson {
     Null,
     Bool,
     Number,
-    String,
+    String(String),
     Array(Vec<RawJson>),
     Object(Vec<(String, RawJson)>),
 }
@@ -696,11 +696,11 @@ impl<'de> serde::Deserialize<'de> for RawJson {
                     Err(E::custom("doc: non-finite number"))
                 }
             }
-            fn visit_str<E: serde::de::Error>(self, _v: &str) -> Result<RawJson, E> {
-                Ok(RawJson::String)
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<RawJson, E> {
+                Ok(RawJson::String(v.to_owned()))
             }
-            fn visit_string<E: serde::de::Error>(self, _v: String) -> Result<RawJson, E> {
-                Ok(RawJson::String)
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<RawJson, E> {
+                Ok(RawJson::String(v))
             }
             fn visit_seq<A: serde::de::SeqAccess<'de>>(
                 self,
@@ -970,6 +970,31 @@ pub fn check_envelope_raw_duplicates(text: &str) -> Result<(), String> {
     let raw: RawJson =
         serde_json::from_str(text).map_err(|error| format!("envelope: invalid JSON ({error})"))?;
     walk_raw_duplicates(&raw, &mut vec![], "envelope")
+}
+
+/// Top-level raw string members for one key, in wire order
+/// (P2fix18 NEW-110 — duplicate-preserving: a last-wins
+/// `Value` cannot show a first `schema` hidden behind a
+/// second, so settlement-authority classification reads the
+/// raw wire instead). Non-string members for `key` are
+/// skipped (never claimed); non-object text and invalid JSON
+/// report `None` (claim nothing — the strict parser convicts
+/// them on its own path).
+pub fn raw_top_string_members(text: &str, key: &str) -> Option<Vec<String>> {
+    let raw: RawJson = serde_json::from_str(text).ok()?;
+    match raw {
+        RawJson::Object(members) => Some(
+            members
+                .into_iter()
+                .filter(|(k, _)| k == key)
+                .filter_map(|(_, v)| match v {
+                    RawJson::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// NEW-33 fix9: raw-text document intake — the RAW section checks

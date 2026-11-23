@@ -1836,10 +1836,16 @@ fn h5_t3_every_device_site_names_one_domain() {
         // `validate_opened_parent` (current-occupant stat vs the
         // opened fd's own identity, bound on match); still
         // raw-vs-raw native identity, same single domain.]
+        // [p2fix18 NEW-112: handle-derived binding — the
+        // pathname sampler is deleted; the stored binding is
+        // the OPENED parent handle's own fstat (dev, ino),
+        // returned with the handle — still raw-vs-raw
+        // native identity, same single domain, never joined
+        // to maps text, encoded devices, or display values.]
         (
             "src/presentation/snapshot.rs",
             "raw",
-            "Some((md.dev(), md.ino()))",
+            "Ok((file, (md.dev(), md.ino())))",
             1,
         ),
         (
