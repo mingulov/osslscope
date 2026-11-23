@@ -345,6 +345,24 @@ fn ckpt_for(dir: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.checkpoint.json", dir.display()))
 }
 
+/// Reserved-namespace record path for a checkpoint (P2fix16
+/// NEW-96 craft support — mirrors the writer's layout).
+fn record_path_for(ckpt: &std::path::Path) -> std::path::PathBuf {
+    let parent = ckpt.parent().unwrap_or_else(|| std::path::Path::new(""));
+    let name = ckpt.file_name().unwrap_or_default();
+    parent.join(".osslscope-settled").join(name)
+}
+
+/// Void every settlement record for a checkpoint (P2fix15
+/// NEW-88, namespaces P2fix16 NEW-96 — out-of-band craft
+/// support): both the reserved-namespace record and any
+/// legacy beside-target record go, so the craft exercises
+/// the legacy content-validation path.
+fn void_settlement(ckpt: &std::path::Path) {
+    let _ = std::fs::remove_file(record_path_for(ckpt));
+    let _ = std::fs::remove_file(format!("{}.settled", ckpt.display()));
+}
+
 fn read_names(dir: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -3463,7 +3481,7 @@ fn gate29_contract_triggers_and_coverage_across_all_paths() {
         // productions only; the craft exercises the legacy
         // content-validation path, whose rules are identical
         // on the marker path).
-        let _ = std::fs::remove_file(format!("{}.settled", ckpt.display()));
+        void_settlement(&ckpt);
     };
     retamper(&|v| {
         v["accumulators"]["latest"]["api_activity"] = serde_json::json!([]);
@@ -4728,7 +4746,7 @@ fn new19_required_nullable_presence_and_null_rules_across_all_gates() {
         // productions only; the craft exercises the legacy
         // content-validation path, whose rules are identical
         // on the marker path).
-        let _ = std::fs::remove_file(format!("{}.settled", ckpt.display()));
+        void_settlement(&ckpt);
     };
     // Absent classes ride the UNCERTAIN shape (present-null
     // applies; absent refuses — the preserved distinction).
@@ -6617,7 +6635,7 @@ fn new2_restore_rejects_unbound_watermark() {
         // productions only; the craft exercises the legacy
         // content-validation path, whose rules are identical
         // on the marker path).
-        let _ = std::fs::remove_file(format!("{}.settled", ckpt.display()));
+        void_settlement(&ckpt);
     };
     // Sanity: the untampered checkpoint restores.
     snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
@@ -7153,7 +7171,7 @@ fn new4_restore_revalidates_typed_state() {
         // productions only; the craft exercises the legacy
         // content-validation path, whose rules are identical
         // on the marker path).
-        let _ = std::fs::remove_file(format!("{}.settled", ckpt.display()));
+        void_settlement(&ckpt);
     };
     // Non-vocabulary counter in restored signals.
     retamper(&|v| {
@@ -7502,13 +7520,12 @@ fn new34_concurrent_distinct_checkpoints_share_no_staging() {
         );
         let _ = snapshot::Presenter::open_with_checkpoint(&dir, ckpt, 1, "export")
             .expect("checkpoint reloads");
-        // Settlement record (P2fix15 NEW-88): each target
-        // carries its own record confirming its own bytes
-        // (per-target citizens — never shared, never
-        // crossed).
+        // Settlement record (P2fix15 NEW-88, namespace P2fix16
+        // NEW-96): each target carries its own record
+        // confirming its own bytes (per-target citizens —
+        // never shared, never crossed).
         let settled: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(format!("{}.settled", ckpt.display())).unwrap())
-                .unwrap();
+            serde_json::from_slice(&std::fs::read(record_path_for(ckpt)).unwrap()).unwrap();
         assert_eq!(
             settled["target_sha256"], v["sha256"],
             "the record confirms its own target: {ckpt:?}"
@@ -7517,7 +7534,7 @@ fn new34_concurrent_distinct_checkpoints_share_no_staging() {
     let residue: Vec<_> = std::fs::read_dir(&parent)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n != "w.json" && n != "w.bak" && n != "w.json.settled" && n != "w.bak.settled")
+        .filter(|n| n != "w.json" && n != "w.bak" && n != ".osslscope-settled")
         .collect();
     assert!(residue.is_empty(), "no staging residue: {residue:?}");
 }
@@ -10358,38 +10375,46 @@ fn envelope_raw_duplicate_trace_keys_reject() {
     assert!(!err.contains("`mode`"), "key must not echo: {err}");
 }
 
-/// Complete-field phrase match (P2fix15 NEW-91): the
-/// phrase must occur AND the first byte after it must not
-/// be an ASCII digit — `seq=20` never satisfies `seq=2`
-/// (the old substring wait accepted the decimal prefix).
-/// Mid-phrase boundaries are structural (the fixed
-/// `watch.rs` words + spaces pin every interior field, so
-/// only the trailing digits need the bound).
-fn phrase_eq(line: &str, phrase: &str) -> bool {
-    match line.find(phrase) {
-        Some(i) => !line
-            .as_bytes()
-            .get(i + phrase.len())
-            .is_some_and(|b| b.is_ascii_digit()),
-        None => false,
-    }
+/// Complete-suffix match (P2fix16 NEW-98 — supersedes
+/// the P2fix15 NEW-91 two-phrase match): the line must
+/// carry the COMPLETE contiguous production suffix with
+/// exact delimiters — `(accepted tip gen={g} seq={s};
+/// rejected window seq={r}; retaining last-good)` — as
+/// ONE contiguous string at the END of the line (the
+/// production `watch.rs` outage note ends there), behind
+/// the fixed `osslscope: watch: ` prefix. Malformed token
+/// endings (`seq=2x`, trailing commas, broken `;`
+/// delimiters) never match — the expected suffix pins
+/// every delimiter byte — and decoy fragments in the
+/// diagnostic prefix can no longer combine with the real
+/// suffix (the two fields are never matched
+/// independently).
+fn suffix_eq(line: &str, want_rejected: u64, want_gen: u64, want_seq: u64) -> bool {
+    let suffix = format!(
+        "(accepted tip gen={want_gen} seq={want_seq}; rejected window seq={want_rejected}; retaining last-good)"
+    );
+    line.starts_with("osslscope: watch: ") && line.ends_with(suffix.as_str())
 }
 
-/// Exact-scan synchronization (P2fix15 NEW-91 — supersedes
-/// the P2fix14 NEW-84 substring wait): wait until ONE outage
-/// note names BOTH the explicit rejected window
+/// Exact-scan synchronization (P2fix16 NEW-98 — supersedes
+/// the P2fix15 NEW-91 two-phrase wait): wait until ONE outage
+/// note carries the COMPLETE contiguous production suffix
+/// (`(accepted tip gen={g} seq={s}; rejected window seq={r};
+/// retaining last-good)` with exact delimiters) at the END
+/// of the line — the explicit rejected window
 /// (`want_rejected` — the filename sequence that scan broke
 /// at, never the schema-error text) AND the accepted tip
-/// (`want_gen`/`want_seq`) on the SAME line, matched as
-/// COMPLETE fields. Same-line atomicity IS the same-scan
-/// proof: the watch loop prints the live folded tip beside
-/// the rejection from the single scan that just ran (one
-/// `eprintln!` — pipe buffering cannot fuse lines from
-/// different scans). No buffered-note counting: tail-only
-/// scans (the tip is elsewhere — they folded no prefix) can
-/// never satisfy the wait, however many queue up (codex
-/// R14's counterexample: two queued tail errors from before
-/// the prefix landed).
+/// (`want_gen`/`want_seq`) in ONE match, never two
+/// independent field matches. Same-line atomicity IS the
+/// same-scan proof: the watch loop prints the live folded
+/// tip beside the rejection from the single scan that just
+/// ran (one `eprintln!` — pipe buffering cannot fuse lines
+/// from different scans). No buffered-note counting:
+/// tail-only scans (the tip is elsewhere — they folded no
+/// prefix) can never satisfy the wait, however many queue
+/// up (codex R14's counterexample: two queued tail errors
+/// from before the prefix landed satisfied the old two-note
+/// count).
 fn drain_until_exact_scan(
     rx: &std::sync::mpsc::Receiver<(bool, String)>,
     out_lines: &mut Vec<String>,
@@ -10399,20 +10424,15 @@ fn drain_until_exact_scan(
     want_gen: u64,
     want_seq: u64,
 ) {
-    let tip = format!("accepted tip gen={want_gen} seq={want_seq}");
-    let rejected = format!("rejected window seq={want_rejected}");
     loop {
         for line in err_lines.iter() {
-            if phrase_eq(line, tip.as_str())
-                && phrase_eq(line, rejected.as_str())
-                && line.contains("retaining last-good")
-            {
+            if suffix_eq(line, want_rejected, want_gen, want_seq) {
                 return;
             }
         }
         if std::time::Instant::now() >= deadline {
             panic!(
-                "timed out waiting for the same-scan tip+tail note ({rejected:?} + {tip:?}); out={out_lines:?} err={err_lines:?}"
+                "timed out waiting for the same-scan tip+tail note (rejected={want_rejected} gen={want_gen} seq={want_seq}); out={out_lines:?} err={err_lines:?}"
             );
         }
         match rx.recv_timeout(std::time::Duration::from_millis(200)) {
@@ -10604,6 +10624,97 @@ fn new91_multidigit_tip_satisfies_exactly() {
         err_lines.len(),
         2,
         "the prefix line waited, the exact line satisfied: {err_lines:?}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "timed out waiting for the same-scan tip+tail note")]
+fn new98_malformed_tokens_never_satisfy() {
+    // P2fix16 NEW-98 (+ NEW-65/NEW-78/NEW-84/NEW-91-OPEN —
+    // malformed-token negative, synthetic): notes whose
+    // fields carry MALFORMED token endings (`seq=2x`,
+    // trailing commas, empty values, broken delimiters)
+    // NEVER satisfy the wait — the waiter matches the
+    // COMPLETE contiguous production suffix with exact
+    // delimiters, not a prefix plus "any nondigit".
+    // Pre-fix: `phrase_eq` accepts any nondigit after the
+    // prefix, so every `seq=2x`-shaped line below satisfies
+    // (RED).
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    for suffix in [
+        "(accepted tip gen=1 seq=2x; rejected window seq=3; retaining last-good)",
+        "(accepted tip gen=1 seq=2, rejected window seq=3; retaining last-good)",
+        "(accepted tip gen=1 seq=2 rejected window seq=3; retaining last-good)",
+        "(accepted tip gen=1x seq=2; rejected window seq=3; retaining last-good)",
+        "(accepted tip gen=1 seq=; rejected window seq=3; retaining last-good)",
+        "(accepted tip gen=1 seq=2; rejected window seq=3x; retaining last-good)",
+        "(accepted tip gen=1 seq=2; rejected window seq=3, retaining last-good)",
+        "(accepted tip gen=1 seq=2; rejected window seq=; retaining last-good)",
+        "(accepted tip gen=1 seq=2; rejected window seq=3; retaining last-good",
+        "accepted tip gen=1 seq=2; rejected window seq=3; retaining last-good)",
+    ] {
+        tx.send((
+            false,
+            format!("osslscope: watch: envelope without service-window-v1 schema {suffix}"),
+        ))
+        .unwrap();
+    }
+    drop(tx);
+    let mut out_lines: Vec<String> = vec![];
+    let mut err_lines: Vec<String> = vec![];
+    drain_until_exact_scan(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        std::time::Instant::now() + std::time::Duration::from_millis(500),
+        3,
+        1,
+        2,
+    );
+}
+
+#[test]
+#[should_panic(expected = "timed out waiting for the same-scan tip+tail note")]
+fn new98_decoy_prefix_fragments_never_satisfy() {
+    // P2fix16 NEW-98 (+ NEW-65/NEW-78/NEW-84/NEW-91-OPEN —
+    // decoy-prefix negative, synthetic): notes whose
+    // diagnostic prefix carries DECOY fragments (a tip
+    // phrase, a rejected-window phrase, or even a whole
+    // suffix copy inside the error text) while the REAL
+    // production suffix names DIFFERENT values NEVER
+    // satisfy the wait — the waiter matches ONE complete
+    // contiguous production suffix, never two independent
+    // fields that combine across the prefix/suffix split.
+    // Pre-fix: the two `phrase_eq` calls match
+    // independently, so every decoy below satisfies (RED).
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    for line in [
+        // Decoy tip in the prefix + a real suffix with a
+        // different tip.
+        "osslscope: watch: accepted tip gen=1 seq=2 please (accepted tip gen=9 seq=9; rejected window seq=3; retaining last-good)",
+        // Decoy rejected window in the prefix + a real
+        // suffix with a different tail.
+        "osslscope: watch: rejected window seq=3 seen (accepted tip gen=1 seq=2; rejected window seq=30; retaining last-good)",
+        // A whole suffix copy in the prefix + a real
+        // suffix with different values.
+        "osslscope: watch: note (accepted tip gen=1 seq=2; rejected window seq=3; retaining last-good) then (accepted tip gen=1 seq=2; rejected window seq=4; retaining last-good)",
+        // Decoy tip AND decoy tail split across the
+        // prefix, real suffix entirely different.
+        "osslscope: watch: accepted tip gen=1 seq=2 / rejected window seq=3 (accepted tip gen=7 seq=7; rejected window seq=8; retaining last-good)",
+    ] {
+        tx.send((false, line.to_string())).unwrap();
+    }
+    drop(tx);
+    let mut out_lines: Vec<String> = vec![];
+    let mut err_lines: Vec<String> = vec![];
+    drain_until_exact_scan(
+        &rx,
+        &mut out_lines,
+        &mut err_lines,
+        std::time::Instant::now() + std::time::Duration::from_millis(500),
+        3,
+        1,
+        2,
     );
 }
 

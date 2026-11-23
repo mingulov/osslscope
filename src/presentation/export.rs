@@ -4283,6 +4283,7 @@ mod tests {
         .unwrap();
         // SINK: the refresh commits the new transaction AND
         // reports the cleanup residue on the served push.
+        snapshot::settle_cleanup_fault::reset();
         snapshot::settle_cleanup_fault::arm(1);
         let qp = refresh_once(&mut p, &mut state)
             .expect("a settled commit advances live despite cleanup failure");
@@ -4325,6 +4326,225 @@ mod tests {
             .expect("reopen on the settled checkpoint");
         assert_eq!(q.folded_tip(), (Some(0), Some(1)), "the new tip stands");
         assert_eq!(q.fold_totals(), (20, [20, 0, 0, 0]), "the new totals stand");
+        assert!(
+            !q.recovered_unsettled_prior(),
+            "a settled commit reopens directly (no recovery)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new94_refresh_marker_sync_failure_retries_whole_and_reports() {
+        // P2fix16 NEW-94 (+ NEW-9/NEW-16/NEW-70-OPEN — the
+        // public layer): a marker-sync failure inside the
+        // joint commit fails the refresh (the staged
+        // transaction is discarded — live state untouched,
+        // no mid-fold resume — and the durable state rolls
+        // back to the prior, so live and restart agree)
+        // and the SAME transaction retries whole after the
+        // fault clears; the shutdown flush reports the
+        // same settlement outcome (never a silent
+        // discard).
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix16-new94-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("ckpt.json");
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::default();
+        refresh_once(&mut p, &mut state).expect("first refresh commits watermark 0");
+        let file_before = std::fs::read(&ckpt).unwrap();
+        // A second window lands; the joint commit's marker
+        // sync fails past the decision.
+        std::fs::write(
+            dir.join("window-0000000001.json"),
+            serde_json::to_string(&snapshot::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        snapshot::marker_sync_fault::arm(1);
+        let err = refresh_once(&mut p, &mut state)
+            .err()
+            .expect("the undecided commit fails the refresh");
+        assert!(
+            err.contains("checkpoint flush") && err.contains("directory sync failed"),
+            "the failure is the real post-decision rollback: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            file_before,
+            "the failed refresh keeps the committed checkpoint bytes"
+        );
+        // The SAME transaction retries whole (calls 10+10,
+        // watermark 1 — a mid-fold resume would double-fold).
+        let qp = refresh_once(&mut p, &mut state).expect("the transaction retries whole");
+        assert_eq!(qp.snap.source.window_seq, Some(1), "the tip advances once");
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        assert_eq!(body["watermark_seq"], serde_json::json!(1));
+        assert_eq!(
+            body["accumulators"]["calls_total"],
+            serde_json::json!(20),
+            "exactly one fold of each window (no double fold past the abort)"
+        );
+        // Shutdown reporting reflects the real settlement
+        // outcome too (the marker fault re-armed).
+        snapshot::marker_sync_fault::arm(1);
+        let err = super::shutdown_flush(&mut p)
+            .expect_err("an unconfirmed shutdown flush must report its error");
+        assert!(
+            format!("{err:?}").contains("directory sync failed"),
+            "shutdown reports the settlement failure: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new97_serve_shutdown_cleanup_fault_reports_and_reopens_first() {
+        // P2fix16 NEW-97 (+ NEW-9/NEW-70/NEW-89-OPEN — the
+        // REAL public path, not direct `shutdown_flush`
+        // calls): REAL serve publication under the
+        // post-settlement cleanup fault — the served sink
+        // carries the FIRST settled transaction's exact
+        // values, the shutdown reports `Ok` WITH the
+        // residue on its own diagnostic line, and reopening
+        // the FIRST settled transaction BEFORE any later
+        // write adopts it exactly (live, durable, and
+        // restart aligned — no live-behind).
+        use super::super::snapshot;
+        use std::sync::{Arc, atomic::AtomicBool};
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix16-new97-serve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let checkpoint = ckpt_dir.join("ckpt.json");
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            port
+        };
+        // One cleanup fault (process-global — the serve
+        // collector consumes it on its own thread): the
+        // first tick is a NOREPLACE first commit (no
+        // cleanup stage exists, so the fault survives it)
+        // and the shutdown flush is the EXCHANGE rewrite
+        // that faults.
+        snapshot::settle_cleanup_fault::reset();
+        snapshot::settle_cleanup_fault::arm(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let out = dir.clone();
+        let bodies: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let bodies2 = bodies.clone();
+        let _ = super::take_shutdown_reports();
+        let handle = std::thread::spawn(move || {
+            serve_with_shutdown(
+                Options {
+                    out,
+                    listen: format!("127.0.0.1:{port}"),
+                    poll_secs: 60,
+                    otlp: None,
+                    checkpoint: Some(checkpoint),
+                },
+                stop2,
+                Some(Arc::new(move |body: &str| {
+                    bodies2.lock().unwrap().push(body.to_string());
+                })),
+            )
+        });
+        // Scrape until the first tick serves (bounded —
+        // the collector refreshes immediately).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut served = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(mut stream) = std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
+                use std::io::{Read as _, Write as _};
+                let _ = stream.write_all(b"GET /metrics HTTP/1.0\r\n\r\n");
+                let mut text = String::new();
+                let _ = stream.read_to_string(&mut text);
+                if !text.contains("no snapshot yet") && text.contains("osslscope_epoch_calls_total")
+                {
+                    served = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(served, "serve published the first transaction");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let code = handle.join().unwrap();
+        assert_eq!(
+            code,
+            std::process::ExitCode::SUCCESS,
+            "serve stays outage-compatible"
+        );
+        // SINK: the served exposition carries the FIRST
+        // settled transaction's exact values.
+        let bodies = bodies.lock().unwrap();
+        assert!(!bodies.is_empty(), "the scrape callback observed the sink");
+        let body = bodies.last().unwrap();
+        assert!(
+            body.contains("osslscope_epoch_calls_total{lane=\"legacy_exclusive\"} 10\n"),
+            "the sink carries the exact lane total: {body:?}"
+        );
+        assert!(
+            body.contains("osslscope_exporter_series_overflow_total 0\n"),
+            "the sink carries the exact overflow total: {body:?}"
+        );
+        assert!(
+            !body.contains(".staging-"),
+            "the residue rides separately, never in the sink: {body:?}"
+        );
+        // SHUTDOWN: the persist reports `Ok` WITH the
+        // residue on its own diagnostic line.
+        let reports = super::take_shutdown_reports();
+        assert!(
+            reports.iter().any(|l| l
+                .contains("osslscope: shutdown checkpoint flush committed with residue")
+                && l.contains(".staging-")),
+            "the shutdown persist reports the residue separately: {reports:?}"
+        );
+        // REOPEN FIRST: before any later write, the FIRST
+        // settled transaction adopts exactly (live ==
+        // durable — no live-behind).
+        let q = snapshot::Presenter::open_with_checkpoint(
+            &dir,
+            &ckpt_dir.join("ckpt.json"),
+            1,
+            "export",
+        )
+        .expect("reopen on the first settled transaction");
+        assert_eq!(q.folded_tip(), (Some(0), Some(0)), "the tip stands");
+        assert_eq!(q.fold_totals(), (10, [10, 0, 0, 0]), "the totals stand");
         assert!(
             !q.recovered_unsettled_prior(),
             "a settled commit reopens directly (no recovery)"
