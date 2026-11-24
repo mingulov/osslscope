@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
-## 0.7.0 (candidate — 2026-11-24)
+## 0.7.0 (2026-11-24)
 
 - Interim v0.7.0: Phase 1+2 aggregate-only close-out over 0.6.0 — NOT the
   feature-complete milestone once planned under this number (ARM64,

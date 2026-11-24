@@ -211,6 +211,26 @@ collision: `osslscope inspect` (process/module inventory) is unrelated
 to `docker inspect` (container config; used to verify
 `Privileged=false` and the cap set).
 
+## Known issues (0.7.0)
+
+Honest limits of this release; all planned for later work:
+
+- Unprivileged first runs see limited evidence (other users' processes
+  need privileges to inspect); run `--help` first, privileged runs where
+  the docs say so.
+- Short-lived external processes can be missed between discovery and
+  attach; results stay PARTIAL rather than invented.
+- No pre-armed library mode yet: you cannot enroll a library by
+  path/hash/build-id for instant attach (planned next).
+- Latency/rate numbers are characterization-only (OPEN); `--trace`
+  latency/status/all degrade to aggregate-only on every public path.
+- Service trace serving is deferred; a fresh service starts PARTIAL
+  (clean-COMPLETE bootstrap is future work).
+- Fetch/load/query evidence never means execution: requesting an
+  algorithm is not using it.
+- Known intermittent test/harness flakes (H5, SIGINT, drain, G3 attach,
+  w079) stay OPEN with cause unproved; batteries rerun them on record.
+
 ## License
 
 GPL-3.0-or-later for the host, documentation and scripts. BPF/common and
