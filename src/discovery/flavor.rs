@@ -14,6 +14,8 @@
 //! - Fork split: `BORINGSSL_`/`bcm_` vs `AWSLC_` symbol prefixes; a
 //!   crypto-ish library with neither is `UnknownLookalike` (fail-closed:
 //!   never mislabeled OpenSSL). P5 qualifies against real fork builds.
+//!   Specificity ordering (R0): `AWSLC_` is checked first because real
+//!   AWS-LC also exports compat `BORINGSSL_*` symbols.
 
 use std::collections::HashSet;
 
@@ -116,10 +118,13 @@ pub fn classify_symbols<'a>(
                 minor: None,
             },
         }
-    } else if ev.has_boring_prefix && crypto_shaped {
-        Flavor::BoringSSL
+    // R0 specificity ordering: real AWS-LC exports BOTH prefixes
+    // (`AWSLC_*` plus compat `BORINGSSL_*`), while `AWSLC_` never
+    // appears in BoringSSL — so the AWSLC arm goes first.
     } else if ev.has_awslc_prefix && crypto_shaped {
         Flavor::AwsLc
+    } else if ev.has_boring_prefix && crypto_shaped {
+        Flavor::BoringSSL
     } else if crypto_shaped {
         Flavor::UnknownLookalike
     } else {
@@ -264,6 +269,18 @@ mod tests {
             classify_symbols(a.iter().map(String::as_str), b"").0,
             Flavor::AwsLc
         );
+    }
+
+    /// R0: real AWS-LC exports BOTH `AWSLC_*` and compat `BORINGSSL_*`
+    /// (e.g. `BORINGSSL_self_test`) symbols, so a boring-first rule
+    /// mislabels it BoringSSL. `AWSLC_` is AWS-LC-specific while
+    /// `BORINGSSL_` is shared, hence specificity ordering: AWSLC wins.
+    #[test]
+    fn real_awslc_both_prefixes_classifies_awslc() {
+        let s = syms(&["EVP_DigestInit", "BORINGSSL_self_test", "AWSLC_some_fn"]);
+        let (f, ev) = classify_symbols(s.iter().map(String::as_str), b"");
+        assert_eq!(f, Flavor::AwsLc);
+        assert!(ev.has_boring_prefix && ev.has_awslc_prefix);
     }
 
     #[test]
