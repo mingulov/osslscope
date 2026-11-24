@@ -2059,9 +2059,10 @@ enum NameState {
 /// Stat a dirfd-relative name WITHOUT following links
 /// (P2fix22 NEW-145 — absence-permitting call sites only:
 /// the post-unlink confirm, the completed-removal resume,
-/// and the authority-loss restore proof; every other
-/// caller keeps the fail-closed `name_id`/`name_refers_to`
-/// readings).
+/// the authority-loss restore proof, and (P2fix23 NEW-153)
+/// the displaced-retry and direct-retry absence reads;
+/// every other caller keeps the fail-closed
+/// `name_id`/`name_refers_to` readings).
 fn name_state(dir_fd: &std::fs::File, name: &std::ffi::CString) -> NameState {
     // Fault injection (P2fix22 NEW-145, test-only): a
     // transient lookup failure (inert at zero).
@@ -2105,14 +2106,75 @@ static TRASH_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// displacement is never silently kept).
 fn trash_name_for(orig: &std::ffi::CString) -> std::ffi::CString {
     let lossy = String::from_utf8_lossy(orig.as_bytes());
+    let stem = trash_stem_truncate(&lossy);
+    let ctr = TRASH_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::ffi::CString::new(format!("{stem}.staging-trash-{}-{ctr}", std::process::id()))
+        .expect("static shape")
+}
+
+/// Truncate a trash stem exactly like [`trash_name_for`]
+/// (P2fix23 NEW-152 — one rule, shared by naming and
+/// recovery scoping): the first 120 bytes at a character
+/// boundary.
+fn trash_stem_truncate(lossy: &str) -> &str {
     let mut end = lossy.len().min(120);
     while end > 0 && !lossy.is_char_boundary(end) {
         end -= 1;
     }
-    let stem = &lossy[..end];
-    let ctr = TRASH_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::ffi::CString::new(format!("{stem}.staging-trash-{}-{ctr}", std::process::id()))
-        .expect("static shape")
+    &lossy[..end]
+}
+
+/// Split a displacement-trash name into its stem (P2fix23
+/// NEW-152): `{stem}.staging-trash-{pid}-{ctr}` parses from
+/// the RIGHT (the numeric `{pid}-{ctr}` tail anchors the
+/// split, so a stem that itself contains the marker — a
+/// checkpoint name carrying `.staging-trash-`, or a
+/// re-displaced trash — still resolves to its full stem).
+/// `None` for non-trash shapes (never candidates, never
+/// counted).
+fn trash_stem_of(name: &str) -> Option<&str> {
+    let (head, ctr) = name.rsplit_once('-')?;
+    if ctr.is_empty() || !ctr.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (head, pid) = head.rsplit_once('-')?;
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    head.strip_suffix(".staging-trash")
+}
+
+/// True iff a directory entry is a settlement-recovery
+/// candidate for THIS checkpoint (P2fix23 NEW-152 —
+/// identity BEFORE budget): a stage of this checkpoint
+/// (`{target}.staging-...`), or displacement trash whose
+/// stem derives from this checkpoint's own names — the
+/// target itself (a displaced target withdrawal) or one of
+/// its stages (a displaced stage) — matched through the
+/// same 120-byte truncation the trash names use, so every
+/// supported filename length scopes (short names match the
+/// full stage prefix; long names match the truncated
+/// stem). Unrelated sibling residue is neither read nor
+/// counted toward the 64-candidate bound.
+fn recovery_candidate_for(name: &str, target_name: &str) -> bool {
+    let stage_prefix = format!("{target_name}.staging-");
+    if name.starts_with(&stage_prefix) {
+        return true;
+    }
+    let Some(stem) = trash_stem_of(name) else {
+        return false;
+    };
+    // A displaced target withdrawal (any length — the
+    // truncation of the target itself).
+    if stem == trash_stem_truncate(target_name) {
+        return true;
+    }
+    // A displaced stage (the truncation of the stage
+    // prefix — exact for long names, a proper prefix for
+    // short ones; the empty guard keeps a degenerate
+    // prefix from matching every stem).
+    let scoped = trash_stem_truncate(&stage_prefix);
+    !scoped.is_empty() && stem.starts_with(scoped)
 }
 
 /// Identity-conditional owned removal (P2fix15 NEW-87,
@@ -2209,8 +2271,11 @@ struct RemovalPlace<'a> {
 /// placement through the removal (`None` skips placement
 /// — direct unit-test calls only; every production
 /// caller passes it); `pre_unlink` (when set) re-proves
-/// commit authority fused before the unlink — a failure
-/// restores the displaced entry instead of removing it.
+/// commit authority AND the retirement target fused before
+/// the unlink — a failure restores the displaced entry
+/// instead of removing it — and re-proves again fused in
+/// the final re-proof (P2fix23 NEW-149 — a failure there
+/// refuses with the displaced entry standing declared).
 struct RemovalCtx<'a> {
     byte_cap: u64,
     place: Option<RemovalPlace<'a>>,
@@ -2779,17 +2844,19 @@ fn unlink_owned_inner_tracked(
     // production fusion untouched).
     #[cfg(test)]
     pre_unlink_hook::take_and_run();
-    // Pre-unlink authority gate (P2fix21 NEW-127 — fused
-    // with the unlink below): when set, re-prove commit
-    // authority HERE (a loss between the pre-removal
-    // check and the unlink restores the displaced entry
-    // instead of deleting it — both payloads stay
-    // recoverable). On gate failure the trash restores
-    // to the name (NOREPLACE — never overwrite) and the
-    // call fails WITHOUT removal; when the restore
-    // cannot run (or cannot prove what it moved), the
-    // prior stands declared at the trash — reported
-    // loudly, never deleted.
+    // Pre-unlink commit gate (commit authority P2fix21
+    // NEW-127, retirement target P2fix23 NEW-149 — fused
+    // with the unlink below): when set, re-prove the
+    // commit HERE (a loss or target rewrite between the
+    // pre-removal check and the unlink restores the
+    // displaced entry instead of deleting it — both
+    // payloads stay recoverable). On gate failure the
+    // trash restores to the name (NOREPLACE — never
+    // overwrite) and the call fails WITHOUT removal; when
+    // the restore cannot run (or cannot prove what it
+    // moved), the prior stands declared at the trash —
+    // reported loudly, never deleted. (The gate re-proves
+    // once more in the final re-proof below.)
     if let Some(gate) = ctx.pre_unlink {
         if let Err(gate_err) = gate() {
             // Bound-mutation protection for the
@@ -2902,6 +2969,26 @@ fn unlink_owned_inner_tracked(
                 trash_c.to_string_lossy()
             ),
         ));
+    }
+    // Pre-unlink gate re-proof (P2fix23 NEW-149 — the commit
+    // authority AND the retirement target re-prove HERE,
+    // fused with the unlinkat below: a loss or target
+    // rewrite between the pre-removal gate above and the
+    // unlink refuses with the displaced prior standing
+    // declared at its trash name (recoverable — never
+    // deleted). Runs only once the trash re-proved (a
+    // trash mismatch reports above, unchanged).
+    if let Some(gate) = ctx.pre_unlink {
+        if let Err(gate_err) = gate() {
+            track(&trash_c, true, false);
+            return Err(std::io::Error::new(
+                gate_err.kind(),
+                format!(
+                    "{gate_err} (refusing the unlinkat: the prior payload is preserved declared at {}; operator must inspect)",
+                    trash_c.to_string_lossy()
+                ),
+            ));
+        }
     }
     let trash_err: Option<std::io::Error> = if trash_injected {
         Some(std::io::Error::from_raw_os_error(libc::EIO))
@@ -3542,18 +3629,24 @@ enum LegacyScan {
 /// True iff the scanned bytes hold a COMPLETE
 /// structurally valid sibling checkpoint (P2fix21 NEW-126
 /// — the affirmative sibling proof for the oversize
-/// intake): one complete JSON document parses from the
-/// start (a truncated or malformed prefix proves nothing
-/// — it cannot mask a settlement claim beyond the scan),
-/// its `sha256` self-hash validates (the same bare-bytes
-/// computation the open path uses), its `schema` is the
-/// checkpoint schema, and only JSON whitespace trails
-/// within the scanned region. A raw schema token alone
-/// (decoy) is NOT affirmative — anything short of a
-/// complete valid sibling is Junk (fully scanned — EOF
-/// reached, nothing hides beyond) or Unresolved (past
-/// the bound — refuse fail-closed).
-fn scanned_holds_complete_sibling(scanned: &[u8]) -> bool {
+/// intake; raw uniqueness + full structural validation
+/// P2fix23 NEW-126): one complete JSON document parses
+/// from the start (a truncated or malformed prefix proves
+/// nothing — it cannot mask a settlement claim beyond the
+/// scan), its `sha256` self-hash validates (the same
+/// bare-bytes computation the open path uses), its
+/// `schema` is the checkpoint schema, only JSON
+/// whitespace trails within the scanned region, the raw
+/// text carries no duplicated member (the decoded `Value`
+/// already collapsed them — a hash-valid duplicate is
+/// present-but-invalid content, never affirmative), and
+/// the document carries the full checkpoint shape strict
+/// restore enforces (bound to this `out_dir`). A raw
+/// schema token alone (decoy) is NOT affirmative —
+/// anything short of a complete valid sibling is Junk
+/// (fully scanned — EOF reached, nothing hides beyond) or
+/// Unresolved (past the bound — refuse fail-closed).
+fn scanned_holds_complete_sibling(scanned: &[u8], out_dir: &Path) -> bool {
     let mut de = serde_json::Deserializer::from_slice(scanned);
     let v: serde_json::Value = match serde::de::Deserialize::deserialize(&mut de) {
         Ok(v) => v,
@@ -3573,12 +3666,303 @@ fn scanned_holds_complete_sibling(scanned: &[u8]) -> bool {
         obj.remove("sha256");
     }
     let bytes = serde_json::to_vec(&bare).unwrap_or_default();
-    sha256_hex(&bytes) == want
+    if sha256_hex(&bytes) != want {
+        return false;
+    }
+    // Raw uniqueness (P2fix23 NEW-126 — the decoded `Value`
+    // above already collapsed duplicates): a hash-valid
+    // document carrying any member twice is
+    // present-but-invalid content, never an affirmative
+    // sibling.
+    let Ok(text) = std::str::from_utf8(scanned) else {
+        return false;
+    };
+    if crate::schema::check_envelope_raw_duplicates(text).is_err() {
+        return false;
+    }
+    // Checkpoint structural validation (P2fix23 NEW-126 —
+    // the same required shape strict restore enforces).
+    sibling_checkpoint_shape_valid(&v, out_dir)
+}
+
+/// Validate a restored `latest` window exactly as strict
+/// restore does (P2fix23 NEW-126 — extracted verbatim from
+/// `load_checkpoint` so restore and the
+/// affirmative-sibling classifier share ONE validator and
+/// never diverge). `Err` carries the same label restore
+/// reported (callers map it through their own error).
+fn validate_latest_window(l: &serde_json::Value) -> Result<LatestWindow, &'static str> {
+    // Required-nullable presence (P2fix4 NEW-19/GATE29):
+    // the raw restored trace section enforces the SAME
+    // presence + null rules as intake BEFORE typed
+    // normalization — absent-vs-null stays distinct
+    // through restore (present-null applies, absent
+    // refuses, explicit null on non-nullables refuses).
+    if let Some(ts) = l
+        .get("signals")
+        .and_then(|s| s.get("trace"))
+        .filter(|t| !t.is_null())
+    {
+        crate::provider_observation::trace::check_trace_shape_presence(ts)
+            .map_err(|_| "latest.trace")?;
+    }
+    let w: LatestWindow = serde_json::from_value(l.clone()).map_err(|_| "latest")?;
+    if let Some(ts) = w.signals.trace.as_ref() {
+        ts.validate().map_err(|_| "latest.trace")?;
+    }
+    // Document-level contract (P2fix3 GATE29 — restore
+    // re-runs the SAME contract on the persisted minor
+    // + section + activity rows: trigger both
+    // directions + coverage reconciliation).
+    crate::provider_observation::trace::check_trace_contract(
+        w.schema_minor,
+        w.signals.trace.as_ref(),
+        Some(&serde_json::Value::Array(w.api_activity.clone())),
+    )
+    .map_err(|_| "latest.contract")?;
+    if !matches!(w.signals.state.as_str(), "complete" | "partial" | "fatal") {
+        return Err("latest.state");
+    }
+    if !matches!(
+        w.signals.outcome.as_str(),
+        "pass" | "violation" | "inconclusive" | "no_verdict" | "observe_only"
+    ) {
+        return Err("latest.outcome");
+    }
+    if w.signals.reasons.iter().any(|r| !valid_reason_word(r)) {
+        return Err("latest.reasons");
+    }
+    if w.signals
+        .counters
+        .iter()
+        .any(|c| !(validate_counter(c, false) || validate_counter(c, true)))
+    {
+        return Err("latest.counters");
+    }
+    if !valid_boot_id(&w.run_id.boot_id) {
+        return Err("latest.run_id");
+    }
+    if let Some(loss) = w.session_loss.as_ref() {
+        if loss
+            .lost_intervals
+            .iter()
+            .any(|it| crate::presentation::labels::loss_cause_index(&it.cause).is_none())
+        {
+            return Err("latest.loss_causes");
+        }
+    }
+    if let Some(active) = w.policy_active.as_ref() {
+        if active.sha256.len() != 64 || !active.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("latest.policy_digest");
+        }
+    }
+    // Restored window digest (P2fix4 NEW-4/PRIVACY —
+    // the sha publishes as `window_sha256`, so a
+    // non-digest refuses instead of projecting).
+    if w.sha.len() != 64 || !w.sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("latest.sha");
+    }
+    Ok(w)
+}
+
+/// True iff a decoded checkpoint document carries the full
+/// structurally required shape (P2fix23 NEW-126 — mirrors
+/// strict restore's required members with the SAME readers,
+/// so affirmative sibling classification admits exactly
+/// what restore would apply): top-level sequence members,
+/// required-nullable generation/watermark, the
+/// `accumulators` object with every always-written member,
+/// the `latest` window through the shared validator, the
+/// watermark/generation/latest binding, and the out-DIR
+/// binding (canonical equality, like restore — a sibling
+/// for another out-DIR is junk to this presenter). The two
+/// backward-compatible absences (`admission`,
+/// `previous_epoch`) validate only when present, exactly
+/// like restore.
+fn sibling_checkpoint_shape_valid(v: &serde_json::Value, out_dir: &Path) -> bool {
+    // Required-nullable generation/watermark (present,
+    // u64 or null — absent refuses).
+    let opt_present_u64 = |key: &str| -> Option<Option<u64>> {
+        match v.get(key) {
+            None => None,
+            Some(serde_json::Value::Null) => Some(None),
+            Some(n) => n.as_u64().map(Some),
+        }
+    };
+    let (Some(generation), Some(watermark)) = (
+        opt_present_u64("generation"),
+        opt_present_u64("watermark_seq"),
+    ) else {
+        return false;
+    };
+    if u64_at(v, "checkpoint_seq").is_none() || u64_at(v, "snapshot_seq").is_none() {
+        return false;
+    }
+    let Some(acc) = obj_at(v, "accumulators") else {
+        return false;
+    };
+    // Out-DIR binding (restore's source-directory rule —
+    // same canonical compare on both sides).
+    let bound = match str_at(v, "out_dir") {
+        Some(stored) => {
+            let (Ok(live), Ok(want)) = (
+                std::fs::canonicalize(out_dir),
+                std::fs::canonicalize(stored),
+            ) else {
+                return false;
+            };
+            live == want
+        }
+        None => false,
+    };
+    if !bound {
+        return false;
+    }
+    // Accumulator required members (same strict readers as
+    // restore — presence + type, never silent defaults).
+    if u64_at(acc, "calls_total").is_none()
+        || read_u64_4_strict(acc.get("lanes")).is_none()
+        || u64_at(acc, "retired_epoch").is_none()
+        || read_u64_12_strict(acc.get("epoch_by_cause")).is_none()
+        || read_u64_10_strict(acc.get("epoch_partial")).is_none()
+        || acc
+            .get("trace_unmeasured")
+            .and_then(|u| serde_json::from_value::<Vec<[u64; 2]>>(u.clone()).ok())
+            .is_none()
+        || u64_at(acc, "epoch_changes").is_none()
+        || u64_at(acc, "series_overflow").is_none()
+        || acc
+            .get("counted")
+            .and_then(|c| serde_json::from_value::<CountedRanges>(c.clone()).ok())
+            .is_none()
+        || acc
+            .get("sealed")
+            .and_then(|c| serde_json::from_value::<BTreeMap<String, SealedGross>>(c.clone()).ok())
+            .is_none()
+    {
+        return false;
+    }
+    match acc.get("current_run") {
+        None => return false,
+        Some(serde_json::Value::Null) => {}
+        Some(s) if s.is_string() => {}
+        _ => return false,
+    }
+    if obj_at(acc, "current_gross")
+        .and_then(read_stream_drops_strict)
+        .is_none()
+    {
+        return false;
+    }
+    if obj_at(acc, "current_close")
+        .and_then(read_stream_drops_strict)
+        .is_none()
+    {
+        return false;
+    }
+    for key in ["adopted_summary", "current_summary"] {
+        match acc.get(key) {
+            None => return false,
+            Some(serde_json::Value::Null) => {}
+            Some(g) if read_stream_drops_strict(g).is_some() => {}
+            _ => return false,
+        }
+    }
+    for key in [
+        "stream_seen_configured",
+        "stream_sealed_note",
+        "stream_mismatch_note",
+    ] {
+        if bool_at(acc, key).is_none() {
+            return false;
+        }
+    }
+    let Some(unstable) = arr_at(acc, "unstable") else {
+        return false;
+    };
+    for s in unstable {
+        let Some(flag) = s.as_str() else {
+            return false;
+        };
+        if !valid_unstable_flag(flag) {
+            return false;
+        }
+    }
+    let latest = match acc.get("latest") {
+        None => return false,
+        Some(serde_json::Value::Null) => None,
+        Some(l) => match validate_latest_window(l) {
+            Ok(w) => Some(w),
+            Err(_) => return false,
+        },
+    };
+    // Export starts (always written; null on watch-path
+    // checkpoints that never saved any).
+    match acc.get("export_starts") {
+        None => return false,
+        Some(serde_json::Value::Null) => {}
+        Some(e) => {
+            let Some(pair) = e.as_array() else {
+                return false;
+            };
+            if pair.len() != 2 || pair[0].as_u64().is_none() || pair[1].as_u64().is_none() {
+                return false;
+            }
+        }
+    }
+    // Bound-state cross-check (same rule as restore:
+    // watermark binds to the restored latest window).
+    match (&latest, watermark, generation) {
+        (None, None, None) => {}
+        (Some(w), Some(wm), Some(g)) if wm == w.seq && g == w.generation => {}
+        _ => return false,
+    }
+    // Checkpoint-bound admission (backward-compatible
+    // absence; present records validate).
+    if let Some(a) = acc.get("admission").filter(|a| !a.is_null()) {
+        let Ok(snap) = serde_json::from_value::<super::budget::BudgetSnapshot>(a.clone()) else {
+            return false;
+        };
+        if snap.admitted.len() > super::budget::EPOCH_SERIES_CAP {
+            return false;
+        }
+    }
+    // Preserved failed-unpublished epoch
+    // (backward-compatible absence; present records
+    // validate strictly and bind to a distinct preceding
+    // epoch with the saturated lane-sum invariant).
+    let previous_epoch = match acc.get("previous_epoch").filter(|p| !p.is_null()) {
+        None => None,
+        Some(p) => {
+            let Some(pe) = read_previous_epoch_strict(p) else {
+                return false;
+            };
+            Some(pe)
+        }
+    };
+    if let Some(p) = previous_epoch.as_ref() {
+        let (Some(wm), Some(g)) = (watermark, generation) else {
+            return false;
+        };
+        if p.generation == g
+            || p.window_seq >= wm
+            || !preserved_flags_canonical(&p.unstable)
+            || !preserved_ranges_canonical(&p.unmeasured)
+            || p.calls_total
+                != p.lanes
+                    .iter()
+                    .fold(0u64, |sum, &lane| sum.saturating_add(lane))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Scan an occupant's bounded bytes WITHOUT adopting them
 /// (P2fix20 NEW-126 — the oversize-authority intake;
-/// affirmative sibling proof structural P2fix21 NEW-126):
+/// affirmative sibling proof structural P2fix21 NEW-126,
+/// raw-unique + fully structural P2fix23 NEW-126):
 /// stat WITHOUT following links (absent ⇒ `Absent`;
 /// nonregular ⇒ `NonRegular` — no open is attempted, so
 /// no open can stall), then open nonblocking +
@@ -3589,13 +3973,15 @@ fn scanned_holds_complete_sibling(scanned: &[u8]) -> bool {
 /// stays bounded however large the file is). The
 /// settlement discriminator is checked FIRST
 /// (escape-aware — a both-schema file claims, fail
-/// closed); then the sibling shape; then bound
+/// closed); then the sibling shape (raw-unique + the
+/// full restore shape, bound to `out_dir`); then bound
 /// exhaustion. True I/O failures fail closed (an
 /// unreadable occupant might assert authority — never
 /// scan around it).
 fn scan_legacy_occupant(
     dir_fd: &std::fs::File,
     name: &std::ffi::CString,
+    out_dir: &Path,
 ) -> std::io::Result<LegacyScan> {
     use std::os::unix::io::AsRawFd as _;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -3667,7 +4053,7 @@ fn scan_legacy_occupant(
     // scan (the probe byte proved more exists — what
     // follows is unvalidated, so the shape is Unresolved,
     // never Sibling).
-    if !past_bound && scanned_holds_complete_sibling(scanned) {
+    if !past_bound && scanned_holds_complete_sibling(scanned, out_dir) {
         return Ok(LegacyScan::Sibling);
     }
     if past_bound {
@@ -3906,8 +4292,9 @@ fn read_open_target(
 /// re-resolution, so a rebound parent cannot mix
 /// directories). Bounded (regular files only,
 /// intake-capped, never following links) and count-capped
-/// (fail closed past 64 candidates — operator
-/// intervenes).
+/// (fail closed past 64 CHECKPOINT-SCOPED candidates —
+/// P2fix23 NEW-152: unrelated sibling residue is neither
+/// read nor counted — operator intervenes).
 fn scan_settled_stage(
     parent_fd: &std::fs::File,
     target_name: &str,
@@ -3916,7 +4303,6 @@ fn scan_settled_stage(
     want_seq: u64,
 ) -> std::io::Result<Option<Vec<u8>>> {
     use std::os::unix::io::AsRawFd as _;
-    let prefix = format!("{target_name}.staging-");
     // The caller's fd, re-opened for listing
     // (`/proc/self/fd` re-opens OUR fd, never a pathname
     // through the movable tree — the scan_stage_residue
@@ -3942,9 +4328,16 @@ fn scan_settled_stage(
         // names break the stage-prefix linkage above —
         // the `.staging-trash-` shape re-enters those
         // payloads into the SAME hash+sequence+self-hash
-        // verification below, under the SAME 64-candidate
-        // bound; foreign trash content never verifies).
-        if !name.starts_with(&prefix) && !name.contains(".staging-trash-") {
+        // verification below; foreign trash content never
+        // verifies). Checkpoint-scoped candidacy (P2fix23
+        // NEW-152 — identity BEFORE budget): only stages
+        // of THIS checkpoint and trash whose stem derives
+        // from THIS checkpoint's names count toward the
+        // 64-candidate bound — unrelated sibling residue
+        // is neither read nor counted, so it can never
+        // exhaust the budget before the confirmed stage
+        // is examined.
+        if !recovery_candidate_for(&name, target_name) {
             continue;
         }
         candidates += 1;
@@ -8940,7 +9333,7 @@ impl Presenter {
         let found = match read_owned_name(parent_fd, &legacy_c, MARKER_MAX_BYTES, &what) {
             Ok(found) => found,
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                match scan_legacy_occupant(parent_fd, &legacy_c) {
+                match scan_legacy_occupant(parent_fd, &legacy_c, &self.out_dir) {
                     Ok(LegacyScan::SettlementClaim) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -9485,80 +9878,7 @@ impl Presenter {
         let latest: Option<LatestWindow> = match acc.get("latest") {
             None => return Err(bad("latest")),
             Some(serde_json::Value::Null) => None,
-            Some(l) => {
-                // Required-nullable presence (P2fix4 NEW-19/GATE29):
-                // the raw restored trace section enforces the SAME
-                // presence + null rules as intake BEFORE typed
-                // normalization — absent-vs-null stays distinct
-                // through restore (present-null applies, absent
-                // refuses, explicit null on non-nullables refuses).
-                if let Some(ts) = l
-                    .get("signals")
-                    .and_then(|s| s.get("trace"))
-                    .filter(|t| !t.is_null())
-                {
-                    crate::provider_observation::trace::check_trace_shape_presence(ts)
-                        .map_err(|_| bad("latest.trace"))?;
-                }
-                let w: LatestWindow =
-                    serde_json::from_value(l.clone()).map_err(|_| bad("latest"))?;
-                if let Some(ts) = w.signals.trace.as_ref() {
-                    ts.validate().map_err(|_| bad("latest.trace"))?;
-                }
-                // Document-level contract (P2fix3 GATE29 — restore
-                // re-runs the SAME contract on the persisted minor
-                // + section + activity rows: trigger both
-                // directions + coverage reconciliation).
-                crate::provider_observation::trace::check_trace_contract(
-                    w.schema_minor,
-                    w.signals.trace.as_ref(),
-                    Some(&serde_json::Value::Array(w.api_activity.clone())),
-                )
-                .map_err(|_| bad("latest.contract"))?;
-                if !matches!(w.signals.state.as_str(), "complete" | "partial" | "fatal") {
-                    return Err(bad("latest.state"));
-                }
-                if !matches!(
-                    w.signals.outcome.as_str(),
-                    "pass" | "violation" | "inconclusive" | "no_verdict" | "observe_only"
-                ) {
-                    return Err(bad("latest.outcome"));
-                }
-                if w.signals.reasons.iter().any(|r| !valid_reason_word(r)) {
-                    return Err(bad("latest.reasons"));
-                }
-                if w.signals
-                    .counters
-                    .iter()
-                    .any(|c| !(validate_counter(c, false) || validate_counter(c, true)))
-                {
-                    return Err(bad("latest.counters"));
-                }
-                if !valid_boot_id(&w.run_id.boot_id) {
-                    return Err(bad("latest.run_id"));
-                }
-                if let Some(loss) = w.session_loss.as_ref() {
-                    if loss.lost_intervals.iter().any(|it| {
-                        crate::presentation::labels::loss_cause_index(&it.cause).is_none()
-                    }) {
-                        return Err(bad("latest.loss_causes"));
-                    }
-                }
-                if let Some(active) = w.policy_active.as_ref() {
-                    if active.sha256.len() != 64
-                        || !active.sha256.bytes().all(|b| b.is_ascii_hexdigit())
-                    {
-                        return Err(bad("latest.policy_digest"));
-                    }
-                }
-                // Restored window digest (P2fix4 NEW-4/PRIVACY —
-                // the sha publishes as `window_sha256`, so a
-                // non-digest refuses instead of projecting).
-                if w.sha.len() != 64 || !w.sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err(bad("latest.sha"));
-                }
-                Some(w)
-            }
+            Some(l) => Some(validate_latest_window(l).map_err(bad)?),
         };
         // Checkpoint-bound admission (P2fix2 item 13): validated
         // shape (set bounded by the epoch cap). Absent on old
@@ -10077,7 +10397,7 @@ impl Presenter {
         ) {
             Ok(found) => found.map(|(bytes, _)| bytes),
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                match scan_legacy_occupant(parent_fd, &legacy_c) {
+                match scan_legacy_occupant(parent_fd, &legacy_c, &self.out_dir) {
                     Ok(LegacyScan::SettlementClaim) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -10166,14 +10486,31 @@ impl Presenter {
     /// the payload legacy authority selects and report
     /// the conflict after). Runs before recovery starts
     /// AND revalidates at the recovery's mutation
-    /// boundary. Zero mutations on every path.
+    /// boundary. Zero mutations on every path. The
+    /// reserved directory entry re-binds FIRST (P2fix23
+    /// NEW-150 — the record re-read below runs through
+    /// the pinned directory fd, so a replacement at the
+    /// boundary would otherwise govern the pending
+    /// payload while the stale handle authorizes its
+    /// removal: a rebound entry refuses HERE, before the
+    /// read).
     fn resolve_recovery_governor(
         &self,
         parent_fd: &std::fs::File,
         marker_fd: &std::fs::File,
+        marker_id: (u64, u64),
         record_c: &std::ffi::CString,
         target_name: &std::ffi::OsStr,
     ) -> std::io::Result<()> {
+        if let Err(e) = marker_entry_pinned(parent_fd, marker_id, &self.checkpoint_path) {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "osslscope: checkpoint settlement record namespace rebound before pending recovery (the reserved entry no longer resolves to the verified directory — refusing before any recovery mutation, never authorizing removal through the stale handle; not {}): {e}",
+                    self.checkpoint_path.display()
+                ),
+            ));
+        }
         let fresh = read_marker_record(marker_fd, record_c, &self.checkpoint_path).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
@@ -10188,6 +10525,46 @@ impl Presenter {
             self.refuse_conflicting_legacy_governor(parent_fd, target_name)?;
         }
         Ok(())
+    }
+
+    /// Revalidate the governing namespace before ONE pending
+    /// mutation (P2fix23 NEW-150 — read-only): the reserved
+    /// directory entry AND the governing record re-resolve
+    /// HERE, immediately before the named mutation step — a
+    /// replacement since the boundary (a rebound entry, a
+    /// changed record, a newly conflicting legacy marker)
+    /// refuses before the mutation runs, never authorizing
+    /// removal through the stale handle. `pending_kept`
+    /// reports the caller's disposition truthfully (steps
+    /// before confirmation keep pending for a later flush;
+    /// the post-confirmation step clears — its leftover
+    /// stands declared, never unlinked past the conflict).
+    #[allow(clippy::too_many_arguments)]
+    fn revalidate_pending_governor(
+        &self,
+        parent_fd: &std::fs::File,
+        marker_fd: &std::fs::File,
+        marker_id: (u64, u64),
+        record_c: &std::ffi::CString,
+        target_name: &std::ffi::OsStr,
+        step: &str,
+        pending_kept: bool,
+    ) -> std::io::Result<()> {
+        self.resolve_recovery_governor(parent_fd, marker_fd, marker_id, record_c, target_name)
+            .map_err(|e| {
+                let tail = if pending_kept {
+                    "the recovery retries on a later flush"
+                } else {
+                    "the target step already completed; the leftover stands declared for the operator"
+                };
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "osslscope: pending settlement recovery refused: governing namespace changed before the {step} (the reserved entry or its record no longer binds the verified transaction — refusing before the mutation; {tail}; not {}): {e}",
+                        self.checkpoint_path.display()
+                    ),
+                )
+            })
     }
 
     /// Establish markerless-entry authority (P2fix16 NEW-93 —
@@ -10350,7 +10727,7 @@ impl Presenter {
         ) {
             Ok(found) => found.map(|(bytes, _)| bytes),
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                match scan_legacy_occupant(parent_fd, &legacy_c) {
+                match scan_legacy_occupant(parent_fd, &legacy_c, &self.out_dir) {
                     Ok(LegacyScan::SettlementClaim) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -11257,11 +11634,23 @@ impl Presenter {
     /// bytes, junk — is preserved SILENTLY (it is inert:
     /// only the reserved namespace governs now, and the
     /// migration check reads it solely when no record
-    /// exists).
+    /// exists). Current-authority bound (P2fix23 NEW-151 —
+    /// the sweep binds the CURRENT marker + target, not
+    /// just the pre-write bytes: a reserved-record change
+    /// or target rewrite since the success gate leaves the
+    /// legacy record STANDING, declared as residue — the
+    /// record may govern again, so it is never deleted
+    /// past unconfirmed authority).
+    #[allow(clippy::too_many_arguments)]
     fn remove_migrated_legacy(
         &self,
         guard: &PlacementGuard,
         parent_fd: &std::fs::File,
+        marker_fd: &std::fs::File,
+        marker_id: (u64, u64),
+        record_c: &std::ffi::CString,
+        our_record_bytes: &[u8],
+        target_bind: Option<(&std::ffi::CString, (u64, u64), &[u8])>,
         target_name: &std::ffi::OsStr,
         settled_before: Option<&Vec<u8>>,
         residue: &mut Vec<String>,
@@ -11313,6 +11702,50 @@ impl Presenter {
                     // inert at zero).
                     #[cfg(test)]
                     pre_legacy_sweep_hook::take_and_run();
+                    // Sweep authority gate (P2fix23 NEW-151 —
+                    // the CURRENT marker + target re-confirm
+                    // HERE, after the boundary and before
+                    // the removal: a reserved-record change
+                    // or target rewrite since the success
+                    // gate leaves the legacy record
+                    // STANDING, declared as residue — it may
+                    // govern again, so it is never deleted
+                    // past unconfirmed authority or target).
+                    if !settlement_still_ours(
+                        parent_fd,
+                        marker_fd,
+                        marker_id,
+                        record_c,
+                        our_record_bytes,
+                        &self.checkpoint_path,
+                    ) {
+                        residue.push(
+                            "legacy settlement record left standing: settlement authority changed during the sweep (never unlinked past unconfirmed authority; operator must inspect)"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                    if let Some((sweep_target_c, sweep_stage_id, sweep_want)) = target_bind {
+                        let sweep_target_ok =
+                            name_refers_to(parent_fd, sweep_target_c, sweep_stage_id)
+                                && matches!(
+                                    read_owned_name(
+                                        parent_fd,
+                                        sweep_target_c,
+                                        CHECKPOINT_MAX_BYTES,
+                                        "checkpoint legacy sweep target",
+                                    ),
+                                    Ok(Some((back, id)))
+                                        if id == sweep_stage_id && back.as_slice() == sweep_want
+                                );
+                        if !sweep_target_ok {
+                            residue.push(
+                                "legacy settlement record left standing: target changed during the sweep (never unlinked past an unconfirmed target; operator must inspect)"
+                                    .to_string(),
+                            );
+                            return;
+                        }
+                    }
                     // Marker context (P2fix20 NEW-124): the
                     // marker cap + placement re-proven
                     // through the removal.
@@ -11370,6 +11803,7 @@ impl Presenter {
         guard: &PlacementGuard,
         parent_fd: &std::fs::File,
         marker_fd: &std::fs::File,
+        marker_id: (u64, u64),
         record_c: &std::ffi::CString,
         target_name: &std::ffi::OsStr,
     ) -> std::io::Result<()> {
@@ -11384,11 +11818,14 @@ impl Presenter {
         // zero).
         #[cfg(test)]
         pre_recovery_mutation_hook::take_and_run();
-        // Mutation-boundary revalidation (P2fix22 NEW-142):
-        // the governing slot re-resolves HERE, before the
-        // first recovery mutation — a conflict refuses
+        // Mutation-boundary revalidation (P2fix22 NEW-142,
+        // entry re-binding P2fix23 NEW-150): the governing
+        // slot re-resolves HERE — the reserved directory
+        // entry FIRST, then the governing record — before
+        // the first recovery mutation; a conflict refuses
         // with pending kept and ZERO namespace mutations.
-        if let Err(e) = self.resolve_recovery_governor(parent_fd, marker_fd, record_c, target_name)
+        if let Err(e) =
+            self.resolve_recovery_governor(parent_fd, marker_fd, marker_id, record_c, target_name)
         {
             self.pending_recovery = Some(pending);
             return Err(e);
@@ -11520,16 +11957,36 @@ impl Presenter {
                 self.pending_recovery = Some(pending);
                 return Err(e);
             }
-            if name_id(parent_fd, displaced_name).is_some() {
-                let e = std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "osslscope: pending settlement recovery refused: foreign replacement at the displaced name (the substituted object is preserved; the recovery retries on a later flush; not {})",
-                        self.checkpoint_path.display()
-                    ),
-                );
-                self.pending_recovery = Some(pending);
-                return Err(e);
+            // Affirmative displaced-name state (P2fix23 NEW-153
+            // — a failed lookup is NOT proof the name is
+            // empty: only ENOENT reads absent; an unreadable
+            // name defers with pending kept — the retry never
+            // proceeds to remove trash past an unproven
+            // name).
+            match name_state(parent_fd, displaced_name) {
+                NameState::Present(_) => {
+                    let e = std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "osslscope: pending settlement recovery refused: foreign replacement at the displaced name (the substituted object is preserved; the recovery retries on a later flush; not {})",
+                            self.checkpoint_path.display()
+                        ),
+                    );
+                    self.pending_recovery = Some(pending);
+                    return Err(e);
+                }
+                NameState::Unreadable => {
+                    let e = std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "osslscope: pending settlement recovery deferred: the displaced name stands unreadable (the namespace observation failed — absence unproven, never removed past it; the recovery retries on a later flush; not {})",
+                            self.checkpoint_path.display()
+                        ),
+                    );
+                    self.pending_recovery = Some(pending);
+                    return Err(e);
+                }
+                NameState::Absent => {}
             }
             #[cfg(test)]
             pending_recovery_step_hook::take_and_run();
@@ -11549,6 +12006,24 @@ impl Presenter {
                         self.checkpoint_path.display()
                     ),
                 );
+                self.pending_recovery = Some(pending);
+                return Err(e);
+            }
+            // Governing-namespace revalidation (P2fix23
+            // NEW-150): the reserved entry + governing
+            // record re-resolve HERE, immediately before
+            // the displaced-trash removal — a replacement
+            // since the boundary defers with pending kept,
+            // never removing through the stale handle.
+            if let Err(e) = self.revalidate_pending_governor(
+                parent_fd,
+                marker_fd,
+                marker_id,
+                record_c,
+                target_name,
+                "displaced-trash removal",
+                true,
+            ) {
                 self.pending_recovery = Some(pending);
                 return Err(e);
             }
@@ -11713,6 +12188,24 @@ impl Presenter {
                     self.pending_recovery = Some(pending);
                     return Err(e);
                 }
+                // Governing-namespace revalidation (P2fix23
+                // NEW-150): the reserved entry + governing
+                // record re-resolve HERE, immediately before
+                // the swapback — a replacement since the
+                // boundary defers with pending kept, never
+                // exchanging through the stale handle.
+                if let Err(e) = self.revalidate_pending_governor(
+                    parent_fd,
+                    marker_fd,
+                    marker_id,
+                    record_c,
+                    target_name,
+                    "swapback exchange",
+                    true,
+                ) {
+                    self.pending_recovery = Some(pending);
+                    return Err(e);
+                }
                 // Swap back: target→prior, stage→ours (the
                 // exchange is atomic — a failure ran
                 // nothing, so the pending state stays).
@@ -11779,6 +12272,25 @@ impl Presenter {
                         ),
                     ));
                 }
+                // Governing-namespace revalidation (P2fix23
+                // NEW-150): the reserved entry + governing
+                // record re-resolve HERE, immediately before
+                // the swapped-stage removal — the target
+                // step already CONFIRMED, so a replacement
+                // since the boundary clears (the next
+                // write's gate re-validates the standing
+                // target) but still fails the write, with
+                // the stage standing declared, never
+                // unlinked past the conflict.
+                self.revalidate_pending_governor(
+                    parent_fd,
+                    marker_fd,
+                    marker_id,
+                    record_c,
+                    target_name,
+                    "swapped-stage removal",
+                    false,
+                )?;
                 // Data-stage context (P2fix20 NEW-124/NEW-125).
                 let rctx = RemovalCtx::data(Some(RemovalPlace {
                     out_dir: &self.out_dir,
@@ -11886,32 +12398,53 @@ impl Presenter {
                 // alone never strands; the next write
                 // proceeds via its gate).
                 if !name_refers_to(parent_fd, &pending.target_c, pending.own_id) {
-                    if name_id(parent_fd, &pending.target_c).is_none() {
-                        if let Err(sync) = parent_fd.sync_all() {
-                            let e = with_withdrawal_unconfirmed_note(
-                                std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!(
-                                        "osslscope: pending settlement recovery failed (the target entry already absent; not {})",
-                                        self.checkpoint_path.display()
+                    // Affirmative target state (P2fix23 NEW-153
+                    // — a failed lookup is NOT proof the
+                    // target is absent: only ENOENT clears; an
+                    // unreadable target defers with pending
+                    // kept — the retry never syncs-and-clears
+                    // past an unproven name).
+                    match name_state(parent_fd, &pending.target_c) {
+                        NameState::Absent => {
+                            if let Err(sync) = parent_fd.sync_all() {
+                                let e = with_withdrawal_unconfirmed_note(
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!(
+                                            "osslscope: pending settlement recovery failed (the target entry already absent; not {})",
+                                            self.checkpoint_path.display()
+                                        ),
                                     ),
+                                    sync,
+                                );
+                                self.pending_recovery = Some(pending);
+                                return Err(e);
+                            }
+                            return Ok(());
+                        }
+                        NameState::Unreadable => {
+                            let e = std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "osslscope: pending settlement recovery deferred: the target name stands unreadable (the namespace observation failed — absence unproven, never cleared past it; the recovery retries on a later flush; not {})",
+                                    self.checkpoint_path.display()
                                 ),
-                                sync,
                             );
                             self.pending_recovery = Some(pending);
                             return Err(e);
                         }
-                        return Ok(());
+                        NameState::Present(_) => {
+                            let e = std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "osslscope: pending settlement recovery refused: target no longer carries the failed write's bytes (the substituted object is preserved; the recovery retries on a later flush; not {})",
+                                    self.checkpoint_path.display()
+                                ),
+                            );
+                            self.pending_recovery = Some(pending);
+                            return Err(e);
+                        }
                     }
-                    let e = std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "osslscope: pending settlement recovery refused: target no longer carries the failed write's bytes (the substituted object is preserved; the recovery retries on a later flush; not {})",
-                            self.checkpoint_path.display()
-                        ),
-                    );
-                    self.pending_recovery = Some(pending);
-                    return Err(e);
                 }
                 // Per-step re-proof (P2fix18 NEW-109): the
                 // transition is UNPERFORMED here, so a trip
@@ -11951,6 +12484,25 @@ impl Presenter {
                             self.checkpoint_path.display()
                         ),
                     );
+                    self.pending_recovery = Some(pending);
+                    return Err(e);
+                }
+                // Governing-namespace revalidation (P2fix23
+                // NEW-150): the reserved entry + governing
+                // record re-resolve HERE, immediately before
+                // the direct-target removal — a replacement
+                // since the boundary defers with pending
+                // kept, never removing through the stale
+                // handle.
+                if let Err(e) = self.revalidate_pending_governor(
+                    parent_fd,
+                    marker_fd,
+                    marker_id,
+                    record_c,
+                    target_name,
+                    "direct-target removal",
+                    true,
+                ) {
                     self.pending_recovery = Some(pending);
                     return Err(e);
                 }
@@ -12275,6 +12827,7 @@ impl Presenter {
             self.resolve_recovery_governor(
                 &dir_fd,
                 &marker_fd,
+                marker_id,
                 &record_c,
                 target_name.as_os_str(),
             )?;
@@ -12294,6 +12847,7 @@ impl Presenter {
             &guard,
             &dir_fd,
             &marker_fd,
+            marker_id,
             &record_c,
             target_name.as_os_str(),
         )?;
@@ -13283,7 +13837,7 @@ impl Presenter {
                     ),
                 ));
             } else {
-                // Retirement TARGET check (P2fix22 NEW-128 —
+                // Retirement TARGET binding (P2fix22 NEW-128 —
                 // the target binds through RETIREMENT: the
                 // prior retires only while the target still
                 // carries our committed bytes — a rewrite
@@ -13291,18 +13845,23 @@ impl Presenter {
                 // prior stage stands preserved — it may be
                 // the last intact payload — and live state
                 // is NOT advanced past the unconfirmed
-                // target).
-                let retirement_target_ok = name_refers_to(&dir_fd, &target_c, stage_id)
-                    && matches!(
-                        read_owned_name(
-                            &dir_fd,
-                            &target_c,
-                            CHECKPOINT_MAX_BYTES,
-                            "checkpoint settled retirement target",
-                        ),
-                        Ok(Some((back, id))) if id == stage_id && back.as_slice() == bytes
-                    );
-                if !retirement_target_ok {
+                // target); P2fix23 NEW-149 — re-evaluated
+                // THROUGH the removal below (the pre-unlink
+                // gate re-proves it fused with the unlink),
+                // never checked once and forgotten.
+                let retirement_target_ok = || {
+                    name_refers_to(&dir_fd, &target_c, stage_id)
+                        && matches!(
+                            read_owned_name(
+                                &dir_fd,
+                                &target_c,
+                                CHECKPOINT_MAX_BYTES,
+                                "checkpoint settled retirement target",
+                            ),
+                            Ok(Some((back, id))) if id == stage_id && back.as_slice() == bytes
+                        )
+                };
+                if !retirement_target_ok() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
@@ -13311,23 +13870,35 @@ impl Presenter {
                         ),
                     ));
                 }
-                // Pre-unlink authority gate (P2fix21 NEW-127
+                // Pre-unlink commit gate (authority P2fix21
+                // NEW-127, retirement target P2fix23 NEW-149
                 // — re-proven fused before the unlink
-                // inside the removal: a mid-removal loss
-                // restores the displaced prior instead of
-                // deleting it).
+                // inside the removal AND re-proven again in
+                // the final re-proof: a mid-removal loss OR
+                // target rewrite restores the displaced
+                // prior instead of deleting it — the last
+                // intact prior is never deleted past either
+                // mismatch).
                 let authority_gate = || {
-                    if authority_held() {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::new(
+                    if !authority_held() {
+                        return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!(
                                 "osslscope: checkpoint commit lost its settlement authority during the prior-bytes cleanup ({stage_name}: the current durable record or its namespace no longer carries our commit — the prior payload is preserved and the new payload stands at the target; live state is NOT advanced; operator must inspect; not {})",
                                 self.checkpoint_path.display()
                             ),
-                        ))
+                        ));
                     }
+                    if !retirement_target_ok() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "osslscope: checkpoint commit target changed during the prior-bytes cleanup ({stage_name}: the target no longer carries our committed bytes — the prior payload is preserved and the foreign target stands untouched; live state is NOT advanced; operator must inspect; not {})",
+                                self.checkpoint_path.display()
+                            ),
+                        ));
+                    }
+                    Ok(())
                 };
                 // Fault injection (P2fix15 NEW-89, test-only):
                 // fail the post-settlement cleanup AFTER the
@@ -13399,6 +13970,23 @@ impl Presenter {
                             std::io::ErrorKind::InvalidData,
                             format!(
                                 "osslscope: checkpoint commit lost its settlement authority during the prior-bytes cleanup ({stage_name}: the prior-bytes cleanup failed ({cleanup}) AND the current durable record or its namespace no longer carries our commit — the new payload stands at the target; live state is NOT advanced; operator must inspect; not {})",
+                                self.checkpoint_path.display()
+                            ),
+                        ));
+                    }
+                    // A concurrent TARGET change fails the
+                    // flush too (P2fix23 NEW-149 — the
+                    // authority arm's mirror: never
+                    // success-with-residue past an
+                    // unconfirmed target, and never a
+                    // completion-time report for a
+                    // removal-time trip — the gate-time
+                    // detail rides in the cleanup error).
+                    if !retirement_target_ok() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "osslscope: checkpoint commit target changed during the prior-bytes cleanup ({stage_name}: the prior-bytes cleanup failed ({cleanup}) AND the target no longer carries our committed bytes — the foreign target stands untouched; live state is NOT advanced; operator must inspect; not {})",
                                 self.checkpoint_path.display()
                             ),
                         ));
@@ -13490,17 +14078,23 @@ impl Presenter {
                 ),
             ));
         }
-        let completion_target_ok = name_refers_to(&dir_fd, &target_c, stage_id)
-            && matches!(
-                read_owned_name(
-                    &dir_fd,
-                    &target_c,
-                    CHECKPOINT_MAX_BYTES,
-                    "checkpoint completion target",
-                ),
-                Ok(Some((back, id))) if id == stage_id && back.as_slice() == bytes
-            );
-        if !completion_target_ok {
+        // P2fix23 NEW-151 — re-evaluated again after
+        // the legacy sweep below (the post-sweep
+        // confirmation), never checked once and
+        // forgotten.
+        let completion_target_ok = || {
+            name_refers_to(&dir_fd, &target_c, stage_id)
+                && matches!(
+                    read_owned_name(
+                        &dir_fd,
+                        &target_c,
+                        CHECKPOINT_MAX_BYTES,
+                        "checkpoint completion target",
+                    ),
+                    Ok(Some((back, id))) if id == stage_id && back.as_slice() == bytes
+                )
+        };
+        if !completion_target_ok() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -13526,10 +14120,47 @@ impl Presenter {
         self.remove_migrated_legacy(
             &guard,
             &dir_fd,
+            &marker_fd,
+            marker_id,
+            &record_c,
+            &our_record_bytes,
+            Some((&target_c, stage_id, &bytes)),
             &target_name,
             settled_before.as_ref(),
             &mut residue,
         );
+        // Post-sweep confirmation (P2fix23 NEW-151 —
+        // authority AND the committed target re-confirm
+        // AFTER the legacy sweep, before live advancement:
+        // the sweep runs past the success gate above, so a
+        // change during the sweep withholds HERE (the
+        // legacy record stands preserved by the sweep
+        // gate; live state is NOT advanced past it).
+        if !settlement_still_ours(
+            &dir_fd,
+            &marker_fd,
+            marker_id,
+            &record_c,
+            &our_record_bytes,
+            &self.checkpoint_path,
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "osslscope: checkpoint commit lost its settlement authority during the legacy sweep (the current durable record or its namespace no longer carries our commit — the legacy record stands preserved; live state is NOT advanced; operator must inspect; not {})",
+                    self.checkpoint_path.display()
+                ),
+            ));
+        }
+        if !completion_target_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "osslscope: checkpoint commit target changed during the legacy sweep (the target no longer carries our committed bytes — every payload stands preserved; live state is NOT advanced; operator must inspect; not {})",
+                    self.checkpoint_path.display()
+                ),
+            ));
+        }
         // Stale-stage scan (P2fix15 NEW-89, P2fix16 NEW-96):
         // anything still standing is a leftover of an
         // interrupted or withdrawn write — declared on the
@@ -31059,6 +31690,8 @@ mod tests {
             Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
         let dir_fd = std::fs::File::open(&p).unwrap();
         let marker_fd = std::fs::File::open(p.join(super::SETTLED_DIR_NAME)).unwrap();
+        let marker_id = super::file_id(&marker_fd).unwrap();
+        let marker_id = super::file_id(&marker_fd).unwrap();
         let guard = super::PlacementGuard::arm(&dir_fd, &ckpt).expect("guard arms");
         let record_c = std::ffi::CString::new("ckpt.json").unwrap();
         // The carried completed removal (mirrors the
@@ -31079,6 +31712,7 @@ mod tests {
                 &guard,
                 &dir_fd,
                 &marker_fd,
+                marker_id,
                 &record_c,
                 std::ffi::OsStr::new("ckpt.json"),
             )
@@ -31106,6 +31740,7 @@ mod tests {
                 &guard,
                 &dir_fd,
                 &marker_fd,
+                marker_id,
                 &record_c,
                 std::ffi::OsStr::new("ckpt.json"),
             )
@@ -31143,6 +31778,8 @@ mod tests {
             Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
         let dir_fd = std::fs::File::open(&p).unwrap();
         let marker_fd = std::fs::File::open(p.join(super::SETTLED_DIR_NAME)).unwrap();
+        let marker_id = super::file_id(&marker_fd).unwrap();
+        let marker_id = super::file_id(&marker_fd).unwrap();
         let guard = super::PlacementGuard::arm(&dir_fd, &ckpt).expect("guard arms");
         let record_c = std::ffi::CString::new("ckpt.json").unwrap();
         presenter.pending_recovery = Some(super::PendingSwapback {
@@ -31165,13 +31802,14 @@ mod tests {
                 &guard,
                 &dir_fd,
                 &marker_fd,
+                marker_id,
                 &record_c,
                 std::ffi::OsStr::new("ckpt.json"),
             )
             .expect_err("an unreadable completed name never clears");
         super::name_lookup_fault::reset();
         assert!(
-            format!("{err:?}").contains("unreadable"),
+            format!("{err:?}").contains("stands unreadable"),
             "the deferral names the failed observation: {err:?}"
         );
         assert!(
@@ -31185,6 +31823,7 @@ mod tests {
                 &guard,
                 &dir_fd,
                 &marker_fd,
+                marker_id,
                 &record_c,
                 std::ffi::OsStr::new("ckpt.json"),
             )
@@ -32416,6 +33055,1528 @@ mod tests {
             matches!(presenter.load_authority, super::LoadAuthority::Absent),
             "live keeps no adopted authority: {:?}",
             presenter.load_authority
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new153_displaced_retry_unreadable_defers() {
+        // P2fix23 NEW-153 (affirmative absence in displaced
+        // retry): a failed lookup of the displaced name is
+        // NOT proof it is empty — with a standing substitute
+        // and a transient observation failure, the recovery
+        // DEFERS with pending kept (never proceeds to remove
+        // trash past the unproven name); the healthy retry
+        // then refuses on the substitute with every byte
+        // preserved. Pre-fix: the site reads `name_id`
+        // (which cannot observe lookup failure), so the
+        // injected failure is invisible and the report names
+        // the substitute instead of the failed observation
+        // (RED — failed lookup unrepresentable here).
+        let base = unique_dir("displaced-defer-153");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        std::fs::create_dir_all(p.join(super::SETTLED_DIR_NAME)).unwrap();
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        let dir_fd = std::fs::File::open(&p).unwrap();
+        let marker_fd = std::fs::File::open(p.join(super::SETTLED_DIR_NAME)).unwrap();
+        let marker_id = super::file_id(&marker_fd).unwrap();
+        let marker_id = super::file_id(&marker_fd).unwrap();
+        let guard = super::PlacementGuard::arm(&dir_fd, &ckpt).expect("guard arms");
+        let record_c = std::ffi::CString::new("ckpt.json").unwrap();
+        let own_bytes = b"displaced-own-bytes-153".to_vec();
+        let trash_name = "ckpt.json.staging-trash-153-0";
+        std::fs::write(p.join(trash_name), &own_bytes).unwrap();
+        let own_id = super::file_id(&std::fs::File::open(p.join(trash_name)).unwrap()).unwrap();
+        std::fs::write(&ckpt, b"standing-substitute-153").unwrap();
+        presenter.pending_recovery = Some(super::PendingSwapback {
+            stage_c: std::ffi::CString::new("ckpt.json.staging-153").unwrap(),
+            target_c: std::ffi::CString::new("ckpt.json").unwrap(),
+            arm: super::PublishArm::Absent,
+            own_id,
+            own_bytes: own_bytes.clone(),
+            prior_bytes: None,
+            displaced_trash: Some(std::ffi::CString::new(trash_name).unwrap()),
+            displaced_verified: true,
+            removal_completed: false,
+        });
+        super::name_lookup_fault::arm(1);
+        let err = presenter
+            .complete_pending_recovery(
+                &guard,
+                &dir_fd,
+                &marker_fd,
+                marker_id,
+                &record_c,
+                std::ffi::OsStr::new("ckpt.json"),
+            )
+            .expect_err("an unreadable displaced name defers");
+        super::name_lookup_fault::reset();
+        assert!(
+            format!("{err:?}").contains("stands unreadable"),
+            "the deferral names the failed observation: {err:?}"
+        );
+        assert!(
+            presenter.pending_recovery.is_some(),
+            "pending stays for the healthy retry"
+        );
+        assert_eq!(
+            std::fs::read(p.join(trash_name)).unwrap(),
+            own_bytes,
+            "the displaced trash stands untouched"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            b"standing-substitute-153",
+            "the standing substitute stands untouched"
+        );
+        // Healthy retry: the substitute is real — refuse on
+        // it with every byte preserved.
+        let err = presenter
+            .complete_pending_recovery(
+                &guard,
+                &dir_fd,
+                &marker_fd,
+                marker_id,
+                &record_c,
+                std::ffi::OsStr::new("ckpt.json"),
+            )
+            .expect_err("the healthy retry refuses the standing substitute");
+        assert!(
+            format!("{err:?}").contains("foreign replacement"),
+            "the healthy retry names the substitute: {err:?}"
+        );
+        assert!(
+            presenter.pending_recovery.is_some(),
+            "pending stays past the refusal"
+        );
+        assert_eq!(
+            std::fs::read(p.join(trash_name)).unwrap(),
+            own_bytes,
+            "the displaced trash still stands"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            b"standing-substitute-153",
+            "the substitute still stands"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new153_displaced_retry_lookup_failure_never_reads_empty() {
+        // P2fix23 NEW-153 (displaced retry never treats a
+        // failed lookup as empty): the displaced name fails
+        // observation outright (an unobservable name — the
+        // lookup fails without proving absence), so the
+        // recovery defers with pending kept and the trash
+        // standing. Pre-fix: `name_id` reads `None` on ANY
+        // lookup failure and the retry proceeds to remove
+        // the trash and clear (RED — removal past an
+        // unproven namespace).
+        let base = unique_dir("displaced-failure-153");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        std::fs::create_dir_all(p.join(super::SETTLED_DIR_NAME)).unwrap();
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        let dir_fd = std::fs::File::open(&p).unwrap();
+        let marker_fd = std::fs::File::open(p.join(super::SETTLED_DIR_NAME)).unwrap();
+        let marker_id = super::file_id(&marker_fd).unwrap();
+        let guard = super::PlacementGuard::arm(&dir_fd, &ckpt).expect("guard arms");
+        let record_c = std::ffi::CString::new("ckpt.json").unwrap();
+        let own_bytes = b"displaced-own-bytes-153b".to_vec();
+        let trash_name = "ckpt.json.staging-trash-153-1";
+        std::fs::write(p.join(trash_name), &own_bytes).unwrap();
+        let own_id = super::file_id(&std::fs::File::open(p.join(trash_name)).unwrap()).unwrap();
+        // An unobservable displaced name (no lookup can
+        // prove it empty — the stat fails outright).
+        let unobservable = "n".repeat(300);
+        presenter.pending_recovery = Some(super::PendingSwapback {
+            stage_c: std::ffi::CString::new("ckpt.json.staging-153").unwrap(),
+            target_c: std::ffi::CString::new(unobservable).unwrap(),
+            arm: super::PublishArm::Absent,
+            own_id,
+            own_bytes: own_bytes.clone(),
+            prior_bytes: None,
+            displaced_trash: Some(std::ffi::CString::new(trash_name).unwrap()),
+            displaced_verified: true,
+            removal_completed: false,
+        });
+        let err = presenter
+            .complete_pending_recovery(
+                &guard,
+                &dir_fd,
+                &marker_fd,
+                marker_id,
+                &record_c,
+                std::ffi::OsStr::new("ckpt.json"),
+            )
+            .expect_err("a failed displaced lookup never reads empty");
+        assert!(
+            format!("{err:?}").contains("stands unreadable"),
+            "the deferral names the failed observation: {err:?}"
+        );
+        assert!(
+            presenter.pending_recovery.is_some(),
+            "pending stays for the healthy retry"
+        );
+        assert_eq!(
+            std::fs::read(p.join(trash_name)).unwrap(),
+            own_bytes,
+            "the displaced trash stands untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new153_direct_retry_unreadable_defers() {
+        // P2fix23 NEW-153 (affirmative absence in direct
+        // NOREPLACE retry): with a standing substitute at
+        // the target and a transient observation failure,
+        // the recovery DEFERS with pending kept (never
+        // clears past the unproven name); the healthy retry
+        // then refuses on the substitute with every byte
+        // preserved. Pre-fix: the site reads `name_id`
+        // (blind to lookup failure), so the report names
+        // the substitute instead of the failed observation
+        // (RED).
+        let base = unique_dir("direct-defer-153");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        std::fs::create_dir_all(p.join(super::SETTLED_DIR_NAME)).unwrap();
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        let dir_fd = std::fs::File::open(&p).unwrap();
+        let marker_fd = std::fs::File::open(p.join(super::SETTLED_DIR_NAME)).unwrap();
+        let marker_id = super::file_id(&marker_fd).unwrap();
+        let marker_id = super::file_id(&marker_fd).unwrap();
+        let guard = super::PlacementGuard::arm(&dir_fd, &ckpt).expect("guard arms");
+        let record_c = std::ffi::CString::new("ckpt.json").unwrap();
+        std::fs::write(&ckpt, b"standing-substitute-153d").unwrap();
+        presenter.pending_recovery = Some(super::PendingSwapback {
+            stage_c: std::ffi::CString::new("ckpt.json.staging-153").unwrap(),
+            target_c: std::ffi::CString::new("ckpt.json").unwrap(),
+            arm: super::PublishArm::Absent,
+            own_id: (0, 0),
+            own_bytes: b"direct-own-bytes-153".to_vec(),
+            prior_bytes: None,
+            displaced_trash: None,
+            displaced_verified: false,
+            removal_completed: false,
+        });
+        super::name_lookup_fault::arm(1);
+        let err = presenter
+            .complete_pending_recovery(
+                &guard,
+                &dir_fd,
+                &marker_fd,
+                marker_id,
+                &record_c,
+                std::ffi::OsStr::new("ckpt.json"),
+            )
+            .expect_err("an unreadable direct target defers");
+        super::name_lookup_fault::reset();
+        assert!(
+            format!("{err:?}").contains("stands unreadable"),
+            "the deferral names the failed observation: {err:?}"
+        );
+        assert!(
+            presenter.pending_recovery.is_some(),
+            "pending stays for the healthy retry"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            b"standing-substitute-153d",
+            "the standing substitute stands untouched"
+        );
+        // Healthy retry: the substitute is real — refuse on
+        // it with every byte preserved.
+        let err = presenter
+            .complete_pending_recovery(
+                &guard,
+                &dir_fd,
+                &marker_fd,
+                marker_id,
+                &record_c,
+                std::ffi::OsStr::new("ckpt.json"),
+            )
+            .expect_err("the healthy retry refuses the standing substitute");
+        assert!(
+            format!("{err:?}").contains("no longer carries"),
+            "the healthy retry names the substitution: {err:?}"
+        );
+        assert!(
+            presenter.pending_recovery.is_some(),
+            "pending stays past the refusal"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            b"standing-substitute-153d",
+            "the substitute still stands"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new153_direct_retry_lookup_failure_never_clears() {
+        // P2fix23 NEW-153 (direct retry never clears past a
+        // failed lookup): the target name fails observation
+        // outright (the lookup fails without proving
+        // absence), so the recovery defers with pending kept
+        // (never syncs-and-clears past the unproven name).
+        // Pre-fix: `name_id` reads `None` on ANY lookup
+        // failure and the retry clears (RED — pending
+        // cleared past an unproven namespace).
+        let base = unique_dir("direct-failure-153");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        std::fs::create_dir_all(p.join(super::SETTLED_DIR_NAME)).unwrap();
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        let dir_fd = std::fs::File::open(&p).unwrap();
+        let marker_fd = std::fs::File::open(p.join(super::SETTLED_DIR_NAME)).unwrap();
+        let marker_id = super::file_id(&marker_fd).unwrap();
+        let guard = super::PlacementGuard::arm(&dir_fd, &ckpt).expect("guard arms");
+        let record_c = std::ffi::CString::new("ckpt.json").unwrap();
+        let unobservable = "d".repeat(300);
+        presenter.pending_recovery = Some(super::PendingSwapback {
+            stage_c: std::ffi::CString::new("ckpt.json.staging-153").unwrap(),
+            target_c: std::ffi::CString::new(unobservable).unwrap(),
+            arm: super::PublishArm::Absent,
+            own_id: (0, 0),
+            own_bytes: b"direct-own-bytes-153b".to_vec(),
+            prior_bytes: None,
+            displaced_trash: None,
+            displaced_verified: false,
+            removal_completed: false,
+        });
+        let err = presenter
+            .complete_pending_recovery(
+                &guard,
+                &dir_fd,
+                &marker_fd,
+                marker_id,
+                &record_c,
+                std::ffi::OsStr::new("ckpt.json"),
+            )
+            .expect_err("a failed direct lookup never clears");
+        assert!(
+            format!("{err:?}").contains("stands unreadable"),
+            "the deferral names the failed observation: {err:?}"
+        );
+        assert!(
+            presenter.pending_recovery.is_some(),
+            "pending stays for the healthy retry"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new153_displaced_retry_transient_then_absent_converges() {
+        // P2fix23 NEW-153 (Tier-1 adjacent edge — the
+        // transient→healthy arc on the displaced path): a
+        // transient failure defers with pending kept and
+        // the trash standing; the healthy retry against a
+        // TRULY absent displaced name converges (removes
+        // the trash, clears). Pre-fix: the first leg
+        // proceeds past the injected failure (RED — the
+        // site cannot defer on unobserved failure).
+        let base = unique_dir("displaced-converge-153");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        std::fs::create_dir_all(p.join(super::SETTLED_DIR_NAME)).unwrap();
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        let dir_fd = std::fs::File::open(&p).unwrap();
+        let marker_fd = std::fs::File::open(p.join(super::SETTLED_DIR_NAME)).unwrap();
+        let marker_id = super::file_id(&marker_fd).unwrap();
+        let marker_id = super::file_id(&marker_fd).unwrap();
+        let guard = super::PlacementGuard::arm(&dir_fd, &ckpt).expect("guard arms");
+        let record_c = std::ffi::CString::new("ckpt.json").unwrap();
+        let own_bytes = b"displaced-own-bytes-153c".to_vec();
+        let trash_name = "ckpt.json.staging-trash-153-2";
+        std::fs::write(p.join(trash_name), &own_bytes).unwrap();
+        let own_id = super::file_id(&std::fs::File::open(p.join(trash_name)).unwrap()).unwrap();
+        // The displaced name stands TRULY absent (no
+        // substitute) — only the observation fails.
+        presenter.pending_recovery = Some(super::PendingSwapback {
+            stage_c: std::ffi::CString::new("ckpt.json.staging-153").unwrap(),
+            target_c: std::ffi::CString::new("ckpt.json").unwrap(),
+            arm: super::PublishArm::Absent,
+            own_id,
+            own_bytes: own_bytes.clone(),
+            prior_bytes: None,
+            displaced_trash: Some(std::ffi::CString::new(trash_name).unwrap()),
+            displaced_verified: true,
+            removal_completed: false,
+        });
+        super::name_lookup_fault::arm(1);
+        let err = presenter
+            .complete_pending_recovery(
+                &guard,
+                &dir_fd,
+                &marker_fd,
+                marker_id,
+                &record_c,
+                std::ffi::OsStr::new("ckpt.json"),
+            )
+            .expect_err("the transient failure defers");
+        super::name_lookup_fault::reset();
+        assert!(
+            format!("{err:?}").contains("stands unreadable"),
+            "the deferral names the failed observation: {err:?}"
+        );
+        assert!(
+            presenter.pending_recovery.is_some(),
+            "pending stays for the healthy retry"
+        );
+        assert!(
+            p.join(trash_name).exists(),
+            "the displaced trash stands through the deferral"
+        );
+        // Healthy retry: affirmative absence converges.
+        presenter
+            .complete_pending_recovery(
+                &guard,
+                &dir_fd,
+                &marker_fd,
+                marker_id,
+                &record_c,
+                std::ffi::OsStr::new("ckpt.json"),
+            )
+            .expect("the healthy retry converges past affirmative absence");
+        assert!(
+            presenter.pending_recovery.is_none(),
+            "the converged recovery clears"
+        );
+        assert!(
+            !p.join(trash_name).exists(),
+            "the converged recovery removes the trash"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new152_unrelated_trash_ignores_budget() {
+        // P2fix23 NEW-152 (checkpoint-scoped trash identity
+        // + budget — short name): 70 UNRELATED trash entries
+        // beside the valid marker-confirmed prior — reopen
+        // adopts the prior EXACTLY (unrelated residue never
+        // consumes the checkpoint's 64-candidate budget).
+        // Pre-fix: every `.staging-trash-` entry counts and
+        // the scan refuses with "too many checkpoint
+        // stages" (RED — unrelated residue strands the only
+        // marker-confirmed payload).
+        let base = unique_dir("unrelated-trash-152");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&super::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let prior_bytes = std::fs::read(&ckpt).unwrap();
+        let prior_totals = presenter.fold_totals();
+        drop(presenter);
+        // Unrelated sibling trash FIRST (70 entries — past
+        // the budget on their own).
+        for i in 0..70 {
+            let name = format!("unrelated-{i:03}.staging-trash-1-{i}");
+            std::fs::write(p.join(&name), b"sibling-residue-152").unwrap();
+        }
+        // The valid prior under its checkpoint-scoped trash
+        // name (the stem of a stage of THIS checkpoint).
+        let stem = "ckpt.json.staging-direct-152";
+        let trash = format!("{stem}.staging-trash-{}-0", std::process::id());
+        std::fs::write(p.join(&trash), &prior_bytes).unwrap();
+        // An unconfirmed target (distinct valid bytes the
+        // record never selects).
+        let unconfirmed = mutated_checkpoint_bytes(&prior_bytes, 999);
+        std::fs::write(&ckpt, &unconfirmed).unwrap();
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("reopen adopts past unrelated trash");
+        assert!(
+            q.recovered_prior,
+            "the reopen reports the marker-bound recovery"
+        );
+        assert_eq!(q.fold_totals(), prior_totals, "reopen totals agree exactly");
+        drop(q);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new152_long_name_unrelated_trash_prior_recovers() {
+        // P2fix23 NEW-152 (checkpoint-scoped trash identity
+        // + budget — LONG name): the same 70-unrelated shape
+        // under a 190-char checkpoint name (whose trash stem
+        // truncates the stage prefix) — reopen still adopts
+        // the marker-confirmed prior EXACTLY. Pre-fix: the
+        // scan refuses with "too many checkpoint stages"
+        // (RED).
+        let long_stem = "L".repeat(190);
+        let long_name = format!("{long_stem}.json");
+        let base = unique_dir("long-unrelated-152");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&super::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join(&long_name);
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let prior_bytes = std::fs::read(&ckpt).unwrap();
+        let prior_totals = presenter.fold_totals();
+        drop(presenter);
+        for i in 0..70 {
+            let name = format!("unrelated-{i:03}.staging-trash-1-{i}");
+            std::fs::write(p.join(&name), b"sibling-residue-152").unwrap();
+        }
+        // The valid prior under its TRUNCATED
+        // checkpoint-scoped trash name (first 120 bytes of a
+        // stage of THIS checkpoint).
+        let stage = format!("{long_name}.staging-direct-152");
+        let stem = &stage[..120];
+        let trash = format!("{stem}.staging-trash-{}-0", std::process::id());
+        assert!(
+            !trash.starts_with(&format!("{long_name}.staging-")),
+            "premise: truncation breaks the stage-prefix linkage"
+        );
+        std::fs::write(p.join(&trash), &prior_bytes).unwrap();
+        let unconfirmed = mutated_checkpoint_bytes(&prior_bytes, 999);
+        std::fs::write(&ckpt, &unconfirmed).unwrap();
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("reopen adopts past unrelated trash");
+        assert!(
+            q.recovered_prior,
+            "the reopen reports the marker-bound recovery"
+        );
+        assert_eq!(q.fold_totals(), prior_totals, "reopen totals agree exactly");
+        drop(q);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new152_unrelated_trash_never_counts() {
+        // P2fix23 NEW-152 (Tier-1 adjacent edge — the
+        // counting rule itself): 70 unrelated trash entries
+        // with NO valid prior and an unconfirmed target —
+        // reopen refuses as an unconfirmed target with no
+        // marker-bound prior (the unrelated entries never
+        // count), NOT as "too many checkpoint stages".
+        // Pre-fix: the scan charges the unrelated entries
+        // and refuses "too many" (RED — order-independent:
+        // no valid entry can short-circuit the count).
+        let base = unique_dir("unrelated-count-152");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&super::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let prior_bytes = std::fs::read(&ckpt).unwrap();
+        drop(presenter);
+        for i in 0..70 {
+            let name = format!("unrelated-{i:03}.staging-trash-1-{i}");
+            std::fs::write(p.join(&name), b"sibling-residue-152").unwrap();
+        }
+        let unconfirmed = mutated_checkpoint_bytes(&prior_bytes, 999);
+        std::fs::write(&ckpt, &unconfirmed).unwrap();
+        let err = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect_err("an unconfirmed target with no prior refuses");
+        assert!(
+            !format!("{err:?}").contains("too many checkpoint stages"),
+            "unrelated trash never consumes the budget: {err:?}"
+        );
+        assert!(
+            format!("{err:?}").contains("no marker-bound prior"),
+            "the refusal names the missing prior: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new152_scoped_budget_still_fails_closed() {
+        // P2fix23 NEW-152 (Tier-1 adjacent edge — the budget
+        // survives scoping): 65 CHECKPOINT-SCOPED junk
+        // entries (our stage prefix, unverifiable content)
+        // with an unconfirmed target still refuse "too many
+        // checkpoint stages" — the 64-candidate bound still
+        // guards plausibly-ours candidates. (No-over-fail
+        // control — GREEN both sides: scoping narrows WHO
+        // counts, never the cap itself.)
+        let base = unique_dir("scoped-budget-152");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&super::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let prior_bytes = std::fs::read(&ckpt).unwrap();
+        drop(presenter);
+        for i in 0..65 {
+            let name = format!("ckpt.json.staging-junk-{i:03}");
+            std::fs::write(p.join(&name), b"checkpoint-scoped-junk-152").unwrap();
+        }
+        let unconfirmed = mutated_checkpoint_bytes(&prior_bytes, 999);
+        std::fs::write(&ckpt, &unconfirmed).unwrap();
+        let err = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect_err("65 scoped junk entries still trip the budget");
+        assert!(
+            format!("{err:?}").contains("too many checkpoint stages"),
+            "the scoped budget still fails closed: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new150_boundary_rebind_with_conflicting_record_preserves_all() {
+        // P2fix23 NEW-150 (governing namespace revalidated at
+        // the pending-mutation boundary): a displaced pending
+        // recovery stands, and the reserved directory entry
+        // REBINDS at the mutation boundary (renamed aside +
+        // recreated with a conflicting record governing
+        // other bytes) — the boundary revalidation refuses
+        // with the conflicting record, every payload, and
+        // the pending state preserved (never authorizing
+        // removal through the stale handle). Pre-fix: the
+        // governor re-reads through the original fd without
+        // checking the entry still resolves to it, so the
+        // recovery removes the displaced trash around the
+        // rebind (RED — the removal the stale handle
+        // authorizes).
+        let base = unique_dir("governor-rebind-150");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&super::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        std::fs::write(
+            out.join("window-0000000001.json"),
+            serde_json::to_string(&super::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        presenter
+            .build_service_staged()
+            .expect("staged fold advances");
+        super::dir_sync_fault::arm(1);
+        super::trash_unlink_fault::arm(1);
+        let first = presenter.flush_checkpoint();
+        super::dir_sync_fault::arm(0);
+        super::trash_unlink_fault::arm(0);
+        assert!(first.is_err(), "premise: the faulted flush fails");
+        assert!(
+            presenter.pending_recovery.is_some(),
+            "premise: a displaced pending recovery stands"
+        );
+        let target_before = std::fs::read(&ckpt).unwrap();
+        let trash_before: Vec<_> = std::fs::read_dir(&p)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".staging-trash-"))
+            .collect();
+        assert_eq!(trash_before.len(), 1, "premise: one displaced trash stands");
+        let trash_bytes = std::fs::read(p.join(&trash_before[0])).unwrap();
+        let conflict = super::render_settlement_record(&super::SettledRecord {
+            target_sha256: "cd".repeat(32).to_string(),
+            checkpoint_seq: 7,
+        });
+        let marker_dir = p.join(super::SETTLED_DIR_NAME);
+        let record_path = record_path_for(&ckpt);
+        let aside = p.join("marker-aside-n150");
+        let original_record = std::fs::read(&record_path).unwrap();
+        let (marker2, aside2, conflict2) = (marker_dir.clone(), aside.clone(), conflict.clone());
+        super::pre_recovery_mutation_hook::arm(move || {
+            std::fs::rename(&marker2, &aside2).unwrap();
+            std::fs::create_dir_all(&marker2).unwrap();
+            std::fs::write(marker2.join("ckpt.json"), &conflict2).unwrap();
+        });
+        let err = presenter
+            .flush_checkpoint()
+            .expect_err("a boundary rebind refuses before any recovery mutation");
+        super::pre_recovery_mutation_hook::disarm();
+        assert!(
+            format!("{err:?}").contains("rebound"),
+            "the refusal names the rebound namespace: {err:?}"
+        );
+        assert!(
+            presenter.pending_recovery.is_some(),
+            "the pending state stays for a later flush"
+        );
+        assert_eq!(
+            std::fs::read(p.join(&trash_before[0])).unwrap(),
+            trash_bytes,
+            "the displaced trash stands (no recovery mutation ran)"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            target_before,
+            "the target stands"
+        );
+        assert_eq!(
+            std::fs::read(marker_dir.join("ckpt.json")).unwrap(),
+            conflict,
+            "the conflicting record stands preserved (never removed)"
+        );
+        assert_eq!(
+            std::fs::read(aside.join("ckpt.json")).unwrap(),
+            original_record,
+            "the aside original record stands preserved"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new150_rebind_before_later_mutation_defers() {
+        // P2fix23 NEW-150 (Tier-1 adjacent edge — the
+        // governing namespace revalidates before EVERY
+        // pending mutation, not just the boundary): a direct
+        // Absent-arm pending recovery stands with the target
+        // carrying our bytes, and the reserved entry rebinds
+        // (with a conflicting record) between the boundary
+        // and the target unlink — the pre-mutation
+        // revalidation defers with pending kept and the
+        // target standing. Pre-fix: no revalidation guards
+        // the later mutation, so the target unlinks around
+        // the rebind (RED).
+        let base = unique_dir("governor-later-150");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let marker_dir = p.join(super::SETTLED_DIR_NAME);
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        let dir_fd = std::fs::File::open(&p).unwrap();
+        let marker_fd = std::fs::File::open(&marker_dir).unwrap();
+        let marker_id = super::file_id(&marker_fd).unwrap();
+        let guard = super::PlacementGuard::arm(&dir_fd, &ckpt).expect("guard arms");
+        let record_c = std::ffi::CString::new("ckpt.json").unwrap();
+        let own_bytes = b"direct-own-bytes-150".to_vec();
+        std::fs::write(&ckpt, &own_bytes).unwrap();
+        let own_id = super::file_id(&std::fs::File::open(&ckpt).unwrap()).unwrap();
+        presenter.pending_recovery = Some(super::PendingSwapback {
+            stage_c: std::ffi::CString::new("ckpt.json.staging-150").unwrap(),
+            target_c: std::ffi::CString::new("ckpt.json").unwrap(),
+            arm: super::PublishArm::Absent,
+            own_id,
+            own_bytes: own_bytes.clone(),
+            prior_bytes: None,
+            displaced_trash: None,
+            displaced_verified: false,
+            removal_completed: false,
+        });
+        let conflict = super::render_settlement_record(&super::SettledRecord {
+            target_sha256: "ab".repeat(32).to_string(),
+            checkpoint_seq: 9,
+        });
+        let aside = p.join("marker-aside-n150b");
+        let (marker2, aside2, conflict2) = (marker_dir.clone(), aside.clone(), conflict.clone());
+        super::pending_recovery_step_hook::arm(move || {
+            std::fs::rename(&marker2, &aside2).unwrap();
+            std::fs::create_dir_all(&marker2).unwrap();
+            std::fs::write(marker2.join("ckpt.json"), &conflict2).unwrap();
+        });
+        let err = presenter
+            .complete_pending_recovery(
+                &guard,
+                &dir_fd,
+                &marker_fd,
+                marker_id,
+                &record_c,
+                std::ffi::OsStr::new("ckpt.json"),
+            )
+            .expect_err("a rebind before the unlink defers");
+        super::pending_recovery_step_hook::disarm();
+        assert!(
+            format!("{err:?}").contains("rebound"),
+            "the deferral names the rebound namespace: {err:?}"
+        );
+        assert!(
+            presenter.pending_recovery.is_some(),
+            "pending stays for the healthy retry"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            own_bytes,
+            "the target stands (no recovery mutation ran)"
+        );
+        assert_eq!(
+            std::fs::read(marker_dir.join("ckpt.json")).unwrap(),
+            conflict,
+            "the conflicting record stands preserved (never removed)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new149_target_rewrite_during_removal_restores_prior() {
+        // P2fix23 NEW-149 (target + authority bound through
+        // prior removal): the target rewritten AFTER the
+        // prior displaces (inside the retirement removal)
+        // withholds the flush AND restores the displaced
+        // prior to its stage name (never deleting the last
+        // intact prior) — the rewrite stands preserved,
+        // live stays frozen at the prior authority, and
+        // reopen refuses the unconfirmed target with every
+        // payload standing. Pre-fix: the pre-unlink
+        // callback rechecks only the marker, so the prior
+        // deletes and only the later completion check
+        // withholds (RED — the last intact prior deleted).
+        let base = unique_dir("removal-target-149");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&super::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let record_path = record_path_for(&ckpt);
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let prior_bytes = std::fs::read(&ckpt).unwrap();
+        let prior_record = std::fs::read(&record_path).unwrap();
+        let prior_sha = super::parse_settlement_record(&prior_record)
+            .unwrap()
+            .target_sha256;
+        std::fs::write(
+            out.join("window-0000000001.json"),
+            serde_json::to_string(&super::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        presenter
+            .build_service_staged()
+            .expect("staged fold advances");
+        // Plant AFTER the retirement displacement (a
+        // re-arming hook: earlier removals re-arm, the
+        // removal whose displacement stands rewrites).
+        fn arm_post_displacement_rewrite(
+            p: std::path::PathBuf,
+            ckpt: std::path::PathBuf,
+            rewrite: Vec<u8>,
+        ) {
+            super::pre_unlink_hook::arm(move || {
+                let displaced = std::fs::read_dir(&p)
+                    .unwrap()
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().contains(".staging-trash-"));
+                if displaced {
+                    std::fs::write(&ckpt, &rewrite).unwrap();
+                } else {
+                    arm_post_displacement_rewrite(p, ckpt, rewrite);
+                }
+            });
+        }
+        let rewrite = mutated_checkpoint_bytes(&prior_bytes, 999);
+        arm_post_displacement_rewrite(p.clone(), ckpt.clone(), rewrite.clone());
+        let err = presenter
+            .flush_checkpoint()
+            .expect_err("a mid-removal target rewrite withholds");
+        super::pre_unlink_hook::disarm();
+        assert!(
+            format!("{err:?}").contains("target changed"),
+            "the withhold names the target change: {err:?}"
+        );
+        assert!(
+            format!("{err:?}").contains("restored to its stage name"),
+            "the withhold restores the prior: {err:?}"
+        );
+        // The prior stage stands RESTORED with the prior
+        // bytes (never deleted).
+        let stages: Vec<_> = std::fs::read_dir(&p)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".staging-") && !n.contains(".staging-trash-"))
+            .collect();
+        assert_eq!(stages.len(), 1, "one prior stage stands: {stages:?}");
+        assert_eq!(
+            std::fs::read(p.join(&stages[0])).unwrap(),
+            prior_bytes,
+            "the restored prior carries the prior bytes"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            rewrite,
+            "the foreign target rewrite stands preserved"
+        );
+        let super::LoadAuthority::Adopted { sha } = &presenter.load_authority else {
+            panic!(
+                "live keeps its adopted authority: {:?}",
+                presenter.load_authority
+            );
+        };
+        assert_eq!(sha, &prior_sha, "live stays frozen at the prior authority");
+        drop(presenter);
+        // Reopen refuses the unconfirmed target with every
+        // payload standing (the new payload is genuinely
+        // gone — only the rewrite stands at the target —
+        // so refusal with preservation is exact).
+        let err = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect_err("reopen refuses the unconfirmed target");
+        assert!(
+            format!("{err:?}").contains("no marker-bound prior"),
+            "reopen names the missing prior: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(p.join(&stages[0])).unwrap(),
+            prior_bytes,
+            "the prior still stands after reopen"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            rewrite,
+            "the rewrite still stands after reopen"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new149_garbage_target_rewrite_during_removal_restores_prior() {
+        // P2fix23 NEW-149 (Tier-1 adjacent edge — the
+        // byte-compare arm): the same mid-removal rewrite
+        // with GARBAGE bytes (not a valid document) also
+        // restores the prior and withholds — the binding
+        // compares bytes, never shape. Pre-fix: the prior
+        // deletes (RED).
+        let base = unique_dir("removal-garbage-149");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&super::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let record_path = record_path_for(&ckpt);
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let prior_bytes = std::fs::read(&ckpt).unwrap();
+        let prior_sha = super::parse_settlement_record(&std::fs::read(&record_path).unwrap())
+            .unwrap()
+            .target_sha256;
+        std::fs::write(
+            out.join("window-0000000001.json"),
+            serde_json::to_string(&super::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        presenter
+            .build_service_staged()
+            .expect("staged fold advances");
+        fn arm_post_displacement_rewrite(
+            p: std::path::PathBuf,
+            ckpt: std::path::PathBuf,
+            rewrite: Vec<u8>,
+        ) {
+            super::pre_unlink_hook::arm(move || {
+                let displaced = std::fs::read_dir(&p)
+                    .unwrap()
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().contains(".staging-trash-"));
+                if displaced {
+                    std::fs::write(&ckpt, &rewrite).unwrap();
+                } else {
+                    arm_post_displacement_rewrite(p, ckpt, rewrite);
+                }
+            });
+        }
+        let rewrite = b"garbage-rewrite-149".to_vec();
+        arm_post_displacement_rewrite(p.clone(), ckpt.clone(), rewrite.clone());
+        let err = presenter
+            .flush_checkpoint()
+            .expect_err("a mid-removal garbage rewrite withholds");
+        super::pre_unlink_hook::disarm();
+        assert!(
+            format!("{err:?}").contains("target changed"),
+            "the withhold names the target change: {err:?}"
+        );
+        assert!(
+            format!("{err:?}").contains("restored to its stage name"),
+            "the withhold restores the prior: {err:?}"
+        );
+        let stages: Vec<_> = std::fs::read_dir(&p)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".staging-") && !n.contains(".staging-trash-"))
+            .collect();
+        assert_eq!(stages.len(), 1, "one prior stage stands: {stages:?}");
+        assert_eq!(
+            std::fs::read(p.join(&stages[0])).unwrap(),
+            prior_bytes,
+            "the restored prior carries the prior bytes"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            rewrite,
+            "the garbage rewrite stands preserved"
+        );
+        let super::LoadAuthority::Adopted { sha } = &presenter.load_authority else {
+            panic!(
+                "live keeps its adopted authority: {:?}",
+                presenter.load_authority
+            );
+        };
+        assert_eq!(sha, &prior_sha, "live stays frozen at the prior authority");
+        drop(presenter);
+        // Garbage takes the pre-existing foreign-schema
+        // discard arm (not the torn-target arm — nothing
+        // checkpoint-shaped stands) with every payload
+        // preserved.
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("reopen discards the garbage target");
+        assert!(
+            matches!(q.load_authority, super::LoadAuthority::Discarded),
+            "reopen discards, never adopts: {:?}",
+            q.load_authority
+        );
+        drop(q);
+        assert_eq!(
+            std::fs::read(p.join(&stages[0])).unwrap(),
+            prior_bytes,
+            "the prior still stands after reopen"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            rewrite,
+            "the rewrite still stands after reopen"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new149_final_gate_reproof_refuses_with_trash_standing() {
+        // P2fix23 NEW-149 (the fused gate re-proof): a gate
+        // that passes pre-removal but fails in the final
+        // re-proof refuses with the displaced entry
+        // standing declared at its trash name (recoverable
+        // — never deleted). Pre-fix: the gate runs once,
+        // so a pass-then-fail gate unlinks (RED — removal
+        // past a revoked commit).
+        let base = unique_dir("final-gate-149");
+        let d = base.join("d");
+        std::fs::create_dir_all(&d).unwrap();
+        let victim = d.join("victim");
+        let ours = b"our-owned-bytes-149".to_vec();
+        std::fs::write(&victim, &ours).unwrap();
+        let dir_fd = std::fs::File::open(&d).unwrap();
+        let ours_id = super::file_id(&std::fs::File::open(&victim).unwrap()).unwrap();
+        let name = std::ffi::CString::new("victim").unwrap();
+        let calls = std::cell::Cell::new(0u64);
+        let gate = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Ok(())
+            } else {
+                Err::<(), std::io::Error>(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "test commit revoked in the final gap",
+                ))
+            }
+        };
+        let rctx = super::RemovalCtx::marker(None).with_pre_unlink(&gate);
+        let err = super::unlink_owned_bytes_ctx(&dir_fd, &name, ours_id, &ours, &rctx)
+            .expect_err("a revoked commit never unlinks");
+        assert_eq!(calls.get(), 2, "the gate re-proves in the final re-proof");
+        assert!(
+            format!("{err:?}").contains("test commit revoked"),
+            "the refusal names the revoked commit: {err:?}"
+        );
+        let trash: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".staging-trash-"))
+            .collect();
+        assert_eq!(trash.len(), 1, "one trash stands declared");
+        assert_eq!(
+            std::fs::read(d.join(&trash[0])).unwrap(),
+            ours,
+            "the displaced bytes stand at the trash"
+        );
+        assert!(
+            !victim.exists(),
+            "the name stands absent (no restore past a fused trip)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new151_sweep_authority_loss_preserves_legacy() {
+        // P2fix23 NEW-151 (legacy sweep bound to the current
+        // marker + target): a migrating write settles, and
+        // the reserved record CHANGES at the sweep boundary
+        // (same-inode rewrite with other valid authority —
+        // the byte-compare arm) — the sweep leaves the
+        // legacy record STANDING (it may govern again —
+        // never deleted past unconfirmed authority) and the
+        // post-sweep confirmation withholds the flush with
+        // live frozen. Reopen first refuses the conflict
+        // exactly with every payload standing; after the
+        // operator restores the committed record, reopen
+        // adopts the committed payload exactly. Pre-fix:
+        // the sweep's later mutation has no
+        // current-authority gate, so the legacy record
+        // deletes and the flush succeeds (RED — a
+        // governing record deleted with success reported).
+        let base = unique_dir("sweep-authority-151");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&super::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        // A settled-legacy tree: the target carries the
+        // prior, the beside-target record confirms it, no
+        // new-namespace record stands.
+        let mut prior =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("prior opens");
+        prior.build_service().expect("prior commits");
+        drop(prior);
+        let legacy_bytes = std::fs::read(record_path_for(&ckpt)).unwrap();
+        let prior_sha = super::parse_settlement_record(&legacy_bytes)
+            .unwrap()
+            .target_sha256;
+        let _ = std::fs::remove_dir_all(p.join(super::SETTLED_DIR_NAME));
+        let legacy_path = p.join("ckpt.json.settled");
+        std::fs::write(&legacy_path, &legacy_bytes).unwrap();
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("reopen adopts");
+        std::fs::write(
+            out.join("window-0000000001.json"),
+            serde_json::to_string(&super::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        presenter
+            .build_service_staged()
+            .expect("staged fold advances");
+        let record_path = record_path_for(&ckpt);
+        let plant = super::render_settlement_record(&super::SettledRecord {
+            target_sha256: "ef".repeat(32).to_string(),
+            checkpoint_seq: 11,
+        });
+        let (record2, plant2) = (record_path.clone(), plant.clone());
+        super::pre_legacy_sweep_hook::arm(move || {
+            std::fs::write(&record2, &plant2).unwrap();
+        });
+        let err = presenter
+            .flush_checkpoint()
+            .expect_err("an authority change at the sweep withholds");
+        super::pre_legacy_sweep_hook::disarm();
+        assert!(
+            format!("{err:?}").contains("during the legacy sweep"),
+            "the withhold names the sweep boundary: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&legacy_path).unwrap(),
+            legacy_bytes,
+            "the legacy record stands preserved (never swept past the loss)"
+        );
+        assert_eq!(
+            std::fs::read(&record_path).unwrap(),
+            plant,
+            "the planted record stands preserved"
+        );
+        let target_bytes = std::fs::read(&ckpt).unwrap();
+        let super::LoadAuthority::Adopted { sha } = &presenter.load_authority else {
+            panic!(
+                "live keeps its adopted authority: {:?}",
+                presenter.load_authority
+            );
+        };
+        assert_eq!(sha, &prior_sha, "live stays frozen at the prior authority");
+        drop(presenter);
+        // Immediate reopen refuses the conflict exactly
+        // with every payload standing.
+        let err = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect_err("reopen refuses the conflicting authority");
+        assert!(
+            format!("{err:?}").contains("no marker-bound prior"),
+            "reopen names the missing prior: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&legacy_path).unwrap(),
+            legacy_bytes,
+            "the legacy still stands after reopen"
+        );
+        // The operator restores the committed record (read
+        // back from the failed flush's own commit — the
+        // plant overwrote it, so the committed bytes come
+        // from the target they select): reopen then adopts
+        // the committed payload exactly.
+        let committed_doc: serde_json::Value = serde_json::from_slice(&target_bytes).unwrap();
+        let committed_sha = committed_doc["sha256"].as_str().unwrap().to_string();
+        let committed_seq = super::u64_at(&committed_doc, "checkpoint_seq").unwrap();
+        let committed = super::render_settlement_record(&super::SettledRecord {
+            target_sha256: committed_sha,
+            checkpoint_seq: committed_seq,
+        });
+        std::fs::write(&record_path, &committed).unwrap();
+        let q = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect("reopen adopts after the operator restores the record");
+        let super::LoadAuthority::Adopted { sha } = &q.load_authority else {
+            panic!("reopen adopts authority: {:?}", q.load_authority);
+        };
+        assert_eq!(
+            sha,
+            &super::parse_settlement_record(&committed)
+                .unwrap()
+                .target_sha256,
+            "reopen binds the committed authority"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            target_bytes,
+            "the committed target stands adopted"
+        );
+        drop(q);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new151_sweep_target_rewrite_preserves_legacy() {
+        // P2fix23 NEW-151 (Tier-1 adjacent edge — the sweep
+        // binds the TARGET too): the same migrating write
+        // with the TARGET rewritten at the sweep boundary
+        // (other valid bytes) — the sweep leaves the legacy
+        // record standing and the post-sweep confirmation
+        // withholds with live frozen; reopen refuses
+        // exactly. Pre-fix: the legacy deletes and the
+        // flush SUCCEEDS past the rewrite (RED).
+        let base = unique_dir("sweep-target-151");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&super::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut prior =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("prior opens");
+        prior.build_service().expect("prior commits");
+        let first_bytes = std::fs::read(&ckpt).unwrap();
+        drop(prior);
+        let legacy_bytes = std::fs::read(record_path_for(&ckpt)).unwrap();
+        let prior_sha = super::parse_settlement_record(&legacy_bytes)
+            .unwrap()
+            .target_sha256;
+        let _ = std::fs::remove_dir_all(p.join(super::SETTLED_DIR_NAME));
+        let legacy_path = p.join("ckpt.json.settled");
+        std::fs::write(&legacy_path, &legacy_bytes).unwrap();
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("reopen adopts");
+        std::fs::write(
+            out.join("window-0000000001.json"),
+            serde_json::to_string(&super::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        presenter
+            .build_service_staged()
+            .expect("staged fold advances");
+        let rewrite = mutated_checkpoint_bytes(&first_bytes, 999);
+        let (ckpt2, rewrite2) = (ckpt.clone(), rewrite.clone());
+        super::pre_legacy_sweep_hook::arm(move || {
+            std::fs::write(&ckpt2, &rewrite2).unwrap();
+        });
+        let err = presenter
+            .flush_checkpoint()
+            .expect_err("a target rewrite at the sweep withholds");
+        super::pre_legacy_sweep_hook::disarm();
+        assert!(
+            format!("{err:?}").contains("during the legacy sweep"),
+            "the withhold names the sweep boundary: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&legacy_path).unwrap(),
+            legacy_bytes,
+            "the legacy record stands preserved (never swept past the rewrite)"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            rewrite,
+            "the foreign target rewrite stands preserved"
+        );
+        let super::LoadAuthority::Adopted { sha } = &presenter.load_authority else {
+            panic!(
+                "live keeps its adopted authority: {:?}",
+                presenter.load_authority
+            );
+        };
+        assert_eq!(sha, &prior_sha, "live stays frozen at the prior authority");
+        drop(presenter);
+        let err = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
+            .expect_err("reopen refuses the unconfirmed target");
+        assert!(
+            format!("{err:?}").contains("no marker-bound prior"),
+            "reopen names the missing prior: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new126_duplicate_member_sibling_reclassifies_junk() {
+        // P2fix23 NEW-126 (raw uniqueness before affirmative
+        // sibling classification): a hash-valid document
+        // carrying a duplicated raw member is NOT an
+        // affirmative sibling — it classifies Junk (fully
+        // scanned, nothing hides beyond), never Sibling.
+        // Pre-fix: the helper checks only schema + self-hash
+        // after decoding (which collapses the duplicate),
+        // so it affirms the defective document (RED).
+        let base = unique_dir("dup-sibling-126");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&super::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let sib = p.join("sib.json");
+        let mut sib_p = Presenter::open_with_checkpoint(&out, &sib, 1, "export")
+            .expect("sibling open succeeds");
+        sib_p.build_service().expect("sibling commits");
+        drop(sib_p);
+        // Duplicate a member in the RAW text (serde
+        // collapses on decode) with a recomputed self-hash.
+        let text = String::from_utf8(std::fs::read(&sib).unwrap()).unwrap();
+        let anchor = "\"checkpoint_seq\":";
+        let pos = text.find(anchor).expect("premise: sequence member renders");
+        let after_key = pos + anchor.len();
+        let end = text[after_key..]
+            .find(|c: char| c == ',' || c == '}')
+            .expect("premise: scalar sequence")
+            + after_key;
+        let num = text[after_key..end].to_string();
+        let duped = format!("{},{anchor}{num}{}", &text[..end], &text[end..]);
+        let v: serde_json::Value = serde_json::from_str(&duped).expect("premise: dup parses");
+        let old_sha = v["sha256"].as_str().unwrap().to_string();
+        let mut bare = v.clone();
+        bare.as_object_mut().unwrap().remove("sha256");
+        let new_sha = super::sha256_hex(&serde_json::to_vec(&bare).unwrap());
+        let occupant = duped.replacen(
+            &format!("\"sha256\":\"{old_sha}\""),
+            &format!("\"sha256\":\"{new_sha}\""),
+            1,
+        );
+        assert!(
+            crate::schema::check_envelope_raw_duplicates(&occupant).is_err(),
+            "premise: the raw text duplicates a member"
+        );
+        std::fs::write(p.join("occupant-126-dup"), &occupant).unwrap();
+        let dir_fd = std::fs::File::open(&p).unwrap();
+        let name_c = std::ffi::CString::new("occupant-126-dup").unwrap();
+        assert!(
+            matches!(
+                super::scan_legacy_occupant(&dir_fd, &name_c, &out),
+                Ok(super::LegacyScan::Junk)
+            ),
+            "a duplicated-member document classifies Junk, never Sibling"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new126_missing_field_sibling_reclassifies_junk() {
+        // P2fix23 NEW-126 (checkpoint structural validation
+        // before affirmative sibling classification): a
+        // hash-valid document missing a required field
+        // (`accumulators`) is NOT an affirmative sibling —
+        // it classifies Junk, never Sibling. Pre-fix: the
+        // helper checks only schema + self-hash, so it
+        // affirms the shapeless document (RED).
+        let base = unique_dir("shape-sibling-126");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&super::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let sib = p.join("sib.json");
+        let mut sib_p = Presenter::open_with_checkpoint(&out, &sib, 1, "export")
+            .expect("sibling open succeeds");
+        sib_p.build_service().expect("sibling commits");
+        drop(sib_p);
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sib).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("accumulators");
+        let mut bare = v.clone();
+        bare.as_object_mut().unwrap().remove("sha256");
+        let hash = super::sha256_hex(&serde_json::to_vec(&bare).unwrap());
+        v.as_object_mut()
+            .unwrap()
+            .insert("sha256".to_string(), serde_json::json!(hash));
+        let occupant = serde_json::to_vec(&v).unwrap();
+        std::fs::write(p.join("occupant-126-shape"), &occupant).unwrap();
+        let dir_fd = std::fs::File::open(&p).unwrap();
+        let name_c = std::ffi::CString::new("occupant-126-shape").unwrap();
+        assert!(
+            matches!(
+                super::scan_legacy_occupant(&dir_fd, &name_c, &out),
+                Ok(super::LegacyScan::Junk)
+            ),
+            "a field-missing document classifies Junk, never Sibling"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new126_valid_full_sibling_still_affirmative() {
+        // P2fix23 NEW-126 (Tier-1 adjacent edge — the
+        // no-over-fail control): a fully valid sibling
+        // checkpoint (a real writer document, bound to this
+        // out-dir) still classifies Sibling. (GREEN both
+        // sides: the fix narrows WHAT affirms, never the
+        // valid shape.)
+        let base = unique_dir("valid-sibling-126");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&super::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let sib = p.join("sib.json");
+        let mut sib_p = Presenter::open_with_checkpoint(&out, &sib, 1, "export")
+            .expect("sibling open succeeds");
+        sib_p.build_service().expect("sibling commits");
+        drop(sib_p);
+        let occupant = std::fs::read(&sib).unwrap();
+        std::fs::write(p.join("occupant-126-valid"), &occupant).unwrap();
+        let dir_fd = std::fs::File::open(&p).unwrap();
+        let name_c = std::ffi::CString::new("occupant-126-valid").unwrap();
+        assert!(
+            matches!(
+                super::scan_legacy_occupant(&dir_fd, &name_c, &out),
+                Ok(super::LegacyScan::Sibling)
+            ),
+            "a fully valid sibling still affirms"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new126_foreign_out_dir_sibling_reclassifies_junk() {
+        // P2fix23 NEW-126 (the out-dir binding applies to
+        // affirmative classification too): a structurally
+        // valid sibling bound to ANOTHER out-dir is junk
+        // to this presenter — it classifies Junk, never
+        // Sibling. Pre-fix: schema + self-hash affirm it
+        // (RED).
+        let base = unique_dir("foreign-sibling-126");
+        let out = base.join("out");
+        let out2 = base.join("out2");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&out2).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        for (dir, seq) in [(&out, 0), (&out2, 0)] {
+            std::fs::write(
+                dir.join(format!("window-{seq:010}.json")),
+                serde_json::to_string(&super::test_envelope(seq, 0, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+        }
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let sib = p.join("sib.json");
+        let mut sib_p = Presenter::open_with_checkpoint(&out2, &sib, 1, "export")
+            .expect("sibling open succeeds");
+        sib_p.build_service().expect("sibling commits");
+        drop(sib_p);
+        let occupant = std::fs::read(&sib).unwrap();
+        std::fs::write(p.join("occupant-126-foreign"), &occupant).unwrap();
+        let dir_fd = std::fs::File::open(&p).unwrap();
+        let name_c = std::ffi::CString::new("occupant-126-foreign").unwrap();
+        assert!(
+            matches!(
+                super::scan_legacy_occupant(&dir_fd, &name_c, &out),
+                Ok(super::LegacyScan::Junk)
+            ),
+            "a foreign-out-dir document classifies Junk, never Sibling"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
