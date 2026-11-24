@@ -269,6 +269,13 @@ mod tests {
             classify_symbols(a.iter().map(String::as_str), b"").0,
             Flavor::AwsLc
         );
+        // Tier-1: pin the bcm_-only cell (BoringSSL-FIPS prefix, never
+        // exported by AWS-LC) — unchanged by the R0 reorder.
+        let f = syms(&["EVP_DigestInit", "bcm_some_fn"]);
+        assert_eq!(
+            classify_symbols(f.iter().map(String::as_str), b"").0,
+            Flavor::BoringSSL
+        );
     }
 
     /// R0: real AWS-LC exports BOTH `AWSLC_*` and compat `BORINGSSL_*`
