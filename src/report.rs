@@ -446,6 +446,7 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
         .any(|a| a == "--help" || a == "-h")
     {
         println!("{USAGE}");
+        println!("{}", crate::cli::attach_warning_help());
         for line in crate::cli::exit_code_help_report() {
             println!("{line}");
         }

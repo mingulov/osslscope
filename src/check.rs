@@ -615,6 +615,7 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
         for l in USAGE {
             println!("{l}");
         }
+        println!("{}", crate::cli::attach_warning_help());
         for line in crate::cli::exit_code_help() {
             println!("{line}");
         }

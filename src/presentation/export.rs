@@ -128,6 +128,7 @@ fn parse(args: &[String]) -> Result<Options, ()> {
             }
             "--help" | "-h" => {
                 print!("{HELP}");
+                println!("{}", crate::cli::attach_warning_help());
                 std::process::exit(0);
             }
             _ => return Err(()),

@@ -92,6 +92,30 @@ pub(crate) fn blocked_pointer_sub() -> &'static str {
     "  first run blocked? bare 'doctor' checks self (CAP_BPF+CAP_PERFMON); 'doctor --pid PID' probes foreign backing (needs root/capable proof)"
 }
 
+/// Attach warning for live-observation `--help` texts (G4 U5/S1):
+/// one shared line — privileged, system-wide, finite window.
+/// Printed after the usage block, before the exit lines.
+pub(crate) fn attach_warning_help() -> &'static str {
+    "  warning: live observation is privileged and system-wide; every observation window is finite"
+}
+
+/// One-line runtime notice, emitted once per process when the
+/// first BPF attach begins (G4 U5/S1). Stderr only; complements
+/// the later per-run `focused callbacks attached` confirmation.
+pub(crate) fn attach_notice_line() -> &'static str {
+    "osslscope: note: live observation starting (privileged, system-wide probes; finite window)"
+}
+
+/// Emit [`attach_notice_line`] exactly once per process, at the
+/// first successful session open. Call sites prove attachment
+/// (an open plane), never an attempt: denied hosts stay silent.
+pub(crate) fn note_attach_start() {
+    static NOTICED: std::sync::Once = std::sync::Once::new();
+    NOTICED.call_once(|| {
+        crate::report::err_line(attach_notice_line());
+    });
+}
+
 /// Tokens in flag position: a value-taking option consumes the next
 /// token (whatever it is — even a flag-shaped pathname), so option
 /// VALUES never select a dispatch route. `value_flags` must be built
@@ -217,10 +241,19 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         "export" => crate::presentation::export::run(&argv),
         "watch" => crate::presentation::watch::run(&argv),
         "help" | "--help" | "-h" => {
+            // G4 U3b: `help <sub>` honors its argument (byte-identical
+            // to `<sub> --help`); unknown topics stay usage errors.
+            if let Some(topic) = argv.get(1).map(String::as_str) {
+                return help_topic(topic);
+            }
             println!("osslscope — non-interposing OpenSSL observer");
             println!(
                 "usage: osslscope <scan|inspect|doctor|report|check|alias-audit|service|export|watch> [args]"
             );
+            // G4 U3a: scan/inspect are first-class bullets (the
+            // unprivileged on-ramp), not a footer aside.
+            println!("  scan         passive process/module discovery; no profile or BPF required");
+            println!("  inspect      passive per-target detail; no profile or BPF required");
             println!(
                 "  doctor       inventory, companion integrity and functional tracing preflight"
             );
@@ -240,9 +273,6 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
                 "  report/check use --pid PID or run -- COMMAND; --libcrypto selects legacy diagnostics"
             );
             println!(
-                "  scan/inspect  passive process/module discovery; no profile or BPF required"
-            );
-            println!(
                 "  scan --watch --observe-crypto  observe discovered scope members separately"
             );
             println!("  --observe-providers  public provider API observation (default 30 seconds)");
@@ -260,10 +290,38 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
             println!("{}", blocked_pointer_top());
             ExitCode::SUCCESS
         }
-        "--version" | "-V" => {
+        "--version" | "-V" | "version" => {
             println!("osslscope {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        other => {
+            crate::report::err_line(&format!(
+                "osslscope: unknown subcommand '{other}' (see: osslscope help)"
+            ));
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `help <topic>` dispatch (G4 U3b): a known subcommand renders
+/// its own `--help` (byte-identical to the direct form); `help`
+/// and `version` topics render the top help and version line;
+/// anything else is the standard unknown-subcommand error.
+fn help_topic(topic: &str) -> ExitCode {
+    match topic {
+        "help" | "--help" | "-h" => run(["help".to_string()].into_iter()),
+        "--version" | "-V" | "version" => run(["--version".to_string()].into_iter()),
+        "scan"
+        | "inspect"
+        | "doctor"
+        | "report"
+        | "check"
+        | "alias-audit"
+        | "service"
+        | "export"
+        | "watch"
+        | "service-witness"
+        | "service-attempt-trace" => run([topic.to_string(), "--help".to_string()].into_iter()),
         other => {
             crate::report::err_line(&format!(
                 "osslscope: unknown subcommand '{other}' (see: osslscope help)"
@@ -504,6 +562,17 @@ mod preview_tests {
             route(&["--observe-crypto", "--module", "m"]),
             ScanRoute::CryptoWatch
         );
+    }
+
+    #[test]
+    fn attach_warning_lines_name_privilege_scope_and_window() {
+        // G4 U5/S1: both the --help warning and the runtime notice
+        // carry the three wording elements.
+        for line in [attach_warning_help(), attach_notice_line()] {
+            assert!(line.contains("privileged"), "{line}");
+            assert!(line.contains("system-wide"), "{line}");
+            assert!(line.contains("finite"), "{line}");
+        }
     }
 
     #[test]

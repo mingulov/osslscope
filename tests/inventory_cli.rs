@@ -647,6 +647,98 @@ fn human_scan_with_gaps_never_claims_blindness() {
     child.kill().unwrap();
 }
 
+/// G4 U2a: every discovery argument error names the offending
+/// token (flag name, option name, or positional role) — never
+/// the byte-identical generic line. Exit stays 2, stdout stays
+/// empty, and user-supplied VALUES stay out of diagnostics
+/// (canary rule: only flag-shaped tokens name themselves).
+#[test]
+fn g4_u2a_discovery_errors_name_the_offending_token() {
+    for (args, needle) in [
+        (vec!["scan", "--bogus-flag"], "unknown flag --bogus-flag"),
+        (vec!["scan", "--pid"], "--pid needs a value"),
+        (
+            vec!["scan", "--pid", "notanumber"],
+            "invalid value for --pid",
+        ),
+        (vec!["scan", "--pid", "0"], "invalid value for --pid"),
+        (vec!["scan", "--pid", "-1"], "invalid value for --pid"),
+        (
+            vec!["scan", "--pid", "4294967296"],
+            "invalid value for --pid",
+        ),
+        (vec!["scan", "--pid", ""], "invalid value for --pid"),
+        (
+            vec!["scan", "extra-positional"],
+            "unexpected positional argument",
+        ),
+        (
+            vec!["scan", "--interval", "1", "--pid", "1"],
+            "--interval needs --watch",
+        ),
+        (
+            vec!["scan", "--watch", "--duration", "abc"],
+            "invalid value for --duration",
+        ),
+        (vec!["scan", "-q"], "unknown flag -q"),
+        (vec!["inspect"], "inspect needs --pid PID or --module PATH"),
+        (
+            vec!["inspect", "--pid", "1", "--pid", "2"],
+            "inspect needs exactly one of --pid PID | --module PATH",
+        ),
+    ] {
+        let output = cli(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(needle), "{args:?} stderr was: {stderr}");
+        assert!(
+            stderr.contains("(see scan --help or inspect --help)"),
+            "{args:?} keeps the help pointer, stderr was: {stderr}"
+        );
+    }
+    // Values never echo — even flag-shaped ones in value position.
+    for (args, secret) in [
+        (vec!["scan", "--pid", "notanumber"], "notanumber"),
+        (vec!["scan", "extra-positional"], "extra-positional"),
+        (vec!["scan", "--watch", "--duration", "abc"], "abc"),
+        (vec!["scan", "--pid", "4294967296"], "4294967296"),
+    ] {
+        let output = cli(&args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains(secret),
+            "{args:?} echoed its value: {stderr}"
+        );
+    }
+}
+
+/// G4 U2b: `scan --module` on a path-shaped spelling that does
+/// not exist reports the missing PATH — the hash-vs-path
+/// diagnosis is kept for bare (separator-free) spellings only.
+/// Exit stays 4 on both.
+#[test]
+fn g4_u2b_missing_module_path_is_not_diagnosed_as_hash() {
+    let output = cli(&["scan", "--module", "deadbeef"]);
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("takes a file PATH, not a hash"),
+        "bare spelling keeps the hash diagnosis, stderr was: {stderr}"
+    );
+    let output = cli(&["scan", "--module", "/nonexistent-g4-u2b/libcrypto.so.3"]);
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("not a hash"),
+        "path-shaped spelling must not get the hash diagnosis: {stderr}"
+    );
+    assert!(
+        stderr.contains("could not be opened"),
+        "path-shaped spelling names the PATH: {stderr}"
+    );
+}
+
 #[test]
 fn human_scan_states_blindness_when_verified() {
     // Root-only presence: a verified gap-free scan of a crypto-free

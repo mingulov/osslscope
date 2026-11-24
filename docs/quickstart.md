@@ -434,8 +434,9 @@ osslscope scan --bogus-flag
 echo "exit=$?"
 ```
 
-stderr is `osslscope discovery: invalid arguments (see scan
---help or inspect --help)`, exit 2.
+stderr is `osslscope discovery: unknown flag --bogus-flag (see
+scan --help or inspect --help)`, exit 2. Discovery errors name
+the offending flag or option; user-supplied values never echo.
 
 ```sh
 osslscope scan --pid 99999999

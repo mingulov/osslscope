@@ -67,13 +67,104 @@ pub(crate) struct Options {
     /// scan/inspect/provider/crypto-watch/doctor routes.
     pub(crate) verbosity: u8,
 }
-pub(crate) fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
+/// Discovery argument error (G4 U2a): names the offending FLAG
+/// token report-style, never a user-supplied value. Only
+/// flag-shaped tokens name themselves (mirroring `report`'s
+/// `unknown flag`); values and positionals are described by
+/// role so paths and secrets stay out of diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParseError {
+    /// Flag-shaped token no arm accepts (echoed verbatim).
+    UnknownFlag(String),
+    /// Non-flag token where no positional is accepted (never echoed).
+    UnexpectedPositional,
+    /// A value-taking option got no value.
+    MissingValue(&'static str),
+    /// A value-taking option got an unusable value (never echoed).
+    InvalidValue(&'static str),
+    /// A known flag repeated on one command line.
+    Repeated(&'static str),
+    /// A scan-only flag used on another command.
+    NeedsScan(&'static str),
+    /// A watch-scoped flag used without `--watch`.
+    NeedsWatch(&'static str),
+    /// Bare `inspect` (or flag-only) without a selector.
+    InspectNeedsSelector,
+    /// `inspect` with a conflicting selector combination.
+    InspectExactlyOne,
+    /// Unreachable-via-dispatch fallback (keeps the legacy line).
+    Invalid,
+}
+
+impl ParseError {
+    fn detail(&self) -> String {
+        match self {
+            ParseError::UnknownFlag(flag) => format!("unknown flag {flag}"),
+            ParseError::UnexpectedPositional => "unexpected positional argument".to_string(),
+            ParseError::MissingValue(option) => format!("{option} needs a value"),
+            ParseError::InvalidValue(option) => format!("invalid value for {option}"),
+            ParseError::Repeated(flag) => format!("flag {flag} is repeated"),
+            ParseError::NeedsScan(flag) => format!("{flag} needs scan"),
+            ParseError::NeedsWatch(flag) => format!("{flag} needs --watch"),
+            ParseError::InspectNeedsSelector => {
+                "inspect needs --pid PID or --module PATH".to_string()
+            }
+            ParseError::InspectExactlyOne => {
+                "inspect needs exactly one of --pid PID | --module PATH".to_string()
+            }
+            ParseError::Invalid => "invalid arguments".to_string(),
+        }
+    }
+}
+
+/// A known flag that fell through its guarded arm: repeated, or
+/// not valid on this command/route. `flag` is one of the static
+/// spellings matched by the caller.
+fn misplaced_flag(
+    command: &str,
+    flag: &str,
+    options: &Options,
+    allow_crypto: bool,
+    crypto: bool,
+) -> ParseError {
+    let flag: &'static str = match flag {
+        "--json" => "--json",
+        "--resolve-paths" => "--resolve-paths",
+        "--watch" => "--watch",
+        "--interval" => "--interval",
+        "--duration" => "--duration",
+        "--cgroup" => "--cgroup",
+        "--observe-crypto" => "--observe-crypto",
+        _ => return ParseError::Invalid,
+    };
+    match flag {
+        "--observe-crypto" if allow_crypto && crypto => ParseError::Repeated(flag),
+        "--observe-crypto" => ParseError::NeedsWatch(flag),
+        "--watch" | "--interval" | "--duration" | "--cgroup" if command != "scan" => {
+            ParseError::NeedsScan(flag)
+        }
+        _ if (flag == "--watch" && options.watch)
+            || (flag == "--interval" && options.interval.is_some())
+            || (flag == "--duration" && options.duration.is_some())
+            || (flag == "--cgroup" && options.cgroup.is_some())
+            || (flag == "--json" && options.json)
+            || (flag == "--resolve-paths" && options.resolve_paths) =>
+        {
+            ParseError::Repeated(flag)
+        }
+        // Unreachable (every guarded arm fails only on the states
+        // above): stay a usage error, never a wrong diagnosis.
+        _ => ParseError::Invalid,
+    }
+}
+
+pub(crate) fn parse(command: &str, args: &[String]) -> Result<Options, ParseError> {
     parse_inner(command, args, false)
 }
-pub(crate) fn parse_crypto_watch(args: &[String]) -> Result<Options, ()> {
+pub(crate) fn parse_crypto_watch(args: &[String]) -> Result<Options, ParseError> {
     parse_inner("scan", args, true)
 }
-fn parse_inner(command: &str, args: &[String], allow_crypto: bool) -> Result<Options, ()> {
+fn parse_inner(command: &str, args: &[String], allow_crypto: bool) -> Result<Options, ParseError> {
     let mut crypto = false;
     let mut options = Options {
         pids: Vec::new(),
@@ -101,53 +192,83 @@ fn parse_inner(command: &str, args: &[String], allow_crypto: bool) -> Result<Opt
             "--observe-crypto" if allow_crypto && !crypto => crypto = true,
             "--watch" if command == "scan" && !options.watch => options.watch = true,
             "--interval" if command == "scan" && options.interval.is_none() => {
-                options.interval = Some(seconds(args.next().ok_or(())?, true)?);
+                let text = args.next().ok_or(ParseError::MissingValue("--interval"))?;
+                options.interval =
+                    Some(seconds(text, true).map_err(|_| ParseError::InvalidValue("--interval"))?);
             }
             "--duration" if command == "scan" && options.duration.is_none() => {
-                options.duration = Some(seconds(args.next().ok_or(())?, false)?);
+                let text = args.next().ok_or(ParseError::MissingValue("--duration"))?;
+                options.duration =
+                    Some(seconds(text, false).map_err(|_| ParseError::InvalidValue("--duration"))?);
             }
             "--pid" => {
-                let text = args.next().ok_or(())?;
+                let text = args.next().ok_or(ParseError::MissingValue("--pid"))?;
                 if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(());
+                    return Err(ParseError::InvalidValue("--pid"));
                 }
-                let pid: u32 = text.parse().map_err(|_| ())?;
+                let pid: u32 = text
+                    .parse()
+                    .map_err(|_| ParseError::InvalidValue("--pid"))?;
                 if pid == 0 || pid > i32::MAX as u32 {
-                    return Err(());
+                    return Err(ParseError::InvalidValue("--pid"));
                 }
                 options.pids.push(pid);
             }
             "--module" => {
-                let path = args.next().ok_or(())?;
+                let path = args.next().ok_or(ParseError::MissingValue("--module"))?;
                 if path.is_empty() || path.starts_with("--") {
-                    return Err(());
+                    return Err(ParseError::InvalidValue("--module"));
                 }
                 options.modules.push(PathBuf::from(path));
             }
             "--cgroup" if command == "scan" && options.cgroup.is_none() => {
-                let path = args.next().ok_or(())?;
+                let path = args.next().ok_or(ParseError::MissingValue("--cgroup"))?;
                 if path.is_empty() || path.starts_with("--") {
-                    return Err(());
+                    return Err(ParseError::InvalidValue("--cgroup"));
                 }
                 options.cgroup = Some(PathBuf::from(path));
             }
-            _ => return Err(()),
+            "--json" | "--resolve-paths" | "--watch" | "--interval" | "--duration" | "--cgroup"
+            | "--observe-crypto" => {
+                return Err(misplaced_flag(
+                    command,
+                    arg.as_str(),
+                    &options,
+                    allow_crypto,
+                    crypto,
+                ));
+            }
+            _ => {
+                return Err(if arg.starts_with('-') {
+                    ParseError::UnknownFlag(arg.to_string())
+                } else {
+                    ParseError::UnexpectedPositional
+                });
+            }
         }
     }
     if allow_crypto && (!crypto || !options.watch) {
-        return Err(());
+        return Err(ParseError::NeedsWatch("--observe-crypto"));
     }
     if !options.watch && (options.interval.is_some() || options.duration.is_some()) {
-        return Err(());
+        return Err(ParseError::NeedsWatch(if options.interval.is_some() {
+            "--interval"
+        } else {
+            "--duration"
+        }));
     }
     if command == "inspect"
         && !((options.pids.len() == 1 && options.modules.is_empty())
             || (options.pids.is_empty() && !options.modules.is_empty()))
     {
-        return Err(());
+        return Err(if options.pids.is_empty() && options.modules.is_empty() {
+            ParseError::InspectNeedsSelector
+        } else {
+            ParseError::InspectExactlyOne
+        });
     }
     if command != "scan" && command != "inspect" {
-        return Err(());
+        return Err(ParseError::Invalid);
     }
     options.verbosity = options.verbosity.min(2);
     Ok(options)
@@ -922,10 +1043,11 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
     } else {
         let options = match parse(command, args) {
             Ok(options) => options,
-            Err(()) => {
-                crate::report::err_line(
-                    "osslscope discovery: invalid arguments (see scan --help or inspect --help)",
-                );
+            Err(error) => {
+                crate::report::err_line(&format!(
+                    "osslscope discovery: {} (see scan --help or inspect --help)",
+                    error.detail()
+                ));
                 return ExitCode::from(2);
             }
         };
@@ -986,6 +1108,13 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
         } else if command == "scan" {
             // Read before the Selection move below consumes the vectors.
             let module_scoped = !options.modules.is_empty();
+            // G4 U2b: the hash-vs-path diagnosis fits bare
+            // (separator-free) spellings only; a separator-bearing
+            // spelling is path-shaped even when it fails to open.
+            let module_all_bare = options
+                .modules
+                .iter()
+                .all(|path| path.components().count() <= 1);
             let mut scanner = match super::scope::ScopedScanner::new(
                 super::scope::Selection {
                     pids: options.pids,
@@ -996,7 +1125,7 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 Limits::default(),
             ) {
                 Ok(scanner) => scanner,
-                Err(_) => {
+                Err(reason) => {
                     // v0.6.0 D7: `--module` takes a file PATH only; a
                     // bare hash (or any other unopenable spelling)
                     // fails scope establishment, and the finite
@@ -1004,10 +1133,20 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                     // itself and IO details never enter diagnostics.
                     // Digest selectors (`sha256:...`) are explicitly
                     // deferred to P1: not accepted in v0.6.
+                    // G4 U2b: keep the hash diagnosis for bare
+                    // unopenable spellings; a path-shaped spelling
+                    // (or a non-open failure such as non-regular)
+                    // reports the PATH instead.
                     if module_scoped {
-                        crate::report::err_line(
-                            "osslscope discovery: requested scope unavailable (scan --module takes a file PATH, not a hash; see scan --help)",
-                        );
+                        if reason == GapReason::Unavailable && module_all_bare {
+                            crate::report::err_line(
+                                "osslscope discovery: requested scope unavailable (scan --module takes a file PATH, not a hash; see scan --help)",
+                            );
+                        } else {
+                            crate::report::err_line(
+                                "osslscope discovery: requested scope unavailable (scan --module PATH could not be opened; see scan --help)",
+                            );
+                        }
                     } else {
                         crate::report::err_line("osslscope discovery: requested scope unavailable");
                     }

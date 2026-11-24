@@ -53,7 +53,11 @@ use std::time::{Duration, Instant};
 pub fn run(args: &[String]) -> ExitCode {
     match crate::service::cli::parse(args) {
         Err(help) if help == "__help__" => {
-            print!("{}", crate::service::cli::USAGE);
+            println!(
+                "{}{}",
+                crate::service::cli::USAGE,
+                crate::cli::attach_warning_help()
+            );
             ExitCode::SUCCESS
         }
         Err(reason) => {

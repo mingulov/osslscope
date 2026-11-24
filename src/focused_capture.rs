@@ -1633,6 +1633,12 @@ impl FocusedSession {
         if let Some(child) = &mut owned.1 {
             child.release_retaining_exit()?;
         }
+        // G4 U5/S1: the first proven attach per process gets the
+        // one-line runtime notice (denied/degraded opens with no
+        // plane stay silent — an attempt is not an attach).
+        if session.is_some() || counter.is_some() {
+            crate::cli::note_attach_start();
+        }
         Ok(Self {
             gate,
             counter,

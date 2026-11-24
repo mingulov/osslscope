@@ -130,7 +130,11 @@ pub(crate) fn run_profiled_before(
         .map_err(anyhow::Error::from)
     })();
     let backend = match prepared {
-        Ok(backend) => backend,
+        Ok(backend) => {
+            // G4 U5/S1: proven attach (the count backend loaded).
+            crate::cli::note_attach_start();
+            backend
+        }
         Err(error) => {
             child
                 .resolve_setup_failure()

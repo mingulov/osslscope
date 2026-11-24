@@ -5409,6 +5409,7 @@ pub fn run(args: &[String]) -> ExitCode {
         println!(
             "Automatic per-process crypto observations; passive inventory when tracing is unavailable."
         );
+        println!("{}", crate::cli::attach_warning_help());
         for line in crate::cli::exit_code_help_observation() {
             println!("{line}");
         }

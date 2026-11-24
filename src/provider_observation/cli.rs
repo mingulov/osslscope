@@ -1393,7 +1393,12 @@ fn observe(
             .and_then(|bytes| ProviderSession::open(ObservationLimits::default(), &bytes))
     };
     let (mut session, mut initial_batch) = match opened {
-        Ok(session) => (Some(session), ObservationBatch::default()),
+        Ok(session) => {
+            // G4 U5/S1: proven attach (a failed open degrades to
+            // passive below and stays silent).
+            crate::cli::note_attach_start();
+            (Some(session), ObservationBatch::default())
+        }
         Err(gap) => (
             None,
             ObservationBatch {
@@ -1545,6 +1550,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let result = if help {
         output
             .write_all(HELP.as_bytes())
+            .and_then(|()| writeln!(output, "{}", crate::cli::attach_warning_help()))
             .and_then(|()| {
                 for line in crate::cli::exit_code_help_observation() {
                     writeln!(output, "{line}")?;
