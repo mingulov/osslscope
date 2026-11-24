@@ -7847,4 +7847,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&ckpt_dir);
     }
+
+    #[test]
+    fn new141_public_first_refresh_empty_marker_withholds() {
+        // P2fix22 NEW-141 (public first-refresh pin):
+        // authority confirms before success on BOTH arms —
+        // a FIRST refresh (NOREPLACE first publication)
+        // with the valid EMPTY entry marker restored after
+        // the first data publish withholds (never success
+        // over the unconfirmed first payload): live's fold
+        // stays frozen (record carries back only the
+        // durable empty entry), the new payload stands at
+        // the target, and reopen refuses the interrupted
+        // first publication exactly. Pre-fix: the refresh
+        // succeeds past the restored marker (RED — live
+        // advances over unconfirmed authority).
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix22-new141-first-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("n141.json");
+        let record = ckpt_dir.join(snapshot::SETTLED_DIR_NAME).join("n141.json");
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::restore(&mut p);
+        let tip0 = p.folded_tip();
+        let totals0 = p.fold_totals();
+        // Stash the EMPTY entry record at publish time
+        // (entry committed, data not yet published), then
+        // restore it after the first data publish.
+        let stashed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stashed2 = stashed.clone();
+        let record2 = record.clone();
+        snapshot::pre_exchange_hook::arm(move || {
+            *stashed2.lock().unwrap() = std::fs::read(&record2).unwrap();
+        });
+        let stashed3 = stashed.clone();
+        let record3 = record.clone();
+        snapshot::pre_cleanup_hook::arm(move || {
+            let empty = stashed3.lock().unwrap().clone();
+            assert!(!empty.is_empty(), "premise: the entry record stashed");
+            std::fs::write(&record3, &empty).unwrap();
+        });
+        let err = match refresh_once(&mut p, &mut state) {
+            Ok(_) => panic!("an unconfirmed first publication withholds"),
+            Err(e) => e,
+        };
+        snapshot::pre_exchange_hook::disarm();
+        snapshot::pre_cleanup_hook::disarm();
+        assert!(
+            err.contains("NOREPLACE first publication"),
+            "the failure names the first-publication arm: {err:?}"
+        );
+        // Live's fold stays frozen (nothing staged
+        // crossed); live's record carries back only the
+        // durable empty entry (never the failed decision).
+        let empty = stashed.lock().unwrap().clone();
+        assert_eq!(p.folded_tip(), tip0, "live tip frozen");
+        assert_eq!(p.fold_totals(), totals0, "live totals frozen");
+        assert_eq!(
+            p.test_verified_record_bytes().as_ref(),
+            Some(&empty),
+            "live's record carries only the durable empty entry"
+        );
+        assert_eq!(
+            std::fs::read(&record).unwrap(),
+            empty,
+            "the empty marker stands restored"
+        );
+        // Reopen refuses the interrupted first publication
+        // exactly (the standing bytes never settled).
+        drop(state);
+        drop(p);
+        let err = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+            .expect_err("reopen refuses the interrupted first publication");
+        assert!(
+            format!("{err:?}").contains("interrupted first publication"),
+            "the oracle names it: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
 }
