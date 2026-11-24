@@ -1,11 +1,11 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# osslscope 0.6.0 quickstart
+# osslscope 0.7.0 quickstart
 
 Passive discovery with no privileges and no install: Linux x86-64
 with stock OpenSSL 3.5.x on the target. Every command below ran
 verbatim against this tree (yours prints your own PIDs, paths, and
 counts); container commands ran against the freshly built
-`osslscope:0.6.0` image. Tracing (`report`/`check`,
+`osslscope:0.7.0` image. Tracing (`report`/`check`,
 `--observe-crypto`, `--observe-providers`) needs a qualified host
 and is out of scope here — see [usage](usage.md) and the drilled
 [container](container.md) recipes.
@@ -35,15 +35,15 @@ echo "exit=$?"
 ```
 
 ```text
-osslscope 0.6.0
+osslscope 0.7.0
 exit=0
 ```
 
 This page exercises passive discovery only. Tracing needs a
 qualified host with the dev build, a root-owned install, and file
 capabilities — see [build](build.md) and [install](install.md).
-0.6.0 binary packages (prefix tarball, DEB, RPM) are published
-with the 0.6.0 release; the source build below is the
+0.7.0 binary packages (prefix tarball, DEB, RPM) are published
+with the 0.7.0 release; the source build below is the
 no-install route this page drills. For the package route, see
 [install a release package](install.md#install-a-release-package).
 
@@ -324,20 +324,20 @@ file, let alone executes it.
 From the repo root, build the image (never `--privileged`):
 
 ```sh
-docker build -t osslscope:0.6.0 .
-docker images osslscope:0.6.0
+docker build -t osslscope:0.7.0 .
+docker images osslscope:0.7.0
 ```
 
 ```text
 IMAGE             ID             DISK USAGE   CONTENT SIZE   EXTRA
-osslscope:0.6.0   cc33ef6065cd        171MB         42.6MB
+osslscope:0.7.0   cc33ef6065cd        171MB         42.6MB
 ```
 
 A bare run fails — the image binary carries file capabilities,
 so the caps must be granted or `exec` is refused:
 
 ```sh
-docker run --rm osslscope:0.6.0 --version
+docker run --rm osslscope:0.7.0 --version
 echo "exit=$?"
 ```
 
@@ -352,7 +352,7 @@ profile — the container sees only its own population:
 ```sh
 docker run --rm --cap-drop ALL --cap-add BPF --cap-add PERFMON \
   --security-opt seccomp=deploy/seccomp-osslscope.json \
-  osslscope:0.6.0 scan
+  osslscope:0.7.0 scan
 echo "exit=$?"
 ```
 
@@ -388,7 +388,7 @@ docker run --rm --user root --pid=host \
   -v /sys/kernel/btf:/sys/kernel/btf:ro \
   -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
   -v /sys/kernel/security:/sys/kernel/security:ro \
-  osslscope:0.6.0 scan --pid 1
+  osslscope:0.7.0 scan --pid 1
 echo "exit=$?"
 ```
 
@@ -462,14 +462,14 @@ exit 4.
 ## 11. Cleanup
 
 ```sh
-docker rmi osslscope:0.6.0
+docker rmi osslscope:0.7.0
 echo "rmi exit=$?"
 rm -f scan.json
 echo "rm exit=$?"
 ```
 
 ```text
-Untagged: osslscope:0.6.0
+Untagged: osslscope:0.7.0
 Deleted: sha256:cc33ef6065cd402cdd09f9045f2675b968ee7ee4724f75143564bb4030de35a9
 rmi exit=0
 rm exit=0

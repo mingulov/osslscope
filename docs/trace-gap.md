@@ -11,7 +11,7 @@ or supply an arbitrary application's missing integration. See the official
 [trace channel API](https://docs.openssl.org/3.5/man3/OSSL_trace_set_channel/)
 and [CLI setup](https://github.com/openssl/openssl/blob/openssl-3.5.5/apps/openssl.c).
 
-| Aspect | OpenSSL tracing | osslscope 0.6.0 |
+| Aspect | OpenSSL tracing | osslscope 0.7.0 |
 | --- | --- | --- |
 | Activation | Trace-enabled build and configured category channels/callbacks | External process/file access; tracing additionally needs installed BPF companions and privileges |
 | Application cooperation | The CLI already provides integration; other apps vary | No injection, application changes or interposition |

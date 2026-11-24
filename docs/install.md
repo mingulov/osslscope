@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Install from source
 
-The v0.6.0 automatic observation candidate uses the pinned [build recipe](build.md) and a
+The v0.7.0 automatic observation candidate uses the pinned [build recipe](build.md) and a
 manifest-verified install. Source/install simulations do not qualify actual
 BPF loading, provider behavior or a platform.
 
@@ -97,37 +97,39 @@ for limits, failure precedence, output delivery and cleanup.
 
 ## Install a release package
 
-From the 0.6.0 release artifacts:
+From the 0.7.0 release artifacts:
 
 ```sh
-sudo dpkg -i osslscope_0.6.0-1_amd64.deb      # Debian/Ubuntu
+sudo dpkg -i osslscope_0.7.0-1_amd64.deb      # Debian/Ubuntu
 osslscope --version
 osslscope doctor --format json
 ```
-(DEB proven live post-publish on Ubuntu: install exit 0 →
+(The 0.6.0 DEB was proven live post-publish on Ubuntu: install exit 0 →
 version 0.6.0 → unprivileged doctor sees `bpf: available`
-(postinst file caps set) → erase exit 0 with the binary gone.)
+(postinst file caps set) → erase exit 0 with the binary gone.
+The 0.7.0 proof is pending post-publish.)
 
 ```sh
-sudo rpm -i osslscope-0.6.0-1.x86_64.rpm      # Fedora/RHEL
+sudo rpm -i osslscope-0.7.0-1.x86_64.rpm      # Fedora/RHEL
 osslscope --version
 osslscope doctor --format json
 ```
-(RPM metadata + manifest validated in the release pipeline and
-the CI packaging suite; the last live Fedora-cell install drill
-was the 0.5.0 lane. Container-cell caveats: install with default
+(The 0.6.0 RPM's metadata + manifest were validated in the release pipeline and
+the CI packaging suite; the same gates re-run for 0.7.0. The last live
+Fedora-cell install drill was the 0.5.0 lane. Container-cell caveats:
+install with default
 caps — `rpm -i` under `--cap-drop ALL` fails in cpio — and grant
 `BPF`+`PERFMON` to run, or exec refuses the file caps with
 `Operation not permitted`.)
 
 ```sh
-sudo tar -xzf osslscope-0.6.0-prefix.tar.gz -C /usr   # any lane host
+sudo tar -xzf osslscope-0.7.0-prefix.tar.gz -C /usr   # any lane host
 sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/osslscope
 osslscope --version
 osslscope doctor --format json
 ```
-(Prefix tarball smoked post-publish: extract → version 0.6.0 →
-JSON scan of pid 1.)
+(The 0.6.0 prefix tarball was smoked post-publish: extract → version 0.6.0 →
+JSON scan of pid 1. The 0.7.0 smoke re-runs post-publish.)
 
 The DEB `Depends: libcap2-bin` and the RPM `Requires: libcap` pull in
 `setcap`. The DEB grants the two file capabilities in postinst and
@@ -179,7 +181,7 @@ follows. The RPM ships no unit or conffile. Also delete any
 Kubernetes:
 
 ```sh
-docker rmi osslscope:0.6.0
+docker rmi osslscope:0.7.0
 kubectl delete -f deploy/kubernetes/daemonset.yaml \
   -f deploy/kubernetes/job-report.yaml \
   -f deploy/kubernetes/configmap.yaml \

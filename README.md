@@ -7,7 +7,7 @@ for selected processes or automatically discovered watched scopes. Normal workfl
 need no enrolled library profile,
 manual offsets or application changes.
 
-**v0.6.0 RnD release (initial public 0.x).** Honest PARTIAL-only
+**v0.7.0 RnD release (interim Phase 1+2 aggregate-only close-out).** Honest PARTIAL-only
 observation on one declared lane (table below): short owned commands,
 warm processes and sampled watched scopes expose physical callback
 entries and separate public API activity. Reports stay PARTIAL,
@@ -16,12 +16,11 @@ definite algorithm/provider count or CBOM asset is claimed. Start with
 the [quickstart](docs/quickstart.md). The [v0.4.0 alpha
 notes](docs/release-v0.4.0.md) and the [v0.3.0 release
 record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0)
-retain their historical artifact-specific scope. The next release,
-v0.7.0 (interim), is a Phase 1+2 aggregate-only close-out — not
-the feature-complete milestone once planned under that number;
-see the [roadmap](ROADMAP.md).
+retain their historical artifact-specific scope. This is not
+the feature-complete milestone once planned under the v0.7.0
+number; see the [roadmap](ROADMAP.md).
 
-## Support matrix (0.6.0 lane)
+## Support matrix (0.7.0 lane)
 
 | Requirement | Lane |
 | --- | --- |
@@ -168,7 +167,7 @@ sudo rm -rf /usr/local/bin/osslscope /usr/local/lib/osslscope /usr/local/share/o
 ```
 
 ```sh
-docker rmi osslscope:0.6.0
+docker rmi osslscope:0.7.0
 kubectl delete -f deploy/kubernetes/daemonset.yaml \
   -f deploy/kubernetes/job-report.yaml \
   -f deploy/kubernetes/configmap.yaml \

@@ -95,6 +95,10 @@ exit 0
 /usr/share/doc/%{name}/
 
 %changelog
+* Tue Nov 24 2026 Denis Mingulov <denis@mingulov.com> - 0.7.0-1
+- 0.7.0 candidate package: interim Phase 1+2 aggregate-only close-out
+  (expanded fetch evidence, focused per-window capture, service windows
+  with Prometheus/OTLP export); reports stay PARTIAL, C023 OPEN.
 * Thu Nov 12 2026 Denis Mingulov <denis@mingulov.com> - 0.6.0-1
 - 0.6.0 candidate package: usability slice (machine path/identity/version
   evidence, human rows by default, interrupt contract, paths acquired by

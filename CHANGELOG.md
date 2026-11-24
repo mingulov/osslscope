@@ -1,6 +1,57 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
+## 0.7.0 (candidate — 2026-11-24)
+
+- Interim v0.7.0: Phase 1+2 aggregate-only close-out over 0.6.0 — NOT the
+  feature-complete milestone once planned under this number (ARM64,
+  OpenSSL 1.1.1, RHEL/Secure Boot, the broad matrix, and p11 correlation
+  stay deferred; see ROADMAP). Reports stay PARTIAL, algorithm checks
+  stay inconclusive on Unknown-only evidence, and no definite
+  algorithm/provider count or CBOM asset is claimed from normal runs.
+- Phase 1 request/fetch/load/query evidence: 14 fetch surfaces (the six
+  v0.6.0 IDs plus eight Phase 1 IDs — 11 `EVP_*_fetch` plus
+  ENCODER/DECODER/STORE_LOADER). Request evidence only: fetch, load,
+  query, and advertisement never mean execution, selection winner, or
+  serving provider.
+- Focused per-window capture with late-cut withholding: physical callback
+  entry counts for one PID incarnation or `run --`; aggregate pairing via
+  `--trace off|metadata`. `--trace latency|status|all` and per-API
+  histograms degrade to aggregate-only on every public path while C023
+  stays OPEN.
+- `service` bounded-window continuous operation (windows, retention,
+  queue, policy, stream, config) with checkpointed state; `export` serves
+  Prometheus `/metrics` and OTLP push and `watch` renders the operator
+  frame — read-only presenters over the service out-DIR, not standalone
+  observers.
+- Public API activity aggregates (digest/cipher/MAC/KDF/PKEY/RAND scalar
+  entry/return) as a separate ledger: activity does not mean a
+  cryptographic result was produced, and stays separate from callback
+  totals.
+- Schema outputs v2.8 (request evidence) / v2.9 (trace summary),
+  producer side.
+- Policy gate `check` (CLI rules + `--policy FILE`, exit 11 inconclusive
+  fail-closed); definite-only CycloneDX `--cbom`; offline `alias-audit`;
+  exit taxonomy 0/1/2/3/4/10/11.
+- Release UX fixes: discovery errors name the offending token,
+  `scan`/`inspect` first-class in top-level help, an attach warning on
+  live routes, and `scan --module` no longer misdiagnoses a missing path
+  as a hash.
+- Supply chain: release assets and the GHCR image carry Sigstore
+  build-provenance attestations (verify with `gh attestation verify`);
+  checksums stay unsigned and no SBOM ships in 0.x.
+- Known Issues (D49 — to be fixed later; no silent limitations):
+  unprivileged first-run limits (tracing needs a root-owned prefix plus
+  file caps; a user-owned install is passive-discovery only); external
+  short-lived processes can be missed; no pre-armed library mode yet
+  (D47); latency/rate characterization-only (C023 OPEN — no ≤4µs, ≤2×
+  wall, or 100k/s lossless claim); service operational per-call trace
+  deferred and no clean-COMPLETE bootstrap; fetch≠used; the interrupt
+  contract differs by route (the modern focused `report`/`check` route
+  stays ack-less — follow-up work); the H5/SIGINT/drain flake family is
+  OPEN.
+- Root package version 0.7.0; helper crates retain their versions.
+
 ## 0.6.0 (candidate — 2026-11-12)
 
 - Usability slice over 0.5.0: discovery answers read as rows,

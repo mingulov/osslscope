@@ -168,8 +168,8 @@ fn r15_interrupt_contract_scopes_ack_promise_to_acking_routes() {
         "usage.md must scope the ack promise to classic report/check capture"
     );
     assert!(
-        text.contains("The modern focused `report`/`check` route is ack-less in v0.6.0:"),
-        "usage.md must name the focused report/check route ack-less in v0.6.0"
+        text.contains("The modern focused `report`/`check` route is ack-less in v0.7.0:"),
+        "usage.md must name the focused report/check route ack-less in v0.7.0"
     );
     assert!(
         text.contains("it keeps the legacy non-acking signal token"),

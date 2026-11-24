@@ -1,14 +1,14 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Usage
 
-The v0.6.0 observer starts with passive discovery, optionally observes
+The v0.7.0 observer starts with passive discovery, optionally observes
 public provider interfaces, and counts learned physical callback entries for
 one selected process. The supported lane (x86-64, 6.9+ feature-probed
 kernel, BTF, cgroup v2, stock OpenSSL 3.5.x) is in the
-[README support matrix](../README.md#support-matrix-060-lane); start with the
+[README support matrix](../README.md#support-matrix-070-lane); start with the
 [quickstart](quickstart.md). Installed/platform qualification is separate
 from source behavior; the latest versioned qualification record
-file is [v0.4.0](release-v0.4.0.md) (0.5.0/0.6.0 status lives in
+file is [v0.4.0](release-v0.4.0.md) (0.5.0/0.6.0/0.7.0 status lives in
 the [CHANGELOG](../CHANGELOG.md) and the README lane — neither
 re-qualifies deferred platform cells).
 
@@ -565,7 +565,7 @@ This covers the acking long-running routes: `scan --watch`, the
 no signal handling: a signal ends them with the conventional
 `128 + signo` status and no ack or end record.
 
-The modern focused `report`/`check` route is ack-less in v0.6.0:
+The modern focused `report`/`check` route is ack-less in v0.7.0:
 it keeps the legacy non-acking signal token, so the first
 SIGINT/SIGTERM prints no ack there (cancellation still stops it
 at the next boundary). Extending the first-signal ack to the
