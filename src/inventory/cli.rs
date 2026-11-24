@@ -1132,7 +1132,7 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                     // stderr line names the PATH form. The input
                     // itself and IO details never enter diagnostics.
                     // Digest selectors (`sha256:...`) are explicitly
-                    // deferred to P1: not accepted in v0.6.
+                    // not accepted (no selector parsing exists).
                     // G4 U2b: keep the hash diagnosis for bare
                     // unopenable spellings; a path-shaped spelling
                     // (or a non-open failure such as non-regular)

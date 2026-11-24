@@ -95,7 +95,7 @@ procfs view. Repeated PIDs are deduplicated. `--cgroup` selects a cgroup-v2
 directory and its inclusive subtree. `--module` takes a file PATH (repeatable);
 each file is hashed and mapped ELF content matching any supplied hash is
 selected. Bare hashes are not accepted; they fail with exit 4 and a message
-naming the PATH form. Digest selectors (`sha256:...`) are not accepted in v0.6.
+naming the PATH form. Digest selectors (`sha256:...`) are not accepted.
 PID, cgroup and module selector families intersect. A resolved empty
 intersection stays empty. Unavailable, invalid or changed selectors never widen
 the request to the system population.
