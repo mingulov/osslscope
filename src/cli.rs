@@ -119,13 +119,32 @@ pub(crate) fn attach_notice_line() -> &'static str {
     "osslscope: note: live observation starting (privileged, system-wide probes; finite window)"
 }
 
+/// First-attach latch shared by the generic and detailed
+/// notices: exactly one line per process, first proven attach
+/// wins, whichever route it comes from.
+static ATTACH_NOTICED: std::sync::Once = std::sync::Once::new();
+
+/// Detailed variant (S1 audit text): names the target pid and the
+/// observation window. Routes without a single pid/window (provider
+/// observation) keep the generic line.
+pub(crate) fn attach_notice_line_detail(detail: &str) -> String {
+    format!("osslscope: note: live observation starting (privileged, system-wide probes; {detail})")
+}
+
 /// Emit [`attach_notice_line`] exactly once per process, at the
 /// first successful session open. Call sites prove attachment
 /// (an open plane), never an attempt: denied hosts stay silent.
 pub(crate) fn note_attach_start() {
-    static NOTICED: std::sync::Once = std::sync::Once::new();
-    NOTICED.call_once(|| {
+    ATTACH_NOTICED.call_once(|| {
         crate::report::err_line(attach_notice_line());
+    });
+}
+
+/// Detailed variant of [`note_attach_start`]: `detail` names the
+/// target and window (e.g. `pid 123, 5s window`). Same once latch.
+pub(crate) fn note_attach_start_detail(detail: &str) {
+    ATTACH_NOTICED.call_once(|| {
+        crate::report::err_line(&attach_notice_line_detail(detail));
     });
 }
 
@@ -621,5 +640,19 @@ mod preview_tests {
         }
         assert!(joined.contains("no verdict"), "{joined}");
         assert!(joined.contains("violation"), "{joined}");
+    }
+
+    /// S1: the detailed first-attach notice names the target pid
+    /// and window (audit text); the generic line is unchanged.
+    #[test]
+    fn attach_notice_detail_names_pid_and_window() {
+        assert_eq!(
+            attach_notice_line_detail("pid 123, 5s window"),
+            "osslscope: note: live observation starting (privileged, system-wide probes; pid 123, 5s window)"
+        );
+        assert_eq!(
+            attach_notice_line(),
+            "osslscope: note: live observation starting (privileged, system-wide probes; finite window)"
+        );
     }
 }

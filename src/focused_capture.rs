@@ -1267,6 +1267,13 @@ impl FocusedSession {
     ) -> anyhow::Result<Self> {
         let (setup_deadline, observation_end) = deadlines;
         config.validate()?;
+        // S1: describe the attach target for the runtime notice
+        // (`target` moves below; capture the wording here — pid
+        // digits only, never argv/paths).
+        let notice_target = match &target {
+            capture::Target::Pid(pid) => format!("pid {pid}"),
+            capture::Target::Spawn { .. } => "spawned workload".to_string(),
+        };
         if reservation.bytes() < Self::reservation_bytes(&objects)? {
             bail!("focused memory reservation too small");
         }
@@ -1635,9 +1642,13 @@ impl FocusedSession {
         }
         // G4 U5/S1: the first proven attach per process gets the
         // one-line runtime notice (denied/degraded opens with no
-        // plane stay silent — an attempt is not an attach).
+        // plane stay silent — an attempt is not an attach), naming
+        // the target pid and window per the audit text.
         if session.is_some() || counter.is_some() {
-            crate::cli::note_attach_start();
+            crate::cli::note_attach_start_detail(&format!(
+                "{}, {:?} window",
+                notice_target, config.duration
+            ));
         }
         Ok(Self {
             gate,

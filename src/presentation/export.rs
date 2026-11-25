@@ -1252,60 +1252,54 @@ fn shutdown_flush(presenter: &mut Presenter) -> std::io::Result<super::snapshot:
 
 /// Serve until `stop` is set (export loop with shared admission +
 /// real accumulation starts). Collection (refresh), scrape
-/// S5: loopback test for one host spelling (bare, bracketed, or
-/// `localhost`). Unparseable input is NOT loopback (warn — the bind
-/// or push then fails loud with its own error).
-fn host_is_loopback(host: &str) -> bool {
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(host);
-    bare == "localhost"
-        || bare
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-}
-
-/// S5: the `--listen ADDR` value (`host:port`) binds loopback-only.
+/// S5: the `--listen ADDR` value binds loopback-only. IP
+/// literals only: names (even `localhost`) warn without
+/// resolving — a resolver round-trip at classify time risks
+/// startup hangs, and the bind resolves anyway. Anything
+/// unparseable warns too (the bind then fails loud).
 fn listen_is_loopback(listen: &str) -> bool {
-    match listen.rsplit_once(':') {
-        Some((host, _)) if !host.is_empty() => host_is_loopback(host),
-        _ => host_is_loopback(listen),
-    }
+    listen
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|addr| addr.ip().is_loopback())
 }
 
-/// S5: the OTLP endpoint URL pushes to loopback-only (scheme and
-/// path stripped; the push itself is cleartext http).
+/// S5: the OTLP endpoint pushes to loopback-only, mirroring the
+/// sender's actual grammar (`http://` literal prefix, then a
+/// socket address or bare IP — names and userinfo are
+/// unresolvable there). Anything else warns (the push then fails
+/// loud with its own error).
 fn endpoint_is_loopback(endpoint: &str) -> bool {
-    let without_scheme = endpoint
+    let rest = match endpoint.strip_prefix("http://") {
+        Some(rest) => rest,
+        None => return false,
+    };
+    let host_port = rest.split('/').next().unwrap_or("");
+    if let Ok(addr) = host_port.parse::<std::net::SocketAddr>() {
+        return addr.ip().is_loopback();
+    }
+    host_port
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// S5: endpoint rendering for diagnostics — host[:port] only, no
+/// userinfo/path/query (credentials must never reach stderr),
+/// defensively length-capped.
+fn endpoint_display(endpoint: &str) -> String {
+    let rest = endpoint
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(endpoint);
-    let authority = without_scheme.split('/').next().unwrap_or("");
-    let no_userinfo = authority.rsplit('@').next().unwrap_or("");
-    if let Some(rest) = no_userinfo.strip_prefix('[') {
-        // Bracketed literal, optional :port after ']'.
-        let host = rest.split(']').next().unwrap_or("");
-        return host_is_loopback(host);
+    let authority = rest.split('/').next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    const MAX: usize = 256;
+    if host_port.len() > MAX {
+        let mut capped: String = host_port.chars().take(MAX).collect();
+        capped.push('\u{2026}');
+        capped
+    } else {
+        host_port.to_string()
     }
-    // Single-colon host:digits splits the port; anything else with a
-    // colon is IPv6-shaped and must parse exactly (an unbracketed
-    // port is ambiguous, so only a bare valid loopback literal
-    // qualifies — fail closed otherwise).
-    let host = match no_userinfo.rsplit_once(':') {
-        Some((h, port))
-            if !h.is_empty() && !h.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            h
-        }
-        _ if !no_userinfo.contains(':') => no_userinfo,
-        _ => {
-            return no_userinfo
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback());
-        }
-    };
-    host_is_loopback(host)
 }
 
 /// serving (bounded threads), and pushes (worker) are separated —
@@ -1330,13 +1324,16 @@ pub fn serve_with_shutdown(
     #[cfg(test)]
     let pre_shutdown = opts.pre_shutdown.clone();
     // S5: silent widenings warn loud (loopback stays silent). The
-    // values echo here as they already do in the bind error below.
+    // listen value echoes as it already does in the bind error
+    // below; the endpoint echoes host[:port] only (never
+    // credentials, path, or query). Panic-free stderr (H7/B-7):
+    // a broken stderr degrades to silence, never exit 101.
     if !listen_is_loopback(&opts.listen) {
         let line = format!(
             "osslscope: warning: export listens on non-loopback {} (unauthenticated cleartext /metrics)",
             opts.listen
         );
-        eprintln!("{line}");
+        crate::report::err_line(&line);
         #[cfg(test)]
         if let Some(sink) = diagnostic_sink.as_ref() {
             sink.lock().unwrap().push(line);
@@ -1346,9 +1343,9 @@ pub fn serve_with_shutdown(
         if !endpoint_is_loopback(&otlp.endpoint) {
             let line = format!(
                 "osslscope: warning: export pushes OTLP/HTTP metrics to non-loopback {} (cleartext http)",
-                otlp.endpoint
+                endpoint_display(&otlp.endpoint)
             );
-            eprintln!("{line}");
+            crate::report::err_line(&line);
             #[cfg(test)]
             if let Some(sink) = diagnostic_sink.as_ref() {
                 sink.lock().unwrap().push(line);
@@ -1645,38 +1642,36 @@ pub fn run(args: &[String]) -> ExitCode {
 mod tests {
     use super::*;
 
-    /// S5: loopback stays silent, everything else warns (unparseable
-    /// fails closed to warn — the bind then errors loud anyway).
+    /// S5: numeric loopback binds stay silent; names (even
+    /// `localhost` — never resolved at classify time) and anything
+    /// unparseable warn (the bind then errors loud anyway).
     #[test]
     fn s5_listen_loopback_matrix() {
-        for quiet in [
-            "127.0.0.1:9464",
-            "127.0.0.2:1",
-            "localhost:9464",
-            "[::1]:9464",
-        ] {
+        for quiet in ["127.0.0.1:9464", "127.0.0.2:1", "[::1]:9464"] {
             assert!(listen_is_loopback(quiet), "{quiet} stays silent");
         }
         for loud in [
             "0.0.0.0:9464",
             "[::]:9464",
             "192.168.1.2:9464",
+            "localhost:9464",
             "example.com:9464",
+            "127.0.0.1:bad",
+            "127.0.0.1",
             "not-an-addr",
         ] {
             assert!(!listen_is_loopback(loud), "{loud} warns");
         }
     }
 
-    /// S5: endpoint matrix (scheme + path stripped, userinfo + port
-    /// stripped, bracketed v6 honored, bare v6 parsed exactly).
+    /// S5: endpoint matrix mirrors the sender grammar (`http://`
+    /// literal, then a socket address or bare IP — names and
+    /// userinfo are unresolvable there and warn).
     #[test]
     fn s5_endpoint_loopback_matrix() {
         for quiet in [
             "http://127.0.0.1:4318/v1/metrics",
-            "http://localhost:4318/v1/metrics",
             "http://[::1]:4318/v1/metrics",
-            "http://user@127.0.0.1:4318/v1/metrics",
             "http://127.0.0.1/v1/metrics",
             "http://::1/v1/metrics",
         ] {
@@ -1686,6 +1681,9 @@ mod tests {
             "http://0.0.0.0:4318/v1/metrics",
             "http://[::]:4318/v1/metrics",
             "http://collector:4318/v1/metrics",
+            "http://localhost:4318/v1/metrics",
+            "http://user@127.0.0.1:4318/v1/metrics",
+            "https://127.0.0.1:4318/v1/metrics",
             "http://10.0.0.5:4318/v1/metrics",
             "http://::1:4318/v1/metrics",
         ] {
@@ -1693,8 +1691,28 @@ mod tests {
         }
     }
 
+    /// S5: diagnostic echo keeps host[:port] only — no userinfo,
+    /// path, or query (credentials must never reach stderr).
+    #[test]
+    fn s5_endpoint_display_redacts() {
+        assert_eq!(
+            endpoint_display("http://user:pw@203.0.113.1:4318/v1/metrics?token=DEMO"),
+            "203.0.113.1:4318"
+        );
+        assert_eq!(
+            endpoint_display("http://127.0.0.1:4318/v1/metrics"),
+            "127.0.0.1:4318"
+        );
+        assert_eq!(endpoint_display("http://[::1]/x"), "[::1]");
+        let long = format!("http://{}.example:1/x", "a".repeat(300));
+        let shown = endpoint_display(&long);
+        assert!(shown.len() <= 260 && shown.ends_with('\u{2026}'));
+        assert!(!shown.contains("/x"));
+    }
+
     /// S5: non-loopback listen + OTLP endpoint warn through the
-    /// production diagnostic channel (observed via the test sink).
+    /// production diagnostic channel (observed via the test sink);
+    /// the endpoint echo redacts userinfo/path/query.
     #[test]
     fn s5_non_loopback_widenings_warn() {
         let dir = std::env::temp_dir().join(format!(
@@ -1718,7 +1736,8 @@ mod tests {
                     listen: "0.0.0.0:0".to_string(),
                     poll_secs: 1,
                     otlp: Some(OtlpConfig {
-                        endpoint: "http://203.0.113.1:4318/v1/metrics".to_string(),
+                        endpoint: "http://user:pw@203.0.113.1:4318/v1/metrics?token=DEMO"
+                            .to_string(),
                         push_secs: 3600,
                     }),
                     checkpoint: None,
@@ -1753,10 +1772,16 @@ mod tests {
             "listen warning missing: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains(
-                "pushes OTLP/HTTP metrics to non-loopback http://203.0.113.1:4318/v1/metrics"
-            )),
+            lines
+                .iter()
+                .any(|l| l.contains("pushes OTLP/HTTP metrics to non-loopback 203.0.113.1:4318")),
             "endpoint warning missing: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("token=DEMO") || l.contains("user:pw@")),
+            "warning leaks credentials: {lines:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

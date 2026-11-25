@@ -11,10 +11,13 @@ current-state alpha, with its finite installed qualification and known limits
 described in [the alpha notes](docs/release-v0.4.0.md). v0.7.0 is the
 current release (interim Phase 1+2 aggregate-only close-out; explicitly
 **not** the feature-complete milestone once planned under the v0.7
-number). The next release, v0.8.0, covers pre-armed library mode, the
-first-run journey, the fork-classifier fix, flake gates, and the audit
-remainder; every item under "Beyond v0.7.0" below stays deferred
-(assigning deferred items a version number remains an owner decision).
+number). The next release, v0.8.0, covers the fork-classifier fix,
+the audit remainder, observer hardening (sampling progress,
+measured coverage limits), the first-run journey, and flake
+gates; per-object pre-armed attach stays deferred to the later
+combined redesign, as does every item under "Beyond v0.7.0"
+below (assigning deferred items a version number remains an
+owner decision).
 The milestones below are planned capabilities, not claims about the current app,
 except where a status paragraph says otherwise.
 

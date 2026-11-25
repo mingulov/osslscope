@@ -202,7 +202,7 @@ workflow. `--table`/`--provider-table` likewise parse and then
 refuse (`table enrollment is deferred beyond v0.2`). The normal
 workflow needs none of them. `doctor --pid PID`
 and `doctor --exe PATH` select a sectioned foreign preflight (named in
-the top-level help, not in `doctor --help`); that route needs
+the top-level help and in `doctor --help`); that route needs
 install-package metadata and refuses with exit 4 where the image
 carries none. `service-witness` and `service-attempt-trace` are
 harness-only signal-observation commands (absent from the top-level

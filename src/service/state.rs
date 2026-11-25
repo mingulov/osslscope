@@ -367,9 +367,12 @@ impl DirLock {
             }
         }
         let prior = read_lock_prior(&path)?;
+        // S6: a newly created lock file is owner-private (the mode
+        // is ignored for an existing file — never chmodded here).
         let file = OpenOptions::new()
             .write(true)
             .create(true)
+            .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(&path)?;
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };

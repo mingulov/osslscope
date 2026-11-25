@@ -247,9 +247,12 @@ pub enum Placement {
 /// unit tests.
 pub fn spill_write_direct(tmp: &Path, line: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // S6: spill tmps are owner-private.
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(tmp)?;
     for chunk in line.chunks(SPILL_BUF_BYTES) {
         f.write_all(chunk)?;

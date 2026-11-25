@@ -879,7 +879,7 @@ words correctly return `unknown subcommand` (exit 2).
 
 `doctor --pid PID` and `doctor --exe PATH` select a sectioned
 foreign-backing/target preflight. That route is named in the top-level
-help but not in `doctor --help`, and it needs install-package metadata:
+help and in `doctor --help`, and it needs install-package metadata:
 where the install carries none (containers) it refuses with exit 4, so
 container probes use bare `doctor --format json` (exit 0/3) instead —
 see [container](container.md) and
@@ -939,9 +939,8 @@ service config (the installed DEB unit runs
 `--reset-sequence` is refused while the out-DIR holds windows.
 Startup/admission refusals exit 2 before any window opens (see
 [install](install.md#installed-service-deb) for the unit's
-restart posture). The service help lists no exit table; do not
-gate automation on codes beyond those documented here and in
-`install.md`.
+restart posture). The service help lists its exit table
+(0/1/2/3/4/10/11); gate automation on those codes.
 
 Honest limits: the service slice is present but not
 production-qualified. No clean-COMPLETE bootstrap, daemon

@@ -146,9 +146,12 @@ pub fn publish_window_streaming(
     let final_name = window_name(seq);
     let tmp_name = format!(".{final_name}.tmp.{tag}.{}", next_op_nonce());
     let tmp = dir.join(&tmp_name);
+    // S6: staged windows are owner-private (0o600); the hard link
+    // below carries the mode (same inode) to the published file.
     let mut f = match OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&tmp)
     {
@@ -925,6 +928,53 @@ mod tests {
         let (step3, _, _) =
             publish_window_streaming(&d, 3, "t", &head, &tail, &array_tmp2, &key(3));
         assert_eq!(step3, PublishStep::IntegrityRefusal);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// S6: process-umask scoped guard (restores on drop, so a
+    /// panic cannot leak a permissive umask into later tests).
+    /// umask is process-global; the suite runs single-threaded.
+    struct UmaskGuard {
+        prior: u32,
+    }
+
+    impl UmaskGuard {
+        fn set(mask: u32) -> Self {
+            // SAFETY: process-global umask under a
+            // single-threaded test; restored by Drop.
+            let prior = unsafe { libc::umask(mask) };
+            Self { prior }
+        }
+    }
+
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::umask(self.prior);
+            }
+        }
+    }
+
+    /// S6: the streaming (production) writer publishes
+    /// owner-private windows even under a fully permissive umask
+    /// (the hard link carries the staging mode — same inode).
+    #[test]
+    fn streaming_window_is_owner_private_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _guard = UmaskGuard::set(0);
+        let d = dir("streaming-mode");
+        let head = br#"{"schema":"service-window-v1","seq":3,"run_id":{"pid":7,"starttime":8,"boot_id":"boot"},"crypto_watch":"#.to_vec();
+        let tail = br#","document":{}}"#.to_vec();
+        let array_tmp = d.join("array.tmp");
+        std::fs::write(&array_tmp, br#"{"k":1}"#).unwrap();
+        let (step, _, _) = publish_window_streaming(&d, 3, "t", &head, &tail, &array_tmp, &key(3));
+        assert_eq!(step, PublishStep::Durable);
+        let mode = std::fs::metadata(d.join("window-0000000003.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "streamed window mode under umask 0");
         let _ = std::fs::remove_dir_all(&d);
     }
 

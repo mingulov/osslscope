@@ -2514,9 +2514,11 @@ fn mid_window_publish(
                 // on every error path — a detached worker's tmp, if
                 // any, is §4.4-cleaned next start).
                 let result = (|| -> std::io::Result<AssembledCounts> {
+                    // S6: the array staging tmp is owner-private.
                     let mut f = std::fs::OpenOptions::new()
                         .write(true)
                         .create_new(true)
+                        .mode(0o600)
                         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                         .open(&array_tmp)?;
                     let counts = assemble_inner_into(

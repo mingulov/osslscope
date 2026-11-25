@@ -131,8 +131,13 @@ pub(crate) fn run_profiled_before(
     })();
     let backend = match prepared {
         Ok(backend) => {
-            // G4 U5/S1: proven attach (the count backend loaded).
-            crate::cli::note_attach_start();
+            // G4 U5/S1: proven attach (the count backend loaded),
+            // naming the owned pid and window per the audit text.
+            crate::cli::note_attach_start_detail(&format!(
+                "owned pid {}, {:?} window",
+                child.pid(),
+                cfg.duration
+            ));
             backend
         }
         Err(error) => {
