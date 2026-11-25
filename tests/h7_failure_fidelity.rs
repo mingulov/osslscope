@@ -666,12 +666,13 @@ fn raw_closer_end(ch: &[char], i: usize, hashes: u32) -> Option<usize> {
 }
 
 /// If `ch[i..]` opens a raw or byte string, return `(end,
-/// continued)`: `end` is the index just past the same-line
-/// closer (or EOL); `continued` is `Some(hashes)` when a
-/// multi-line `r#*"` runs past EOL (the caller carries it —
-/// an unclosed `b"…"` is a `\` continuation residual, same as
-/// regular strings). `None` when `ch[i]` starts no string.
-fn skip_raw(ch: &[char], i: usize) -> Option<(usize, Option<u32>)> {
+/// raw_cont, str_cont)`: `end` is the index just past the
+/// same-line closer (or EOL); `raw_cont` is `Some(hashes)`
+/// when a multi-line `r#*"` runs past EOL; `str_cont` is true
+/// when a `b"…"` runs past EOL (a `\` continuation — the
+/// caller carries it like a regular string). `None` when
+/// `ch[i]` starts no string.
+fn skip_raw(ch: &[char], i: usize) -> Option<(usize, Option<u32>, bool)> {
     let n = ch.len();
     let mut j = i;
     if ch[j] == 'b' {
@@ -697,18 +698,22 @@ fn skip_raw(ch: &[char], i: usize) -> Option<(usize, Option<u32>)> {
     while j < n {
         if has_r {
             if let Some(k) = raw_closer_end(ch, j, hashes) {
-                return Some((k, None));
+                return Some((k, None, false));
             }
             j += 1;
         } else if ch[j] == '\\' {
             j += 2;
         } else if ch[j] == '"' {
-            return Some((j + 1, None));
+            return Some((j + 1, None, false));
         } else {
             j += 1;
         }
     }
-    Some((n, has_r.then_some(hashes)))
+    if has_r {
+        Some((n, Some(hashes), false))
+    } else {
+        Some((n, None, true))
+    }
 }
 
 /// If `ch[i]` opens a char literal, return the index just
@@ -732,18 +737,40 @@ fn skip_char(ch: &[char], i: usize) -> Option<usize> {
 
 /// Code scan for the T6 matcher: removes `/* ... */` spans
 /// (nesting per Rust) and `//` tails so documentation cannot
-/// impersonate a module (codex R7-2); string, raw-string
-/// (multi-line state carried in `raw`), byte-string, and char
-/// literals are skipped so `"/*"` cannot open a span.
-/// Residual: a `\` line-continuation inside a regular or byte
-/// string (sole live instance doctor.rs:5535, continuation
-/// line verified to match no predicate).
-fn strip_block_scan(line: &str, depth: &mut u32, raw: &mut Option<u32>) -> String {
+/// impersonate a module (codex R7-2); string, raw-string,
+/// byte-string, and char literals are skipped so `"/*"`
+/// cannot open a span. Multi-line state crosses lines:
+/// `raw` carries an open `r#*"` (Tier-1 R2 residual),
+/// `in_str` a `\`-continued regular or byte string (codex
+/// R8 blocking finding — e.g. the live continuation at
+/// doctor.rs:5535).
+fn strip_block_scan(
+    line: &str,
+    depth: &mut u32,
+    raw: &mut Option<u32>,
+    in_str: &mut bool,
+) -> String {
     let ch: Vec<char> = line.chars().collect();
     let n = ch.len();
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
-    if let Some(hashes) = *raw {
+    if *in_str {
+        while i < n {
+            if ch[i] == '\\' {
+                i += 2;
+                continue;
+            }
+            if ch[i] == '"' {
+                i += 1;
+                *in_str = false;
+                break;
+            }
+            i += 1;
+        }
+        if *in_str {
+            return out;
+        }
+    } else if let Some(hashes) = *raw {
         while i < n {
             if let Some(end) = raw_closer_end(&ch, i, hashes) {
                 i = end;
@@ -771,10 +798,11 @@ fn strip_block_scan(line: &str, depth: &mut u32, raw: &mut Option<u32>) -> Strin
             continue;
         }
         if (c == 'r' || c == 'b')
-            && let Some((end, continued)) = skip_raw(&ch, i)
+            && let Some((end, raw_cont, str_cont)) = skip_raw(&ch, i)
         {
             i = end;
-            *raw = continued;
+            *raw = raw_cont;
+            *in_str = str_cont;
             continue;
         }
         if c == '\''
@@ -785,6 +813,7 @@ fn strip_block_scan(line: &str, depth: &mut u32, raw: &mut Option<u32>) -> Strin
         }
         if c == '"' {
             let mut k = i + 1;
+            let mut closed = false;
             while k < n {
                 if ch[k] == '\\' {
                     k += 2;
@@ -792,11 +821,13 @@ fn strip_block_scan(line: &str, depth: &mut u32, raw: &mut Option<u32>) -> Strin
                 }
                 if ch[k] == '"' {
                     k += 1;
+                    closed = true;
                     break;
                 }
                 k += 1;
             }
-            i = k;
+            *in_str = !closed;
+            i = k.min(n);
             continue;
         }
         if c == '/' && i + 1 < n && ch[i + 1] == '/' {
@@ -838,8 +869,9 @@ fn h7_cli_surface_carries_no_panics() {
         let mut prev_nonempty = String::new();
         let mut block_depth = 0u32;
         let mut in_raw = None;
+        let mut in_str = false;
         for (i, line) in text.lines().enumerate() {
-            let scan = strip_block_scan(line, &mut block_depth, &mut in_raw);
+            let scan = strip_block_scan(line, &mut block_depth, &mut in_raw, &mut in_str);
             let closed_inline = scan.find('{').is_some_and(|o| scan[o..].contains('}'));
             let is_opener = (scan.starts_with("mod tests {")
                 || (scan.starts_with("mod ")
