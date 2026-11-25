@@ -731,7 +731,25 @@ impl Work<'_> {
         // The external lease covers this parser; metadata.len() still bounds
         // growth between admission and its independent descriptor checks.
         let result = elf::inspect_file_with_cancel(&mut file, metadata.len(), self.cancel);
-        self.deadline()?;
+        self.bank_inspect(key, file, metadata, fingerprint, lease, result)
+    }
+
+    /// Bank a completed parse, then enforce the deadline (B1): an
+    /// overrunning sample still warms the cache, so the next sample
+    /// hits it instead of re-parsing the same bytes. The entry
+    /// check in [`inspect`] still bounds overrun to one object per
+    /// sample; the fingerprint check still precedes the insert
+    /// (never bank a changed file). Returns the parse result on
+    /// time, or `Deadline` (banked) past it.
+    fn bank_inspect(
+        &mut self,
+        key: CacheKey,
+        mut file: File,
+        metadata: &Metadata,
+        fingerprint: Fingerprint,
+        lease: Option<crate::observation_memory::MemoryLease>,
+        result: Result<ModuleInfo, GapReason>,
+    ) -> Result<ModuleInfo, GapReason> {
         if file.metadata().map(|m| Fingerprint::from(&m)).ok().as_ref() != Some(&fingerprint) {
             return Err(GapReason::Changed);
         }
@@ -769,6 +787,7 @@ impl Work<'_> {
                 locator_kind: LocatorKind::HostDirect,
             },
         );
+        self.deadline()?;
         result
     }
 }
@@ -1727,6 +1746,114 @@ mod tests {
                 work.gaps
             );
         }
+    }
+
+    /// B1: an over-deadline parse still warms the cache. With a
+    /// ZERO timeout every deadline check fails, so `bank_inspect`
+    /// must return `Deadline` for this sample AND retain the parse
+    /// for the next one (pre-fix it returned before the insert and
+    /// no sample ever made progress).
+    #[test]
+    fn b1_expired_sample_banks_the_completed_parse() {
+        let options = SnapshotOptions {
+            pids: vec![],
+            resolve_paths: false,
+            limits: super::super::Limits {
+                timeout: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+        };
+        let mut work = Work {
+            records_memory: Vec::new(),
+            memory: None,
+            options: &options,
+            include_other: false,
+            cancel: &NEVER_CANCELLED,
+            started: Instant::now(),
+            totals: WorkTotals::default(),
+            gaps: BTreeSet::new(),
+            cache: BTreeMap::new(),
+            backing_limit: None,
+            sidecar: resolve::ResolveSidecar::default(),
+            resolve_staged: Vec::new(),
+            resolve_bytes: 0,
+            parsed_cache: None,
+            prefill_used: 0,
+        };
+        let path = std::env::temp_dir().join(format!("b1-bank-{}", std::process::id()));
+        std::fs::write(&path, b"elf-bytes").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let fingerprint = Fingerprint::from(&metadata);
+        let key = (fingerprint.clone(), None);
+        let info = super::super::ModuleInfo {
+            sha256: String::new(),
+            device: 0,
+            inode: 0,
+            size_bytes: 9,
+            architecture: super::super::Architecture::X86_64,
+            kind: super::super::ObjectKind::Other,
+            exports: Vec::new(),
+            depends_on_libcrypto: false,
+            depends_on_libssl: false,
+            file_soname: None,
+            file_openssl_version: None,
+            file_version_status: super::super::FileVersionStatus::Absent,
+        };
+        let outcome = work.bank_inspect(key.clone(), file, &metadata, fingerprint, None, Ok(info));
+        assert_eq!(outcome.unwrap_err(), GapReason::Deadline);
+        let cached = work.cache.get(&key).expect("expired parse is banked");
+        assert!(cached.seen);
+        assert!(cached.info.is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// B1 companion: on time, the parse result returns normally (and
+    /// is banked too).
+    #[test]
+    fn b1_ontime_sample_returns_the_parse() {
+        let options = SnapshotOptions {
+            pids: vec![],
+            resolve_paths: false,
+            limits: super::super::Limits {
+                timeout: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+        };
+        let mut work = Work {
+            records_memory: Vec::new(),
+            memory: None,
+            options: &options,
+            include_other: false,
+            cancel: &NEVER_CANCELLED,
+            started: Instant::now(),
+            totals: WorkTotals::default(),
+            gaps: BTreeSet::new(),
+            cache: BTreeMap::new(),
+            backing_limit: None,
+            sidecar: resolve::ResolveSidecar::default(),
+            resolve_staged: Vec::new(),
+            resolve_bytes: 0,
+            parsed_cache: None,
+            prefill_used: 0,
+        };
+        let path = std::env::temp_dir().join(format!("b1-ontime-{}", std::process::id()));
+        std::fs::write(&path, b"elf-bytes").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let fingerprint = Fingerprint::from(&metadata);
+        let key = (fingerprint.clone(), None);
+        let outcome = work.bank_inspect(
+            key.clone(),
+            file,
+            &metadata,
+            fingerprint,
+            None,
+            Err(GapReason::NonRegular),
+        );
+        assert_eq!(outcome.unwrap_err(), GapReason::NonRegular);
+        assert!(work.cache.contains_key(&key));
+        let _ = std::fs::remove_file(&path);
     }
 
     // Codex F3 (closes parked T2 M1): cancellation landing

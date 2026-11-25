@@ -188,6 +188,16 @@ starttime and namespace identities distinguish observed incarnations, including
 PID reuse. Review those identities when correlating samples with other tools.
 No selector grants additional access or enters a target namespace.
 
+Measured coverage limits (guest witness, 0.8.0 development): a cold
+targeted watch needs roughly four to five seconds of attach lead
+before a workload's first call to capture it; sub-second external
+processes are effectively uncovered, and multi-member cgroup
+watches admit one heavy session at a time (a long-lived member
+holding a session keeps short-lived siblings queued behind the
+admission limit until they exit). Short-lived external processes
+stay PARTIAL rather than invented; per-object pre-armed attach is
+future work, not this release.
+
 ### Host-side container workflows
 
 Run osslscope in the host procfs and cgroup view when selecting host processes.
