@@ -654,26 +654,39 @@ fn h7_cli_surface_carries_no_panics() {
     let mut violations = Vec::new();
     for rel in T6_FILES {
         let text = std::fs::read_to_string(root.join(rel)).unwrap();
-        // Skip `mod tests` bodies (H5 mechanism: rustfmt keeps test
-        // modules top-level, so a column-0 `mod tests {` ...
-        // column-0 `}` pair delimits them).
+        // Skip test-module bodies (H5 mechanism: rustfmt keeps
+        // test modules top-level, so a column-0 opener ...
+        // column-0 `}` pair delimits them). The opener is `mod
+        // tests {` or any column-0 `mod <name> {` directly under
+        // `#[cfg(test)]` (e.g. cli.rs `preview_tests`): the audit
+        // governs production code, and `#[cfg(test)]` never
+        // ships — matching by name alone false-positives on
+        // test-only helpers. Attribute and opener match raw at
+        // column 0, so a comment mentioning the attribute cannot
+        // misfire onto a production module.
         let mut in_tests = false;
+        let mut prev_nonempty = "";
         for (i, line) in text.lines().enumerate() {
-            if !in_tests && line.starts_with("mod tests {") {
+            let is_opener = line.starts_with("mod tests {")
+                || (line.starts_with("mod ")
+                    && line.contains('{')
+                    && prev_nonempty == "#[cfg(test)]");
+            if !in_tests && is_opener {
                 in_tests = true;
-                continue;
-            }
-            if in_tests {
+            } else if in_tests {
                 if line.starts_with('}') {
                     in_tests = false;
                 }
-                continue;
-            }
-            let code = strip_comments_and_strings(line);
-            for pat in T6_PATTERNS {
-                if code.contains(pat) {
-                    violations.push(format!("{rel}:{}: {pat}: {}", i + 1, normalize(line)));
+            } else {
+                let code = strip_comments_and_strings(line);
+                for pat in T6_PATTERNS {
+                    if code.contains(pat) {
+                        violations.push(format!("{rel}:{}: {pat}: {}", i + 1, normalize(line)));
+                    }
                 }
+            }
+            if !line.trim().is_empty() {
+                prev_nonempty = line;
             }
         }
     }
