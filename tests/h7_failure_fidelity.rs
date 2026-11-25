@@ -651,36 +651,138 @@ const T6_PATTERNS: &[&str] = &["eprintln!", "panic!", ".expect(", ".unwrap("];
 /// Block-comment scan for the T6 matcher: removes `/* … */`
 /// spans (nesting per Rust) and `//` tails so a test-module
 /// opener inside documentation cannot activate the test skip
-/// (codex R7-2). String literals are deliberately NOT
-/// tracked: no matcher predicate (column-0 `mod ` opener,
-/// `#[cfg(test)]` attribute, `}` closer) can match mid-line
-/// string content, and the multi-line string literals in the
-/// T6 files (raw string at check.rs:1050, `\` continuation
-/// at doctor.rs:5535) were verified inert — no column-0
-/// continuation line matches a predicate.
+/// (codex R7-2); string, raw-string, byte-string, and char
+/// literals are skipped so `"/*"` cannot open a span.
+/// Residual: a `\` line-continuation inside a regular string
+/// (doctor.rs:5535 — continuation line verified to match no
+/// predicate).
+/// If `ch[i..]` opens a raw or byte string, return the index
+/// just past its same-line closer (multi-line raws run past
+/// EOL); `None` when `ch[i]` starts no string.
+fn skip_raw(ch: &[char], i: usize) -> Option<usize> {
+    let n = ch.len();
+    let mut j = i;
+    if ch[j] == 'b' {
+        j += 1;
+    }
+    let has_r = j < n && ch[j] == 'r';
+    if has_r {
+        j += 1;
+    } else if ch[i] != 'b' {
+        return None;
+    }
+    let mut hashes = 0;
+    if has_r {
+        while j < n && ch[j] == '#' {
+            hashes += 1;
+            j += 1;
+        }
+    }
+    if j >= n || ch[j] != '"' {
+        return None;
+    }
+    j += 1;
+    while j < n {
+        if has_r {
+            if ch[j] == '"' {
+                let mut k = j + 1;
+                let mut h = 0;
+                while k < n && ch[k] == '#' && h < hashes {
+                    h += 1;
+                    k += 1;
+                }
+                if h == hashes {
+                    return Some(k);
+                }
+            }
+            j += 1;
+        } else if ch[j] == '\\' {
+            j += 2;
+        } else if ch[j] == '"' {
+            return Some(j + 1);
+        } else {
+            j += 1;
+        }
+    }
+    Some(n)
+}
+
+/// If `ch[i]` opens a char literal, return the index just
+/// past its closer; lifetimes return `None` (scan as text).
+fn skip_char(ch: &[char], i: usize) -> Option<usize> {
+    let n = ch.len();
+    if i + 2 < n && ch[i + 1] != '\\' && ch[i + 2] == '\'' {
+        return Some(i + 3);
+    }
+    if i + 1 < n && ch[i + 1] == '\\' {
+        let mut k = i + 2;
+        while k < n && k < i + 14 && ch[k] != '\'' {
+            k += 1;
+        }
+        if k < n && ch[k] == '\'' {
+            return Some(k + 1);
+        }
+    }
+    None
+}
+
 fn strip_block_scan(line: &str, depth: &mut u32) -> String {
+    let ch: Vec<char> = line.chars().collect();
+    let n = ch.len();
     let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut i = 0;
+    while i < n {
+        let c = ch[i];
         if *depth > 0 {
-            if c == '/' && chars.peek() == Some(&'*') {
-                chars.next();
+            if c == '/' && i + 1 < n && ch[i + 1] == '*' {
                 *depth += 1;
-            } else if c == '*' && chars.peek() == Some(&'/') {
-                chars.next();
+                i += 2;
+            } else if c == '*' && i + 1 < n && ch[i + 1] == '/' {
                 *depth -= 1;
+                i += 2;
+            } else {
+                i += 1;
             }
             continue;
         }
-        if c == '/' && chars.peek() == Some(&'/') {
+        if (c == 'r' || c == 'b')
+            && let Some(end) = skip_raw(&ch, i)
+        {
+            i = end;
+            continue;
+        }
+        if c == '\''
+            && let Some(end) = skip_char(&ch, i)
+        {
+            i = end;
+            continue;
+        }
+        if c == '"' {
+            let mut k = i + 1;
+            while k < n {
+                if ch[k] == '\\' {
+                    k += 2;
+                    continue;
+                }
+                if ch[k] == '"' {
+                    k += 1;
+                    break;
+                }
+                k += 1;
+            }
+            i = k;
+            continue;
+        }
+        if c == '/' && i + 1 < n && ch[i + 1] == '/' {
             break;
         }
-        if c == '/' && chars.peek() == Some(&'*') {
-            chars.next();
+        if c == '/' && i + 1 < n && ch[i + 1] == '*' {
             *depth += 1;
+            i += 2;
             continue;
         }
         out.push(c);
+        i += 1;
     }
     out
 }
