@@ -1639,15 +1639,22 @@ impl FocusedSession {
         // the child — the operator sees pid+window before the
         // heavy/irreversible steps. Denied/degraded opens with no
         // plane stay silent. An owned child names its real pid.
+        // Best-effort under stderr backpressure (a saturated pipe
+        // must not hold a stopped child), then recheck
+        // cancel/deadline so a stalled notice never leads to a
+        // stale gate open or release.
         if session.is_some() || counter.is_some() {
             let target = match owned.1.as_ref() {
                 Some(child) => format!("owned pid {}", child.pid()),
                 None => notice_target,
             };
-            crate::cli::note_attach_start_detail(&format!(
-                "{target}, {:?} window",
-                config.duration
-            ));
+            crate::cli::note_attach_start_detail_bounded(
+                &format!("{target}, {:?} window", config.duration),
+                setup_deadline,
+            );
+        }
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
+            bail!("focused setup interrupted or expired");
         }
         if let Some(gate) = &gate {
             gate.open()?;

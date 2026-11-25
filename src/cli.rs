@@ -148,6 +148,49 @@ pub(crate) fn note_attach_start_detail(detail: &str) {
     });
 }
 
+/// Is stderr writable right now (bounded by `deadline`)? A poll
+/// for `POLLOUT` that never blocks past the deadline and never
+/// touches fd flags (no `O_NONBLOCK` flip — race-free under
+/// threads). Closed/broken stderr reads unwritable: skip.
+fn stderr_writable_until(deadline: std::time::Instant) -> bool {
+    use std::os::unix::io::AsRawFd as _;
+    let fd = std::io::stderr().as_raw_fd();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd, nfds=1, bounded timeout.
+        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if ready > 0 {
+            return pfd.revents & libc::POLLOUT != 0;
+        }
+        if ready == 0 {
+            return false;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return false;
+        }
+    }
+}
+
+/// Best-effort variant of [`note_attach_start_detail`] for
+/// stopped-child setups: the notice must never stall a stopped
+/// child on a saturated stderr pipe past `deadline` — skip
+/// silently instead (the latch stays unfired, so a later attach
+/// can still report). Same once latch on success.
+pub(crate) fn note_attach_start_detail_bounded(detail: &str, deadline: std::time::Instant) {
+    if stderr_writable_until(deadline) {
+        note_attach_start_detail(detail);
+    }
+}
+
 /// One-line runtime notice, emitted once per process when a
 /// selector-less live watch starts (S2): without
 /// --pid/--cgroup/--module the watch attempts the whole visible
@@ -640,6 +683,24 @@ mod preview_tests {
         }
         assert!(joined.contains("no verdict"), "{joined}");
         assert!(joined.contains("violation"), "{joined}");
+    }
+
+    /// S1: the writability probe honors an expired deadline
+    /// without polling (deterministic skip).
+    #[test]
+    fn stderr_probe_expired_deadline_skips() {
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(!stderr_writable_until(past));
+    }
+
+    /// S1: the writability probe passes on a writable stderr
+    /// (captured test pipe has room).
+    #[test]
+    fn stderr_probe_writable_stderr_passes() {
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert!(stderr_writable_until(future));
     }
 
     /// S1: the detailed first-attach notice names the target pid

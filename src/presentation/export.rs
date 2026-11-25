@@ -1285,33 +1285,71 @@ fn endpoint_is_loopback(endpoint: &str) -> bool {
         .is_ok_and(|addr| addr.ip().is_loopback())
 }
 
+/// S5: is `s` a syntactic URI scheme (RFC 3986: ALPHA
+/// *( ALPHA / DIGIT / "+" / "-" / "." ))?
+fn is_uri_scheme(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// S5: is `s` an echoable host[:port] — an IP literal with an
+/// optional digits-only port (names never echo: unverifiable
+/// without resolving)?
+fn is_echoable_host_port(s: &str) -> bool {
+    if let Some(rest) = s.strip_prefix('[') {
+        // Bracketed v6 with optional :digits port.
+        let (host, port) = match rest.split_once(']') {
+            Some(pair) => pair,
+            None => return false,
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return port.is_empty()
+            || port
+                .strip_prefix(':')
+                .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    }
+    match s.rsplit_once(':') {
+        // Unbracketed colon: only host:digits with a v4 host
+        // (anything else is ambiguous or malformed).
+        Some((host, port)) => {
+            !host.contains(':')
+                && host.parse::<std::net::Ipv4Addr>().is_ok()
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+        }
+        // Bare IP literal, no port.
+        None => s.parse::<std::net::IpAddr>().is_ok(),
+    }
+}
+
 /// S5: endpoint rendering for diagnostics — host[:port] only, no
 /// userinfo/path/query/fragment (credentials must never reach
-/// stderr), defensively length-capped. The authority exists ONLY
-/// behind a LEADING scheme: a `://` later in the string sits
-/// inside a query or fragment and must never be treated as the
-/// authority (else `?next=https://SECRET` leaks SECRET) — such
-/// inputs render generic. Cuts at `/`, `?`, AND `#`.
+/// stderr). Echoes ONLY a validated
+/// `IP-literal[:digits]` host behind a LEADING valid scheme: a
+/// `://` later in the string sits inside a query or fragment
+/// (else `?next=https://SECRET` leaks SECRET), and a non-digits
+/// port position may carry a password (`host:password`) — such
+/// inputs render generic.
 fn endpoint_display(endpoint: &str) -> String {
     let rest = match endpoint.split_once("://") {
-        Some((scheme, _))
-            if scheme.is_empty() || scheme.chars().any(|c| matches!(c, '/' | '?' | '#')) =>
-        {
-            return "endpoint".to_string();
-        }
-        Some((_, rest)) => rest,
+        Some((scheme, rest)) if is_uri_scheme(scheme) => rest,
+        Some(_) => return "endpoint".to_string(),
         None => endpoint,
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host_port = authority.rsplit('@').next().unwrap_or("");
-    const MAX: usize = 256;
-    if host_port.len() > MAX {
-        let mut capped: String = host_port.chars().take(MAX).collect();
-        capped.push('\u{2026}');
-        capped
-    } else {
-        host_port.to_string()
+    if !is_echoable_host_port(host_port) {
+        return "endpoint".to_string();
     }
+    // Validated IP-literal hosts are short by construction (no cap
+    // needed): at most a bracketed v6 literal plus :port.
+    host_port.to_string()
 }
 
 /// serving (bounded threads), and pushes (worker) are separated —
@@ -1706,8 +1744,10 @@ mod tests {
         }
     }
 
-    /// S5: diagnostic echo keeps host[:port] only — no userinfo,
-    /// path, or query (credentials must never reach stderr).
+    /// S5: diagnostic echo keeps validated host[:port] only —
+    /// no userinfo/path/query/fragment, no names, no malformed
+    /// ports (credentials must never reach stderr); anything
+    /// else renders generic.
     #[test]
     fn s5_endpoint_display_redacts() {
         assert_eq!(
@@ -1738,10 +1778,17 @@ mod tests {
             endpoint_display("collector#https://DEMO_SECRET"),
             "endpoint"
         );
-        let long = format!("http://{}.example:1/x", "a".repeat(300));
-        let shown = endpoint_display(&long);
-        assert!(shown.len() <= 260 && shown.ends_with('\u{2026}'));
-        assert!(!shown.contains("/x"));
+        // Codex round 3: invalid scheme or non-digits port position
+        // (possibly a password) renders generic too.
+        assert_eq!(endpoint_display("collector=http://DEMO_SECRET"), "endpoint");
+        assert_eq!(
+            endpoint_display("http://127.0.0.1:token=DEMO_SECRET"),
+            "endpoint"
+        );
+        assert_eq!(
+            endpoint_display("http://collector:4318/v1/metrics"),
+            "endpoint"
+        );
     }
 
     /// S5: non-loopback listen + OTLP endpoint warn through the

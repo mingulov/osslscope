@@ -133,11 +133,12 @@ pub(crate) fn run_profiled_before(
         Ok(backend) => {
             // G4 U5/S1: proven attach (the count backend loaded),
             // naming the owned pid and window per the audit text.
-            crate::cli::note_attach_start_detail(&format!(
-                "owned pid {}, {:?} window",
-                child.pid(),
-                cfg.duration
-            ));
+            // Best-effort under stderr backpressure (the child is
+            // stopped; never stall it past the setup deadline).
+            crate::cli::note_attach_start_detail_bounded(
+                &format!("owned pid {}, {:?} window", child.pid(), cfg.duration),
+                deadline,
+            );
             backend
         }
         Err(error) => {
