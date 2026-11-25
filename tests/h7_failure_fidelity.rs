@@ -562,6 +562,10 @@ fn normalize(line: &str) -> String {
 /// Byte-offset line range of `fn NAME(` .. its balanced closing
 /// brace (brace counting skips strings/comments; `None` when the fn
 /// is absent — itself an audit failure).
+/// TODO(post-stop): unify with the stateful T6 scanner — the
+/// legacy per-line stripper misreads quotes in chars, raws,
+/// blocks, and continuations (claude R1-F1; split scope, no
+/// live instance: zero fooling shapes in capture.rs).
 fn fn_body(src: &str, name: &str) -> Option<(usize, usize)> {
     let lines: Vec<&str> = src.lines().collect();
     let pat = format!("fn {name}(");
@@ -724,8 +728,13 @@ fn skip_char(ch: &[char], i: usize) -> Option<usize> {
         return Some(i + 3);
     }
     if i + 1 < n && ch[i + 1] == '\\' {
+        // No length cap (claude R1-F3): a `\` can only start a
+        // char literal (lifetimes cannot contain one), so the
+        // scan runs to the closer however long the `\u{…}`
+        // body is. Absent a closer the line is uncompilable
+        // and the `None` below is best-effort.
         let mut k = i + 3;
-        while k < n && k < i + 15 && ch[k] != '\'' {
+        while k < n && ch[k] != '\'' {
             k += 1;
         }
         if k < n && ch[k] == '\'' {
@@ -744,15 +753,23 @@ fn skip_char(ch: &[char], i: usize) -> Option<usize> {
 /// `in_str` a `\`-continued regular or byte string (codex
 /// R8 blocking finding — e.g. the live continuation at
 /// doctor.rs:5535).
+/// Returns `(scan, src_col0)`: `src_col0` holds only when
+/// the scan's first character is the source line's first
+/// character — anything skipped (block span, string, char,
+/// raw) before the first emission demotes it. Opener and
+/// closer matching require `src_col0` (codex R9-F1): a
+/// mid-line token promoted by a consumed prefix must never
+/// act as a module boundary.
 fn strip_block_scan(
     line: &str,
     depth: &mut u32,
     raw: &mut Option<u32>,
     in_str: &mut bool,
-) -> String {
+) -> (String, bool) {
     let ch: Vec<char> = line.chars().collect();
     let n = ch.len();
     let mut out = String::with_capacity(line.len());
+    let mut prefix_skipped = false;
     let mut i = 0;
     if *in_str {
         while i < n {
@@ -767,8 +784,11 @@ fn strip_block_scan(
             }
             i += 1;
         }
+        if i > 0 {
+            prefix_skipped = true;
+        }
         if *in_str {
-            return out;
+            return (out, !prefix_skipped);
         }
     } else if let Some(hashes) = *raw {
         while i < n {
@@ -779,13 +799,19 @@ fn strip_block_scan(
             }
             i += 1;
         }
+        if i > 0 {
+            prefix_skipped = true;
+        }
         if raw.is_some() {
-            return out;
+            return (out, !prefix_skipped);
         }
     }
     while i < n {
         let c = ch[i];
         if *depth > 0 {
+            if out.is_empty() {
+                prefix_skipped = true;
+            }
             if c == '/' && i + 1 < n && ch[i + 1] == '*' {
                 *depth += 1;
                 i += 2;
@@ -800,6 +826,9 @@ fn strip_block_scan(
         if (c == 'r' || c == 'b')
             && let Some((end, raw_cont, str_cont)) = skip_raw(&ch, i)
         {
+            if out.is_empty() {
+                prefix_skipped = true;
+            }
             i = end;
             *raw = raw_cont;
             *in_str = str_cont;
@@ -808,10 +837,16 @@ fn strip_block_scan(
         if c == '\''
             && let Some(end) = skip_char(&ch, i)
         {
+            if out.is_empty() {
+                prefix_skipped = true;
+            }
             i = end;
             continue;
         }
         if c == '"' {
+            if out.is_empty() {
+                prefix_skipped = true;
+            }
             let mut k = i + 1;
             let mut closed = false;
             while k < n {
@@ -834,6 +869,9 @@ fn strip_block_scan(
             break;
         }
         if c == '/' && i + 1 < n && ch[i + 1] == '*' {
+            if out.is_empty() {
+                prefix_skipped = true;
+            }
             *depth += 1;
             i += 2;
             continue;
@@ -841,7 +879,7 @@ fn strip_block_scan(
         out.push(c);
         i += 1;
     }
-    out
+    (out, !prefix_skipped)
 }
 
 /// T6 scanner cross-line pins (Tier-1 R4 note (d)): the
@@ -856,31 +894,31 @@ fn t6_scanner_cross_line_states_hold() {
     let mut depth = 0u32;
     let mut raw = None;
     let mut in_str = false;
-    let o = strip_block_scan("let h = \"a\\", &mut depth, &mut raw, &mut in_str);
+    let (o, _) = strip_block_scan("let h = \"a\\", &mut depth, &mut raw, &mut in_str);
     assert!(in_str && o == "let h = ");
-    let o = strip_block_scan("mid\\", &mut depth, &mut raw, &mut in_str);
+    let (o, _) = strip_block_scan("mid\\", &mut depth, &mut raw, &mut in_str);
     assert!(in_str && o.is_empty());
-    let o = strip_block_scan("/* tail\";", &mut depth, &mut raw, &mut in_str);
+    let (o, _) = strip_block_scan("/* tail\";", &mut depth, &mut raw, &mut in_str);
     assert!(!in_str && o == ";");
-    let o = strip_block_scan("}", &mut depth, &mut raw, &mut in_str);
+    let (o, _) = strip_block_scan("}", &mut depth, &mut raw, &mut in_str);
     assert!(o == "}" && depth == 0 && raw.is_none() && !in_str);
     // P3 (Tier-1 R4): a continuation line containing `}`
     // must not leak it as code (the string still closes).
     let mut depth = 0u32;
     let mut raw = None;
     let mut in_str = false;
-    let o = strip_block_scan("let h = \"a\\", &mut depth, &mut raw, &mut in_str);
+    let (o, _) = strip_block_scan("let h = \"a\\", &mut depth, &mut raw, &mut in_str);
     assert!(in_str && o == "let h = ");
-    let o = strip_block_scan("}\";", &mut depth, &mut raw, &mut in_str);
+    let (o, _) = strip_block_scan("}\";", &mut depth, &mut raw, &mut in_str);
     assert!(!in_str && o == ";");
     // P4 (Tier-1 R4): byte-string continuation, plain and
     // with escapes.
     let mut depth = 0u32;
     let mut raw = None;
     let mut in_str = false;
-    let o = strip_block_scan("let h = b\"ab\\", &mut depth, &mut raw, &mut in_str);
+    let (o, _) = strip_block_scan("let h = b\"ab\\", &mut depth, &mut raw, &mut in_str);
     assert!(in_str && o == "let h = ");
-    let o = strip_block_scan("xy\";", &mut depth, &mut raw, &mut in_str);
+    let (o, _) = strip_block_scan("xy\";", &mut depth, &mut raw, &mut in_str);
     assert!(!in_str && o == ";");
     let v: Vec<char> = "b\"a\\x41\\\\".chars().collect();
     assert_eq!(skip_raw(&v, 0), Some((v.len(), None, true)));
@@ -889,11 +927,11 @@ fn t6_scanner_cross_line_states_hold() {
     let mut depth = 0u32;
     let mut raw = None;
     let mut in_str = false;
-    let o = strip_block_scan("let f = r#\"l1", &mut depth, &mut raw, &mut in_str);
+    let (o, _) = strip_block_scan("let f = r#\"l1", &mut depth, &mut raw, &mut in_str);
     assert!(raw == Some(1) && !o.is_empty());
-    let o = strip_block_scan("/* poison", &mut depth, &mut raw, &mut in_str);
+    let (o, _) = strip_block_scan("/* poison", &mut depth, &mut raw, &mut in_str);
     assert!(raw == Some(1) && depth == 0 && o.is_empty());
-    let o = strip_block_scan("tail\"#;", &mut depth, &mut raw, &mut in_str);
+    let (o, _) = strip_block_scan("tail\"#;", &mut depth, &mut raw, &mut in_str);
     assert!(raw.is_none() && o == ";");
     // R3 (Tier-1 R2): escaped quote ends past the closer.
     let v: Vec<char> = "'\\''".chars().collect();
@@ -902,8 +940,149 @@ fn t6_scanner_cross_line_states_hold() {
     let mut depth = 0u32;
     let mut raw = None;
     let mut in_str = true;
-    let o = strip_block_scan("x\"; let u = r#\"nl", &mut depth, &mut raw, &mut in_str);
+    let (o, _) = strip_block_scan("x\"; let u = r#\"nl", &mut depth, &mut raw, &mut in_str);
     assert!(!in_str && raw == Some(1) && o == "; let u = ");
+    // Source column (codex R9-F1): the flag tracks the scan's
+    // first character back to source column 0.
+    let mut depth = 0u32;
+    let mut raw = None;
+    let mut in_str = false;
+    let (o, c0) = strip_block_scan("mod tests {", &mut depth, &mut raw, &mut in_str);
+    assert!(c0 && o == "mod tests {");
+    let (o, c0) = strip_block_scan("/*c*/mod tests {", &mut depth, &mut raw, &mut in_str);
+    assert!(!c0 && o == "mod tests {");
+    let (o, c0) = strip_block_scan("}", &mut depth, &mut raw, &mut in_str);
+    assert!(c0 && o == "}");
+    let mut depth = 0u32;
+    let mut raw = None;
+    let mut in_str = true;
+    let (o, c0) = strip_block_scan("x\"}", &mut depth, &mut raw, &mut in_str);
+    assert!(!c0 && o == "}");
+}
+
+/// T6 matcher-level pins (codex R9-F2 + claude R1): evasion
+/// shapes end to end through `t6_violations` over synthetic
+/// sources — the opener/closer/pattern layer the scanner
+/// pins cannot reach. Each mirrors a tree-level probe that
+/// tripped (or, pre-fix, missed).
+#[test]
+fn t6_matcher_flags_and_skips_hold() {
+    // F1-forward (codex R9): mid-line `mod tests {` promoted
+    // by a consumed string-closer + block prefix must NOT
+    // open — the production unwrap is flagged.
+    let v = t6_violations(
+        "macro_rules! w { ($h:literal mod $n:ident $b:block) => {}; }\nw!(\n\"a\\\nsecond\"/*c*/mod tests {\n}\n);\npub fn p() -> u8 {\nSome(1).unwrap()\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":8:") && v[0].contains(".unwrap("), "{v:?}");
+    // F1-reverse (codex R9): a promoted mid-line `}` must NOT
+    // close early — the test unwrap stays skipped. (The
+    // macro's own braces stay indented: any SOURCE column-0
+    // `}` still closes by design — the H5 brace rule without
+    // parsing.)
+    let v = t6_violations(
+        "#[cfg(test)]\nmod tests {\n    macro_rules! m {\n        ({ \"a\\\nx\"}\"y\") => {};\n    }\n    fn t() {\n        Some(1).unwrap()\n    }\n}\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // F2-char (codex R9 / claude R1-F1): a quote inside a
+    // char literal must not hide the call.
+    let v = t6_violations(
+        "pub fn p(s: &str) -> usize {\ns.find('\"').unwrap()\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    // F1-raw (claude R1-F1): backslash before a raw closer
+    // must not extend the string.
+    let v = t6_violations(
+        "pub fn p(s: &str) -> &str {\ns.strip_prefix(r\"C:\\\").unwrap()\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    // F1-block (claude R1-F1): a quote inside a block comment
+    // must not open a string.
+    let v = t6_violations(
+        "pub fn p() -> u8 {\nlet v = /* \" */ Some(1).unwrap();\nv\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // claude R1-F2: a shipped `mod tests` (no attribute)
+    // must NOT skip.
+    let v = t6_violations(
+        "#[allow(dead_code)]\nmod tests {\npub fn h() -> u8 {\nSome(1).unwrap()\n}\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":4:"), "{v:?}");
+    // Control: a real cfg(test) module still skips, and
+    // production around it still flags.
+    let v = t6_violations(
+        "pub fn a() -> u8 {\nSome(1).unwrap()\n}\n#[cfg(test)]\nmod tests {\nfn t() {\nSome(1).unwrap()\n}\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+}
+
+/// T6 matcher over one file's text: skips test-module
+/// bodies (H5 mechanism: rustfmt keeps test modules
+/// top-level) and reports `rel:line: pat: code` violations
+/// for panic patterns in production code. Rules:
+/// - Opener: any `mod <name> {` directly under `#[cfg(test)]`
+///   (name-independent — a shipped `mod tests` must NOT skip
+///   (claude R1-F2)), at SOURCE column 0 (a mid-line token
+///   promoted by a consumed prefix must NOT open (codex
+///   R9-F1)), without its `}` on the same line (empty
+///   modules open nothing; one-line content stays scanned,
+///   fail-closed (codex R7-1)). Documentation cannot
+///   impersonate a module (block scan, codex R7-2). The
+///   attribute matches on scan text: governance is
+///   level-based, and in stable code it shares its item's
+///   level, so indent cannot forge it.
+/// - Closer: source column 0 `}` only (a promoted mid-line
+///   `}` must not close early (codex R9-F1 reverse)).
+///   Accepted residual: a prefixed real closer (`/*c*/}`)
+///   extends the skip — unrustomatic; the symmetric rule is
+///   what keeps macro braces from closing early.
+/// - Patterns match the stateful scan, not the line (codex
+///   R9-F2 / claude R1-F1): the stateless stripper misreads
+///   quotes in chars, raws, blocks, and continuations.
+/// No other known residual for rustfmt-formatted code.
+fn t6_violations(text: &str, rel: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut in_tests = false;
+    let mut prev_nonempty = String::new();
+    let mut block_depth = 0u32;
+    let mut in_raw = None;
+    let mut in_str = false;
+    for (i, line) in text.lines().enumerate() {
+        let (scan, src_col0) = strip_block_scan(line, &mut block_depth, &mut in_raw, &mut in_str);
+        let closed_inline = scan.find('{').is_some_and(|o| scan[o..].contains('}'));
+        let is_opener = scan.starts_with("mod ")
+            && scan.contains('{')
+            && prev_nonempty == "#[cfg(test)]"
+            && src_col0
+            && !closed_inline;
+        if !in_tests && is_opener {
+            in_tests = true;
+        } else if in_tests {
+            if src_col0 && scan.starts_with('}') {
+                in_tests = false;
+            }
+        } else {
+            for pat in T6_PATTERNS {
+                if scan.contains(pat) {
+                    violations.push(format!("{rel}:{}: {pat}: {}", i + 1, normalize(line)));
+                }
+            }
+        }
+        if !scan.trim().is_empty() {
+            prev_nonempty = scan;
+        }
+    }
+    violations
 }
 
 #[test]
@@ -912,52 +1091,7 @@ fn h7_cli_surface_carries_no_panics() {
     let mut violations = Vec::new();
     for rel in T6_FILES {
         let text = std::fs::read_to_string(root.join(rel)).unwrap();
-        // Skip test-module bodies (H5 mechanism: rustfmt keeps
-        // test modules top-level, so a column-0 opener ...
-        // column-0 `}` pair delimits them). The opener is `mod
-        // tests {` or any column-0 `mod <name> {` directly under
-        // `#[cfg(test)]` (e.g. cli.rs `preview_tests`): the audit
-        // governs production code, and `#[cfg(test)]` never
-        // ships — matching by name alone false-positives on
-        // test-only helpers. Matching runs on the
-        // block-comment scan (not raw lines), so documentation
-        // cannot impersonate a module (codex R7-2); a line-doc
-        // mention still cannot match (its `//` prefix survives
-        // the scan). An opener carrying its own `}` on the same
-        // line (`mod foo {}`) opens nothing — an empty module has
-        // no body to skip, and one-line content stays scanned
-        // (fail-closed; codex R7-1).
-        let mut in_tests = false;
-        let mut prev_nonempty = String::new();
-        let mut block_depth = 0u32;
-        let mut in_raw = None;
-        let mut in_str = false;
-        for (i, line) in text.lines().enumerate() {
-            let scan = strip_block_scan(line, &mut block_depth, &mut in_raw, &mut in_str);
-            let closed_inline = scan.find('{').is_some_and(|o| scan[o..].contains('}'));
-            let is_opener = (scan.starts_with("mod tests {")
-                || (scan.starts_with("mod ")
-                    && scan.contains('{')
-                    && prev_nonempty == "#[cfg(test)]"))
-                && !closed_inline;
-            if !in_tests && is_opener {
-                in_tests = true;
-            } else if in_tests {
-                if scan.starts_with('}') {
-                    in_tests = false;
-                }
-            } else {
-                let code = strip_comments_and_strings(line);
-                for pat in T6_PATTERNS {
-                    if code.contains(pat) {
-                        violations.push(format!("{rel}:{}: {pat}: {}", i + 1, normalize(line)));
-                    }
-                }
-            }
-            if !scan.trim().is_empty() {
-                prev_nonempty = scan;
-            }
-        }
+        violations.extend(t6_violations(&text, rel));
     }
     assert!(
         violations.is_empty(),
