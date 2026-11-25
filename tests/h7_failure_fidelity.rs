@@ -844,6 +844,68 @@ fn strip_block_scan(
     out
 }
 
+/// T6 scanner cross-line pins (Tier-1 R4 note (d)): the
+/// evasion shapes behind codex R8 + Tier-1 R2/R4, locked as
+/// direct unit cases so a scanner edit cannot silently
+/// reopen them. Each case mirrors a tree-level probe that
+/// tripped (or, pre-fix, missed) end to end.
+#[test]
+fn t6_scanner_cross_line_states_hold() {
+    // P1 (codex R8): chained `\` continuation carrying a
+    // phantom block opener — the closer must survive.
+    let mut depth = 0u32;
+    let mut raw = None;
+    let mut in_str = false;
+    let o = strip_block_scan("let h = \"a\\", &mut depth, &mut raw, &mut in_str);
+    assert!(in_str && o == "let h = ");
+    let o = strip_block_scan("mid\\", &mut depth, &mut raw, &mut in_str);
+    assert!(in_str && o.is_empty());
+    let o = strip_block_scan("/* tail\";", &mut depth, &mut raw, &mut in_str);
+    assert!(!in_str && o == ";");
+    let o = strip_block_scan("}", &mut depth, &mut raw, &mut in_str);
+    assert!(o == "}" && depth == 0 && raw.is_none() && !in_str);
+    // P3 (Tier-1 R4): a continuation line shaped like a
+    // closer must not close.
+    let mut depth = 0u32;
+    let mut raw = None;
+    let mut in_str = false;
+    let o = strip_block_scan("let h = \"a\\", &mut depth, &mut raw, &mut in_str);
+    assert!(in_str);
+    let o = strip_block_scan("}\";", &mut depth, &mut raw, &mut in_str);
+    assert!(!in_str && o == ";");
+    // P4 (Tier-1 R4): byte-string continuation, plain and
+    // with escapes.
+    let mut depth = 0u32;
+    let mut raw = None;
+    let mut in_str = false;
+    let o = strip_block_scan("let h = b\"ab\\", &mut depth, &mut raw, &mut in_str);
+    assert!(in_str && o == "let h = ");
+    let o = strip_block_scan("xy\";", &mut depth, &mut raw, &mut in_str);
+    assert!(!in_str && o == ";");
+    let v: Vec<char> = "b\"a\\x41\\\\".chars().collect();
+    assert_eq!(skip_raw(&v, 0), Some((v.len(), None, true)));
+    // R2 (Tier-1 R2 f-prime): multi-line raw spanning the
+    // closer — block tokens inside stay raw text.
+    let mut depth = 0u32;
+    let mut raw = None;
+    let mut in_str = false;
+    let o = strip_block_scan("let f = r#\"l1", &mut depth, &mut raw, &mut in_str);
+    assert!(raw == Some(1) && !o.is_empty());
+    let o = strip_block_scan("/* poison", &mut depth, &mut raw, &mut in_str);
+    assert!(raw == Some(1) && depth == 0 && o.is_empty());
+    let o = strip_block_scan("tail\"#;", &mut depth, &mut raw, &mut in_str);
+    assert!(raw.is_none() && o == ";");
+    // R3 (Tier-1 R2): escaped quote ends past the closer.
+    let v: Vec<char> = "'\\''".chars().collect();
+    assert_eq!(skip_char(&v, 0), Some(4));
+    // Handoff: string close then raw open on one line.
+    let mut depth = 0u32;
+    let mut raw = None;
+    let mut in_str = true;
+    let o = strip_block_scan("x\"; let u = r#\"nl", &mut depth, &mut raw, &mut in_str);
+    assert!(!in_str && raw == Some(1) && o == "; let u = ");
+}
+
 #[test]
 fn h7_cli_surface_carries_no_panics() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
