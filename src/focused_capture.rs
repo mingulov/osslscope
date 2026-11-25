@@ -1634,21 +1634,26 @@ impl FocusedSession {
                 }
             }
         }
+        // S1 (audit text): warn after capability proof (open
+        // sessions) but BEFORE enabling observation or releasing
+        // the child — the operator sees pid+window before the
+        // heavy/irreversible steps. Denied/degraded opens with no
+        // plane stay silent. An owned child names its real pid.
+        if session.is_some() || counter.is_some() {
+            let target = match owned.1.as_ref() {
+                Some(child) => format!("owned pid {}", child.pid()),
+                None => notice_target,
+            };
+            crate::cli::note_attach_start_detail(&format!(
+                "{target}, {:?} window",
+                config.duration
+            ));
+        }
         if let Some(gate) = &gate {
             gate.open()?;
         }
         if let Some(child) = &mut owned.1 {
             child.release_retaining_exit()?;
-        }
-        // G4 U5/S1: the first proven attach per process gets the
-        // one-line runtime notice (denied/degraded opens with no
-        // plane stay silent — an attempt is not an attach), naming
-        // the target pid and window per the audit text.
-        if session.is_some() || counter.is_some() {
-            crate::cli::note_attach_start_detail(&format!(
-                "{}, {:?} window",
-                notice_target, config.duration
-            ));
         }
         Ok(Self {
             gate,

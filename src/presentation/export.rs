@@ -1264,33 +1264,44 @@ fn listen_is_loopback(listen: &str) -> bool {
 }
 
 /// S5: the OTLP endpoint pushes to loopback-only, mirroring the
-/// sender's actual grammar (`http://` literal prefix, then a
-/// socket address or bare IP — names and userinfo are
+/// sender's dial logic EXACTLY (`http://` literal prefix; a
+/// colon-containing authority dials verbatim, otherwise `:80` is
+/// appended; then socket-address parse — names and userinfo are
 /// unresolvable there). Anything else warns (the push then fails
-/// loud with its own error).
+/// loud with its own error). Note bare `::1` warns: the sender
+/// cannot dial it either (no port, unbracketed).
 fn endpoint_is_loopback(endpoint: &str) -> bool {
     let rest = match endpoint.strip_prefix("http://") {
         Some(rest) => rest,
         None => return false,
     };
     let host_port = rest.split('/').next().unwrap_or("");
-    if let Ok(addr) = host_port.parse::<std::net::SocketAddr>() {
-        return addr.ip().is_loopback();
-    }
-    host_port
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
+    let dial = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:80")
+    };
+    dial.parse::<std::net::SocketAddr>()
+        .is_ok_and(|addr| addr.ip().is_loopback())
 }
 
 /// S5: endpoint rendering for diagnostics — host[:port] only, no
 /// userinfo/path/query/fragment (credentials must never reach
-/// stderr), defensively length-capped. Cuts at `/`, `?`, AND `#`:
-/// a query/fragment without a slash still leaks otherwise.
+/// stderr), defensively length-capped. The authority exists ONLY
+/// behind a LEADING scheme: a `://` later in the string sits
+/// inside a query or fragment and must never be treated as the
+/// authority (else `?next=https://SECRET` leaks SECRET) — such
+/// inputs render generic. Cuts at `/`, `?`, AND `#`.
 fn endpoint_display(endpoint: &str) -> String {
-    let rest = endpoint
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(endpoint);
+    let rest = match endpoint.split_once("://") {
+        Some((scheme, _))
+            if scheme.is_empty() || scheme.chars().any(|c| matches!(c, '/' | '?' | '#')) =>
+        {
+            return "endpoint".to_string();
+        }
+        Some((_, rest)) => rest,
+        None => endpoint,
+    };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host_port = authority.rsplit('@').next().unwrap_or("");
     const MAX: usize = 256;
@@ -1674,7 +1685,6 @@ mod tests {
             "http://127.0.0.1:4318/v1/metrics",
             "http://[::1]:4318/v1/metrics",
             "http://127.0.0.1/v1/metrics",
-            "http://::1/v1/metrics",
         ] {
             assert!(endpoint_is_loopback(quiet), "{quiet} stays silent");
         }
@@ -1686,6 +1696,10 @@ mod tests {
             "http://user@127.0.0.1:4318/v1/metrics",
             "https://127.0.0.1:4318/v1/metrics",
             "http://10.0.0.5:4318/v1/metrics",
+            // Bare ::1 warns: the sender cannot dial it either
+            // (colon present, so no :80 is appended; the
+            // unbracketed literal is not a socket address).
+            "http://::1/v1/metrics",
             "http://::1:4318/v1/metrics",
         ] {
             assert!(!endpoint_is_loopback(loud), "{loud} warns");
@@ -1713,6 +1727,16 @@ mod tests {
         assert_eq!(
             endpoint_display("http://203.0.113.1:4318#frag"),
             "203.0.113.1:4318"
+        );
+        // Codex round 2: a separator inside a query/fragment is not
+        // an authority — render generic, never the smuggled text.
+        assert_eq!(
+            endpoint_display("collector?next=https://DEMO_SECRET"),
+            "endpoint"
+        );
+        assert_eq!(
+            endpoint_display("collector#https://DEMO_SECRET"),
+            "endpoint"
         );
         let long = format!("http://{}.example:1/x", "a".repeat(300));
         let shown = endpoint_display(&long);

@@ -1395,8 +1395,18 @@ fn observe(
     let (mut session, mut initial_batch) = match opened {
         Ok(session) => {
             // G4 U5/S1: proven attach (a failed open degrades to
-            // passive below and stays silent).
-            crate::cli::note_attach_start();
+            // passive below and stays silent). A single-pid
+            // invocation names its pid and window; multi-pid,
+            // cgroup, and selector-less runs keep the generic
+            // line (no single pid exists there). Post-open by
+            // necessity: the open IS the enabling step here.
+            match options.selection.pids.as_slice() {
+                [pid] => crate::cli::note_attach_start_detail(&format!(
+                    "pid {pid}, {:?} window",
+                    options.duration
+                )),
+                _ => crate::cli::note_attach_start(),
+            }
             (Some(session), ObservationBatch::default())
         }
         Err(gap) => (
