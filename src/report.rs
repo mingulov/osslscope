@@ -3432,19 +3432,6 @@ pub fn err_line(text: &str) {
     let _ = writeln!(locked, "{text}");
 }
 
-/// Bounded best-effort stderr line (S1). Pipes (the only stderr
-/// kind whose small writes can stall) go through a FRESH
-/// `O_NONBLOCK` description of fd 2 (reopened via
-/// `/proc/self/fd`), so no flag mutation can race other stderr
-/// users and no lock wait can defeat the bound; pipes have no
-/// offsets, so the private description cannot clobber anything.
-/// All other fds take the classic shared-description path.
-/// Total waiting is capped well under
-/// `deadline` (`NOTICE_WAIT_MS`): past it the line is skipped,
-/// never forced. Returns whether the full line was written (a
-/// broken fd, a dead reader, or an expired deadline reads
-/// unwritable: skip, `false`). Panic-free like [`err_line`].
-
 /// Is fd 2 a FIFO (the only stderr kind whose small writes can
 /// stall)? Files, terminals, `/dev/null`, and closed/broken fds
 /// take the classic path below — only pipes need the private
@@ -3457,9 +3444,21 @@ fn stderr_is_fifo() -> bool {
     }
     // SAFETY: `fstat` succeeded, so the struct is initialized.
     let st = unsafe { st.assume_init() };
-    (st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFIFO as u32
+    st.st_mode & libc::S_IFMT == libc::S_IFIFO
 }
 
+/// Bounded best-effort stderr line (S1). Pipes (the only stderr
+/// kind whose small writes can stall) go through a FRESH
+/// `O_NONBLOCK` description of fd 2 (reopened via
+/// `/proc/self/fd`), so no flag mutation can race other stderr
+/// users and no lock wait can defeat the bound; pipes have no
+/// offsets, so the private description cannot clobber anything.
+/// All other fds take the classic shared-description path.
+/// Total waiting is capped well under
+/// `deadline` (`NOTICE_WAIT_MS`): past it the line is skipped,
+/// never forced. Returns whether the full line was written (a
+/// broken fd, a dead reader, or an expired deadline reads
+/// unwritable: skip, `false`). Panic-free like [`err_line`].
 pub fn err_line_bounded(text: &str, deadline: std::time::Instant) -> bool {
     /// Max time spent waiting for a stalled stderr reader per
     /// call — one hostile-quantum-scale budget. The caller's
