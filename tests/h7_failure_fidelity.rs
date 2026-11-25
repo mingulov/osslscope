@@ -648,6 +648,43 @@ const T6_FILES: &[&str] = &[
 
 const T6_PATTERNS: &[&str] = &["eprintln!", "panic!", ".expect(", ".unwrap("];
 
+/// Block-comment scan for the T6 matcher: removes `/* … */`
+/// spans (nesting per Rust) and `//` tails so a test-module
+/// opener inside documentation cannot activate the test skip
+/// (codex R7-2). String literals are deliberately NOT
+/// tracked: no matcher predicate (column-0 `mod ` opener,
+/// `#[cfg(test)]` attribute, `}` closer) can match mid-line
+/// string content, and the multi-line string literals in the
+/// T6 files (raw string at check.rs:1050, `\` continuation
+/// at doctor.rs:5535) were verified inert — no column-0
+/// continuation line matches a predicate.
+fn strip_block_scan(line: &str, depth: &mut u32) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if *depth > 0 {
+            if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                *depth += 1;
+            } else if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                *depth -= 1;
+            }
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'/') {
+            break;
+        }
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            *depth += 1;
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[test]
 fn h7_cli_surface_carries_no_panics() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -661,20 +698,29 @@ fn h7_cli_surface_carries_no_panics() {
         // `#[cfg(test)]` (e.g. cli.rs `preview_tests`): the audit
         // governs production code, and `#[cfg(test)]` never
         // ships — matching by name alone false-positives on
-        // test-only helpers. Attribute and opener match raw at
-        // column 0, so a comment mentioning the attribute cannot
-        // misfire onto a production module.
+        // test-only helpers. Matching runs on the
+        // block-comment scan (not raw lines), so documentation
+        // cannot impersonate a module (codex R7-2); a line-doc
+        // mention still cannot match (its `//` prefix survives
+        // the scan). An opener carrying its own `}` on the same
+        // line (`mod foo {}`) opens nothing — an empty module has
+        // no body to skip, and one-line content stays scanned
+        // (fail-closed; codex R7-1).
         let mut in_tests = false;
-        let mut prev_nonempty = "";
+        let mut prev_nonempty = String::new();
+        let mut block_depth = 0u32;
         for (i, line) in text.lines().enumerate() {
-            let is_opener = line.starts_with("mod tests {")
-                || (line.starts_with("mod ")
-                    && line.contains('{')
-                    && prev_nonempty == "#[cfg(test)]");
+            let scan = strip_block_scan(line, &mut block_depth);
+            let closed_inline = scan.find('{').is_some_and(|o| scan[o..].contains('}'));
+            let is_opener = (scan.starts_with("mod tests {")
+                || (scan.starts_with("mod ")
+                    && scan.contains('{')
+                    && prev_nonempty == "#[cfg(test)]"))
+                && !closed_inline;
             if !in_tests && is_opener {
                 in_tests = true;
             } else if in_tests {
-                if line.starts_with('}') {
+                if scan.starts_with('}') {
                     in_tests = false;
                 }
             } else {
@@ -685,8 +731,8 @@ fn h7_cli_surface_carries_no_panics() {
                     }
                 }
             }
-            if !line.trim().is_empty() {
-                prev_nonempty = line;
+            if !scan.trim().is_empty() {
+                prev_nonempty = scan;
             }
         }
     }
