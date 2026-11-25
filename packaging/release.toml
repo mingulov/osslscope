@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Candidate policy only. Required builder records/resources and measured ABI
 # evidence must be supplied and verified before sealing actual build inputs.
+# The builder recipes below (packaging/builders/*.json) live in the sealing
+# tree, not in this repo (no packaging/builders/ here by design); tests
+# fixture them (see tests/support/package_source_fixtures.rs).
 schema = "osslscope-release-policy-v1"
 package_epoch = 1
 package_revision = 1

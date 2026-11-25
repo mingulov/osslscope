@@ -26,7 +26,7 @@ tells you, but it cannot qualify what it cannot observe:
 ## Historical v0.3 discovery and observation
 
 The remainder of this section was written for v0.3 and is frozen
-history in a 0.6.0 tree: do not read it as current coverage.
+history in this tree: do not read it as current coverage.
 For the live contract see [the v2 document
 reference](observed-crypto-v2.md), [the PARTIAL
 runbook](partial-runbook.md), and [the v0.4.0 current-state alpha

@@ -4,7 +4,7 @@ use super::snapshot::{OperatorSnapshot, Presenter, checkpoint_default};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const HELP: &str = "usage: osslscope watch --out DIR [--poll-seconds S] [--format human|json] [--checkpoint PATH] [--follow]\nRender one operator frame from the service out-DIR (read-only). Non-TTY renders exactly one frame and exits 0.\n";
+const HELP: &str = "usage: osslscope watch --out DIR [--poll-seconds S] [--format human|json] [--checkpoint PATH] [--follow]\nRender one operator frame from the service out-DIR (read-only). Non-TTY renders exactly one frame and exits 0.\nProgress checkpoints to <out-DIR>.checkpoint.json beside the out-DIR unless --checkpoint PATH overrides it.\n";
 
 struct Options {
     out: PathBuf,

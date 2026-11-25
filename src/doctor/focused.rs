@@ -36,7 +36,7 @@ fn word(state: State) -> &'static str {
         State::NotChecked => "not_checked",
     }
 }
-const USAGE: &str = "usage: osslscope doctor [--json | --format human|json] [--observation-object PATH] [--count-object PATH]\nChecks scanner-owned inventory, namespace, companion integrity and functional BPF load/self-attachment. Target access remains scope dependent.\n  --libcrypto PATH selects legacy profile diagnostics.\n  --discovery preserves discovery-only capability checks.";
+const USAGE: &str = "usage: osslscope doctor [--json | --format human|json] [--observation-object PATH] [--count-object PATH]\nChecks scanner-owned inventory, namespace, companion integrity and functional BPF load/self-attachment. Target access remains scope dependent.\n  --libcrypto PATH selects legacy profile diagnostics.\n  --discovery preserves discovery-only capability checks.\n  --pid PID | --exe PATH select target vetting (sectioned route).";
 /// Value-taking options of [`run`]: the doctor router consumes the
 /// token after each of these, so flag-shaped values never misroute.
 /// A new value-taking match arm MUST extend this list.

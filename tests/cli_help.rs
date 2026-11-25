@@ -103,3 +103,48 @@ fn g4_u5_help_texts_carry_the_attach_warning() {
         }
     }
 }
+
+/// v0.8.0 audit remainder: service help names its emittable exits
+/// (§7.3 fold + coordinator refusals; UX4b).
+#[test]
+fn audit_service_help_names_exit_codes() {
+    let output = bin(&["service", "--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&output.stdout);
+    for needle in [
+        "exit 0:", "exit 1:", "exit 2:", "exit 3:", "exit 4:", "exit 10:", "exit 11:",
+    ] {
+        assert!(
+            text.contains(needle),
+            "service help lacks '{needle}':\n{text}"
+        );
+    }
+}
+
+/// v0.8.0 audit remainder: bare doctor help points at the
+/// sectioned target selectors (UX4a).
+#[test]
+fn audit_doctor_help_points_at_target_selectors() {
+    let output = bin(&["doctor", "--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("--pid PID | --exe PATH"),
+        "doctor help lacks target-selector pointer:\n{text}"
+    );
+}
+
+/// v0.8.0 audit remainder: watch/export help names the default
+/// sibling checkpoint write (S7).
+#[test]
+fn audit_watch_export_help_names_checkpoint_write() {
+    for sub in ["watch", "export"] {
+        let output = bin(&[sub, "--help"]);
+        assert_eq!(output.status.code(), Some(0), "{sub} --help");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("<out-DIR>.checkpoint.json"),
+            "{sub} help lacks checkpoint path:\n{text}"
+        );
+    }
+}

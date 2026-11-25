@@ -32,7 +32,10 @@ only) on a cache miss. `CARGO_BUILD_JOBS` defaults to 2.
 
 - Linux x86-64.
 - Rust 1.88.0 (host) via rustup, plus nightly-2026-05-20 with the
-  `rust-src` component (BPF `-Z build-std=core`).
+  `rust-src` component (BPF `-Z build-std=core`). The host toolchain
+  needs the `rustfmt` and `clippy` components (`rust-toolchain.toml`
+  requests them; `rustup component add rustfmt clippy --toolchain
+  1.88.0` installs them manually).
 - `bpf-linker` exactly 0.10.4 on `PATH` (BPF modes only;
   `--host-only` needs no linker). `--check-only` and the build
   share the prerequisite gate: a missing linker or any other

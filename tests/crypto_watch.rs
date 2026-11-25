@@ -19,6 +19,28 @@ fn records(output: &Output) -> Vec<serde_json::Value> {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
 }
+/// S2: a selector-less live watch warns once on stderr (never
+/// refuses); the note precedes observation on every privilege level.
+#[test]
+fn selectorless_watch_warns_once_on_stderr() {
+    let output = command(&["scan", "--watch", "--observe-crypto", "--duration", "1"]);
+    assert!(
+        matches!(output.status.code(), Some(3 | 4)),
+        "selector-less watch stays partial/unavailable: {:?}",
+        output.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("selector-less live watch").count(),
+        1,
+        "exactly one S2 note:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--pid/--cgroup/--module"),
+        "note names the narrowing selectors:\n{stderr}"
+    );
+}
+
 #[test]
 fn default_human_watch_preserves_passive_unavailable_facts() {
     let dir = std::env::temp_dir().join(format!("osslscope-watch-human-{}", std::process::id()));

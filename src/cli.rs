@@ -68,6 +68,19 @@ pub(crate) fn exit_code_help_report() -> [&'static str; 5] {
 /// One help line per exit code (mirrors docs/usage.md#exit-codes).
 /// Exits 3/4 additionally print their single stderr reason at runtime
 /// (see `report::exit_reason_line`).
+/// Service exits (§7.3 fold + coordinator refusals; UX4b).
+pub(crate) fn exit_code_help_service() -> [&'static str; 7] {
+    [
+        "  exit 0: clean run (help or uninterrupted complete windows)",
+        "  exit 1: delivery/tool failure or fatal salvaged",
+        "  exit 2: invalid arguments or refusal",
+        "  exit 3: partial/interrupted run",
+        "  exit 4: setup refusal, zero windows, or no verdict",
+        "  exit 10: definite policy violation (takes precedence)",
+        "  exit 11: policy inconclusive (Unknown-only evidence)",
+    ]
+}
+
 pub(crate) fn exit_code_help() -> [&'static str; 7] {
     [
         "  exit 0: ok (help or successful controls; no complete-execution claim)",
@@ -113,6 +126,23 @@ pub(crate) fn note_attach_start() {
     static NOTICED: std::sync::Once = std::sync::Once::new();
     NOTICED.call_once(|| {
         crate::report::err_line(attach_notice_line());
+    });
+}
+
+/// One-line runtime notice, emitted once per process when a
+/// selector-less live watch starts (S2): without
+/// --pid/--cgroup/--module the watch attempts the whole visible
+/// population. Stderr only; warns (never refuses) to preserve the
+/// whole-population workflow and legacy behavior.
+pub(crate) fn selectorless_watch_notice_line() -> &'static str {
+    "osslscope: note: selector-less live watch observes the whole visible population; narrow with --pid/--cgroup/--module"
+}
+
+/// Emit [`selectorless_watch_notice_line`] once per process.
+pub(crate) fn note_selectorless_watch() {
+    static NOTICED: std::sync::Once = std::sync::Once::new();
+    NOTICED.call_once(|| {
+        crate::report::err_line(selectorless_watch_notice_line());
     });
 }
 

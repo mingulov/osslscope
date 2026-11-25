@@ -18,7 +18,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-const HELP: &str = "usage: osslscope export --out DIR [--listen ADDR] [--poll-seconds S] [--otlp-enable] [--otlp-endpoint URL] [--otlp-push-seconds S] [--checkpoint PATH]\nServe Prometheus exposition on GET /metrics (default 127.0.0.1:9464) and optionally push OTLP/HTTP metrics. Read-only on the out-DIR.\n";
+const HELP: &str = "usage: osslscope export --out DIR [--listen ADDR] [--poll-seconds S] [--otlp-enable] [--otlp-endpoint URL] [--otlp-push-seconds S] [--checkpoint PATH]\nServe Prometheus exposition on GET /metrics (default 127.0.0.1:9464) and optionally push OTLP/HTTP metrics. Read-only on the out-DIR.\nProgress checkpoints to <out-DIR>.checkpoint.json beside the out-DIR unless --checkpoint PATH overrides it.\n";
 
 /// Default scrape endpoint (§6C-6).
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:9464";
@@ -1252,6 +1252,62 @@ fn shutdown_flush(presenter: &mut Presenter) -> std::io::Result<super::snapshot:
 
 /// Serve until `stop` is set (export loop with shared admission +
 /// real accumulation starts). Collection (refresh), scrape
+/// S5: loopback test for one host spelling (bare, bracketed, or
+/// `localhost`). Unparseable input is NOT loopback (warn — the bind
+/// or push then fails loud with its own error).
+fn host_is_loopback(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    bare == "localhost"
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// S5: the `--listen ADDR` value (`host:port`) binds loopback-only.
+fn listen_is_loopback(listen: &str) -> bool {
+    match listen.rsplit_once(':') {
+        Some((host, _)) if !host.is_empty() => host_is_loopback(host),
+        _ => host_is_loopback(listen),
+    }
+}
+
+/// S5: the OTLP endpoint URL pushes to loopback-only (scheme and
+/// path stripped; the push itself is cleartext http).
+fn endpoint_is_loopback(endpoint: &str) -> bool {
+    let without_scheme = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    let authority = without_scheme.split('/').next().unwrap_or("");
+    let no_userinfo = authority.rsplit('@').next().unwrap_or("");
+    if let Some(rest) = no_userinfo.strip_prefix('[') {
+        // Bracketed literal, optional :port after ']'.
+        let host = rest.split(']').next().unwrap_or("");
+        return host_is_loopback(host);
+    }
+    // Single-colon host:digits splits the port; anything else with a
+    // colon is IPv6-shaped and must parse exactly (an unbracketed
+    // port is ambiguous, so only a bare valid loopback literal
+    // qualifies — fail closed otherwise).
+    let host = match no_userinfo.rsplit_once(':') {
+        Some((h, port))
+            if !h.is_empty() && !h.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            h
+        }
+        _ if !no_userinfo.contains(':') => no_userinfo,
+        _ => {
+            return no_userinfo
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        }
+    };
+    host_is_loopback(host)
+}
+
 /// serving (bounded threads), and pushes (worker) are separated —
 /// a stalled push or slow peer never blocks the others.
 pub fn serve_with_shutdown(
@@ -1273,6 +1329,32 @@ pub fn serve_with_shutdown(
     let pre_refresh = opts.pre_refresh.clone();
     #[cfg(test)]
     let pre_shutdown = opts.pre_shutdown.clone();
+    // S5: silent widenings warn loud (loopback stays silent). The
+    // values echo here as they already do in the bind error below.
+    if !listen_is_loopback(&opts.listen) {
+        let line = format!(
+            "osslscope: warning: export listens on non-loopback {} (unauthenticated cleartext /metrics)",
+            opts.listen
+        );
+        eprintln!("{line}");
+        #[cfg(test)]
+        if let Some(sink) = diagnostic_sink.as_ref() {
+            sink.lock().unwrap().push(line);
+        }
+    }
+    if let Some(otlp) = opts.otlp.as_ref() {
+        if !endpoint_is_loopback(&otlp.endpoint) {
+            let line = format!(
+                "osslscope: warning: export pushes OTLP/HTTP metrics to non-loopback {} (cleartext http)",
+                otlp.endpoint
+            );
+            eprintln!("{line}");
+            #[cfg(test)]
+            if let Some(sink) = diagnostic_sink.as_ref() {
+                sink.lock().unwrap().push(line);
+            }
+        }
+    }
     let window_fallback_secs = super::snapshot::WINDOW_SECS_FALLBACK;
     let mut presenter = match Presenter::open_with_checkpoint(
         &opts.out,
@@ -1562,6 +1644,122 @@ pub fn run(args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S5: loopback stays silent, everything else warns (unparseable
+    /// fails closed to warn — the bind then errors loud anyway).
+    #[test]
+    fn s5_listen_loopback_matrix() {
+        for quiet in [
+            "127.0.0.1:9464",
+            "127.0.0.2:1",
+            "localhost:9464",
+            "[::1]:9464",
+        ] {
+            assert!(listen_is_loopback(quiet), "{quiet} stays silent");
+        }
+        for loud in [
+            "0.0.0.0:9464",
+            "[::]:9464",
+            "192.168.1.2:9464",
+            "example.com:9464",
+            "not-an-addr",
+        ] {
+            assert!(!listen_is_loopback(loud), "{loud} warns");
+        }
+    }
+
+    /// S5: endpoint matrix (scheme + path stripped, userinfo + port
+    /// stripped, bracketed v6 honored, bare v6 parsed exactly).
+    #[test]
+    fn s5_endpoint_loopback_matrix() {
+        for quiet in [
+            "http://127.0.0.1:4318/v1/metrics",
+            "http://localhost:4318/v1/metrics",
+            "http://[::1]:4318/v1/metrics",
+            "http://user@127.0.0.1:4318/v1/metrics",
+            "http://127.0.0.1/v1/metrics",
+            "http://::1/v1/metrics",
+        ] {
+            assert!(endpoint_is_loopback(quiet), "{quiet} stays silent");
+        }
+        for loud in [
+            "http://0.0.0.0:4318/v1/metrics",
+            "http://[::]:4318/v1/metrics",
+            "http://collector:4318/v1/metrics",
+            "http://10.0.0.5:4318/v1/metrics",
+            "http://::1:4318/v1/metrics",
+        ] {
+            assert!(!endpoint_is_loopback(loud), "{loud} warns");
+        }
+    }
+
+    /// S5: non-loopback listen + OTLP endpoint warn through the
+    /// production diagnostic channel (observed via the test sink).
+    #[test]
+    fn s5_non_loopback_widenings_warn() {
+        let dir = std::env::temp_dir().join(format!(
+            "s5-warn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink2 = sink.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let out = dir.clone();
+        let handle = std::thread::spawn(move || {
+            serve_with_shutdown(
+                Options {
+                    out,
+                    listen: "0.0.0.0:0".to_string(),
+                    poll_secs: 1,
+                    otlp: Some(OtlpConfig {
+                        endpoint: "http://203.0.113.1:4318/v1/metrics".to_string(),
+                        push_secs: 3600,
+                    }),
+                    checkpoint: None,
+                    pre_refresh: None,
+                    diagnostic_sink: Some(sink2),
+                    pre_shutdown: None,
+                },
+                stop2,
+                None,
+            )
+        });
+        // Warnings fire at startup, before any serving.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if sink.lock().unwrap().len() >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "S5 warnings never fired: {:?}",
+                sink.lock().unwrap()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = handle.join().unwrap();
+        let lines = sink.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("listens on non-loopback 0.0.0.0:0")),
+            "listen warning missing: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains(
+                "pushes OTLP/HTTP metrics to non-loopback http://203.0.113.1:4318/v1/metrics"
+            )),
+            "endpoint warning missing: {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn ok_200(body: &str) -> Result<PostResponse, String> {
         Ok(PostResponse {

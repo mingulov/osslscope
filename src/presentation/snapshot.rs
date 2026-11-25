@@ -4675,7 +4675,8 @@ fn preserve_governed_evidence(
             parent_fd.as_raw_fd(),
             stage_c.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o644,
+            // S6: owner-private staging.
+            0o600,
         )
     };
     if fd < 0 {
@@ -5916,7 +5917,8 @@ fn stage_and_rename_guarded(
             marker_fd.as_raw_fd(),
             stage_c.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-            0o644,
+            // S6: owner-private staging.
+            0o600,
         )
     };
     if fd < 0 {
@@ -12099,7 +12101,8 @@ impl Presenter {
                     marker_fd.as_raw_fd(),
                     marker_c.as_ptr(),
                     libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-                    0o644,
+                    // S6: owner-private staging.
+                    0o600,
                 )
             };
             if fd < 0 {
@@ -14462,7 +14465,8 @@ impl Presenter {
                     dir_fd.as_raw_fd(),
                     stage_c.as_ptr(),
                     libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-                    0o644,
+                    // S6: owner-private staging.
+                    0o600,
                 )
             };
             if fd < 0 {
@@ -17009,6 +17013,29 @@ mod tests {
             .ok()
             .and_then(|v| v.get("checkpoint_seq").and_then(|s| s.as_u64()));
         (residue.into_iter().next().unwrap(), bytes.len() as u64, seq)
+    }
+
+    /// S6: committed checkpoints are owner-private (0o600), not
+    /// umask-derived.
+    #[test]
+    fn checkpoint_file_is_owner_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = unique_dir("ckpt-mode600");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt = base.join("ckpt.json");
+        let mut p = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").unwrap();
+        p.build_service().expect("first fold commits");
+        p.flush_checkpoint().expect("checkpoint commits");
+        let mode = std::fs::metadata(&ckpt).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "checkpoint file mode");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

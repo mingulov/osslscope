@@ -55,6 +55,35 @@ fn fresh_dir(name: &str) -> std::path::PathBuf {
     dir
 }
 
+/// S6: a service-created out-DIR is owner-private (0o700). The
+/// --stream-with-missing-parent refusal (exit 2) lands AFTER
+/// out-DIR creation and BEFORE any run loop, so the pin is
+/// deterministic: no prestart timing, no run loop (`--timeout`
+/// bounds startup only, never the total run — a dead-pid service
+/// otherwise runs unbounded, observed during this pin's design).
+#[test]
+fn sixb_created_out_dir_is_owner_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = fresh_dir("outdir-mode");
+    let missing = root.join("created-by-service");
+    let bad_stream = root.join("no-such-dir").join("stream.jsonl");
+    assert!(!missing.exists());
+    assert_eq!(
+        run_service(&[
+            "--out",
+            missing.to_str().unwrap(),
+            "--pid",
+            "1",
+            "--stream",
+            bad_stream.to_str().unwrap(),
+        ]),
+        2
+    );
+    let mode = std::fs::metadata(&missing).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "created out-DIR mode");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // --- §1 admission (exit 2, pre-side-effect) ---
 
 #[test]

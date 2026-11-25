@@ -43,6 +43,7 @@ use crate::service::worker::{
     Control, DestClass, Destination, Diagnostics, Gate, WaitPoll, WorkerOut, outcome_of, peek_slot,
     push_accounting, run_under_control, view_slot,
 };
+use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -58,6 +59,9 @@ pub fn run(args: &[String]) -> ExitCode {
                 crate::service::cli::USAGE,
                 crate::cli::attach_warning_help()
             );
+            for line in crate::cli::exit_code_help_service() {
+                println!("{line}");
+            }
             ExitCode::SUCCESS
         }
         Err(reason) => {
@@ -805,8 +809,14 @@ fn run_service(cfg: ServiceConfig) -> ExitCode {
     let startup_budget = || startup_deadline.saturating_duration_since(Instant::now());
     // The out-DIR is the unit of durability (§4) — create it when
     // missing (T7.4's: a service that cannot create its workspace
-    // cannot run; refusal here would strand fresh deploys).
-    if let Err(e) = std::fs::create_dir_all(&cfg.out) {
+    // cannot run; refusal here would strand fresh deploys). S6:
+    // newly created components are owner-private (0o700); a
+    // pre-existing out-DIR keeps its mode (no chmod here).
+    if let Err(e) = std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&cfg.out)
+    {
         return refuse2(&format!("--out not creatable: {e}"));
     }
     // Sink admission (§4.1) — usage check before the lock.

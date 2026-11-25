@@ -264,9 +264,12 @@ pub fn write_state(dir: &Path, name: &str, tag: &str, bytes: &[u8]) -> std::io::
     let tmp_name = format!(".{name}.tmp.{tag}.{}", next_op_nonce());
     let tmp = dir.join(&tmp_name);
     {
+        // S6: staged state is owner-private (0o600); the rename
+        // carries the mode to the published file.
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&tmp)?;
         f.write_all(bytes)?;
@@ -477,6 +480,24 @@ mod tests {
             starttime: 987_654_321,
             boot_id: "01234567-89ab-cdef".to_string(),
         }
+    }
+
+    /// S6: written state is owner-private (0o600), not
+    /// umask-derived.
+    #[test]
+    fn written_state_is_owner_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("sixb-state-mode600-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_state(&dir, "probe.json", "t", b"{}").unwrap();
+        let mode = std::fs::metadata(dir.join("probe.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "written state mode");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

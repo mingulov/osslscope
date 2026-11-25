@@ -5471,6 +5471,12 @@ pub fn run(args: &[String]) -> ExitCode {
         Ok(o) if o.watch => o,
         _ => return invalid(),
     };
+    // S2: a selector-less live watch attempts the whole visible
+    // population — say so once (warn, never refuse: the
+    // whole-population workflow and legacy behavior stand).
+    if options.pids.is_empty() && options.cgroup.is_none() && options.modules.is_empty() {
+        crate::cli::note_selectorless_watch();
+    }
     // F2 gate: locator acquisition runs only for human output
     // on a terminal; machine modes bypass resolution entirely.
     // Render intent travels separately (F4).

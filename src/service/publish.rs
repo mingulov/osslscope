@@ -53,9 +53,12 @@ pub fn publish_window(
     let tmp_name = format!(".{final_name}.tmp.{tag}.{}", next_op_nonce());
     let tmp = dir.join(&tmp_name);
     let staged = (|| -> std::io::Result<()> {
+        // S6: staged windows are owner-private (0o600); the rename
+        // carries the mode to the published file.
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&tmp)?;
         f.write_all(bytes)?;
@@ -810,6 +813,26 @@ mod tests {
             std::fs::read(d.join("window-0000000003.json")).unwrap(),
             bytes
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// S6: published windows are owner-private (0o600), not
+    /// umask-derived.
+    #[test]
+    fn published_window_is_owner_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = dir("mode600");
+        let bytes = env_bytes(5, 7);
+        assert_eq!(
+            publish_window_durable(&d, 5, "t", &bytes, &key(5)),
+            PublishStep::Durable
+        );
+        let mode = std::fs::metadata(d.join("window-0000000005.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "published window mode");
         let _ = std::fs::remove_dir_all(&d);
     }
 
