@@ -4726,6 +4726,23 @@ mod tests {
         );
     }
 
+    /// First-run journey (codex R2): the doctor-advertised owned
+    /// route (`report --duration 1 run -- /bin/true`) must parse
+    /// to a Spawn target (a binary-level pin asserting only the
+    /// absence of `unknown subcommand` would also pass a parse
+    /// failure like `unknown flag rnu`).
+    #[test]
+    fn doctor_advertised_owned_route_parses() {
+        let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let a = parse(&v(vec!["--duration", "1", "run", "--", "/bin/true"])).unwrap();
+        match &a.target {
+            capture::Target::Spawn { argv, .. } => {
+                assert_eq!(*argv, vec!["/bin/true".to_string()]);
+            }
+            _ => panic!("advertised route must parse to a Spawn target"),
+        }
+    }
+
     #[test]
     fn parse_matrix() {
         let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
