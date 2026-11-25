@@ -648,18 +648,30 @@ const T6_FILES: &[&str] = &[
 
 const T6_PATTERNS: &[&str] = &["eprintln!", "panic!", ".expect(", ".unwrap("];
 
-/// Block-comment scan for the T6 matcher: removes `/* … */`
-/// spans (nesting per Rust) and `//` tails so a test-module
-/// opener inside documentation cannot activate the test skip
-/// (codex R7-2); string, raw-string, byte-string, and char
-/// literals are skipped so `"/*"` cannot open a span.
-/// Residual: a `\` line-continuation inside a regular string
-/// (doctor.rs:5535 — continuation line verified to match no
-/// predicate).
-/// If `ch[i..]` opens a raw or byte string, return the index
-/// just past its same-line closer (multi-line raws run past
-/// EOL); `None` when `ch[i]` starts no string.
-fn skip_raw(ch: &[char], i: usize) -> Option<usize> {
+/// If `ch[i]` is `"` followed by `hashes` `#`, return the
+/// index just past them; else `None`. A longer `#` run still
+/// closes at the first `"` + `hashes` `#` (surplus stays
+/// code — the rustc rule).
+fn raw_closer_end(ch: &[char], i: usize, hashes: u32) -> Option<usize> {
+    if ch.get(i) != Some(&'"') {
+        return None;
+    }
+    let mut k = i + 1;
+    let mut h = 0;
+    while k < ch.len() && ch[k] == '#' && h < hashes {
+        h += 1;
+        k += 1;
+    }
+    if h == hashes { Some(k) } else { None }
+}
+
+/// If `ch[i..]` opens a raw or byte string, return `(end,
+/// continued)`: `end` is the index just past the same-line
+/// closer (or EOL); `continued` is `Some(hashes)` when a
+/// multi-line `r#*"` runs past EOL (the caller carries it —
+/// an unclosed `b"…"` is a `\` continuation residual, same as
+/// regular strings). `None` when `ch[i]` starts no string.
+fn skip_raw(ch: &[char], i: usize) -> Option<(usize, Option<u32>)> {
     let n = ch.len();
     let mut j = i;
     if ch[j] == 'b' {
@@ -671,7 +683,7 @@ fn skip_raw(ch: &[char], i: usize) -> Option<usize> {
     } else if ch[i] != 'b' {
         return None;
     }
-    let mut hashes = 0;
+    let mut hashes = 0u32;
     if has_r {
         while j < n && ch[j] == '#' {
             hashes += 1;
@@ -684,27 +696,19 @@ fn skip_raw(ch: &[char], i: usize) -> Option<usize> {
     j += 1;
     while j < n {
         if has_r {
-            if ch[j] == '"' {
-                let mut k = j + 1;
-                let mut h = 0;
-                while k < n && ch[k] == '#' && h < hashes {
-                    h += 1;
-                    k += 1;
-                }
-                if h == hashes {
-                    return Some(k);
-                }
+            if let Some(k) = raw_closer_end(ch, j, hashes) {
+                return Some((k, None));
             }
             j += 1;
         } else if ch[j] == '\\' {
             j += 2;
         } else if ch[j] == '"' {
-            return Some(j + 1);
+            return Some((j + 1, None));
         } else {
             j += 1;
         }
     }
-    Some(n)
+    Some((n, has_r.then_some(hashes)))
 }
 
 /// If `ch[i]` opens a char literal, return the index just
@@ -715,8 +719,8 @@ fn skip_char(ch: &[char], i: usize) -> Option<usize> {
         return Some(i + 3);
     }
     if i + 1 < n && ch[i + 1] == '\\' {
-        let mut k = i + 2;
-        while k < n && k < i + 14 && ch[k] != '\'' {
+        let mut k = i + 3;
+        while k < n && k < i + 15 && ch[k] != '\'' {
             k += 1;
         }
         if k < n && ch[k] == '\'' {
@@ -726,11 +730,32 @@ fn skip_char(ch: &[char], i: usize) -> Option<usize> {
     None
 }
 
-fn strip_block_scan(line: &str, depth: &mut u32) -> String {
+/// Code scan for the T6 matcher: removes `/* ... */` spans
+/// (nesting per Rust) and `//` tails so documentation cannot
+/// impersonate a module (codex R7-2); string, raw-string
+/// (multi-line state carried in `raw`), byte-string, and char
+/// literals are skipped so `"/*"` cannot open a span.
+/// Residual: a `\` line-continuation inside a regular or byte
+/// string (sole live instance doctor.rs:5535, continuation
+/// line verified to match no predicate).
+fn strip_block_scan(line: &str, depth: &mut u32, raw: &mut Option<u32>) -> String {
     let ch: Vec<char> = line.chars().collect();
     let n = ch.len();
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
+    if let Some(hashes) = *raw {
+        while i < n {
+            if let Some(end) = raw_closer_end(&ch, i, hashes) {
+                i = end;
+                *raw = None;
+                break;
+            }
+            i += 1;
+        }
+        if raw.is_some() {
+            return out;
+        }
+    }
     while i < n {
         let c = ch[i];
         if *depth > 0 {
@@ -746,9 +771,10 @@ fn strip_block_scan(line: &str, depth: &mut u32) -> String {
             continue;
         }
         if (c == 'r' || c == 'b')
-            && let Some(end) = skip_raw(&ch, i)
+            && let Some((end, continued)) = skip_raw(&ch, i)
         {
             i = end;
+            *raw = continued;
             continue;
         }
         if c == '\''
@@ -811,8 +837,9 @@ fn h7_cli_surface_carries_no_panics() {
         let mut in_tests = false;
         let mut prev_nonempty = String::new();
         let mut block_depth = 0u32;
+        let mut in_raw = None;
         for (i, line) in text.lines().enumerate() {
-            let scan = strip_block_scan(line, &mut block_depth);
+            let scan = strip_block_scan(line, &mut block_depth, &mut in_raw);
             let closed_inline = scan.find('{').is_some_and(|o| scan[o..].contains('}'));
             let is_opener = (scan.starts_with("mod tests {")
                 || (scan.starts_with("mod ")
