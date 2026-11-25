@@ -3432,6 +3432,83 @@ pub fn err_line(text: &str) {
     let _ = writeln!(locked, "{text}");
 }
 
+/// Bounded best-effort stderr line (S1): writes through a FRESH
+/// `O_NONBLOCK` description of fd 2 (reopened via `/proc/self/fd`),
+/// so no flag mutation can race other stderr users (`O_NONBLOCK`
+/// lives on the description, not the fd) and no lock wait can
+/// defeat the bound. Total waiting is capped well under
+/// `deadline` (`NOTICE_WAIT_MS`): past it the line is skipped,
+/// never forced. Returns whether the full line was written (a
+/// broken fd, a dead reader, or an expired deadline reads
+/// unwritable: skip, `false`). Short lines complete in one
+/// pipe-atomic write; concurrent writers can only reorder whole
+/// lines, never interleave bytes. Panic-free like [`err_line`].
+pub fn err_line_bounded(text: &str, deadline: std::time::Instant) -> bool {
+    /// Max time spent waiting for a stalled stderr reader per
+    /// call — one hostile-quantum-scale budget. The caller's
+    /// deadline recheck (not this cap) guards staleness.
+    const NOTICE_WAIT_MS: u64 = 250;
+    use std::io::Write as _;
+    use std::os::unix::io::{FromRawFd as _, RawFd};
+    if std::time::Instant::now() >= deadline {
+        return false;
+    }
+    let cap =
+        deadline.min(std::time::Instant::now() + std::time::Duration::from_millis(NOTICE_WAIT_MS));
+    let path = format!("/proc/self/fd/{}", libc::STDERR_FILENO);
+    let Ok(cstr) = std::ffi::CString::new(path) else {
+        return false;
+    };
+    // SAFETY: `open` with a NUL-free path; the fd is owned below.
+    // A failed open (closed stderr, no /proc) skips silently.
+    let fd: RawFd = unsafe {
+        libc::open(
+            cstr.as_ptr(),
+            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: `fd` is a fresh owned descriptor from `open` above.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut line = Vec::with_capacity(text.len() + 1);
+    line.extend_from_slice(text.as_bytes());
+    line.push(b'\n');
+    let mut pending = &line[..];
+    while !pending.is_empty() {
+        if std::time::Instant::now() >= cap {
+            return false;
+        }
+        match file.write(pending) {
+            Ok(0) => return false,
+            Ok(n) => pending = &pending[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let ms = cap.saturating_duration_since(std::time::Instant::now());
+                if ms.is_zero() {
+                    return false;
+                }
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd, nfds=1, bounded timeout.
+                let ready =
+                    unsafe { libc::poll(&mut pfd, 1, ms.as_millis().min(i32::MAX as u128) as i32) };
+                if ready < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                {
+                    return false;
+                }
+            }
+            // EPIPE/EIO/EBADF and friends: undelivered.
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 /// Loud companion miss: resolved objects came back empty (companion
 /// lookup or validation failed). Names the absence and the remedy;
 /// locator paths and IO errors stay private by design.

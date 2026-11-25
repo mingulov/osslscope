@@ -1296,10 +1296,14 @@ fn is_uri_scheme(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
-/// S5: is `p` an echoable port — 1-5 digits in u16 range (a
-/// digit run of any length could pad stderr unboundedly)?
+/// S5: is `p` an echoable port — 1-5 ASCII digits in u16 range
+/// (a digit run of any length could pad stderr unboundedly; a
+/// `u16` parse alone would admit a leading `+`)?
 fn is_echoable_port(p: &str) -> bool {
-    !p.is_empty() && p.len() <= 5 && p.parse::<u16>().is_ok()
+    !p.is_empty()
+        && p.len() <= 5
+        && p.bytes().all(|b| b.is_ascii_digit())
+        && p.parse::<u16>().is_ok()
 }
 
 /// S5: is `s` an echoable host[:port] — an IP literal with an
@@ -1793,6 +1797,10 @@ mod tests {
             endpoint_display("http://127.0.0.1:431899/v1/metrics"),
             "endpoint"
         );
+        // Codex round 4: `u16` parse admits a leading `+` — the
+        // echo policy is ASCII digits only.
+        assert_eq!(endpoint_display("http://127.0.0.1:+80/x"), "endpoint");
+        assert_eq!(endpoint_display("http://127.0.0.1:+0/x"), "endpoint");
         assert_eq!(
             endpoint_display(&format!("http://127.0.0.1:{}/x", "4".repeat(500))),
             "endpoint"

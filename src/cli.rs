@@ -119,10 +119,14 @@ pub(crate) fn attach_notice_line() -> &'static str {
     "osslscope: note: live observation starting (privileged, system-wide probes; finite window)"
 }
 
-/// First-attach latch shared by the generic and detailed
-/// notices: exactly one line per process, first proven attach
-/// wins, whichever route it comes from.
-static ATTACH_NOTICED: std::sync::Once = std::sync::Once::new();
+/// First-attach latch shared by all three notice variants:
+/// exactly one line per process, first proven attach wins,
+/// whichever route it comes from. A lock + flag (not `Once`)
+/// so a SKIPPED bounded write leaves the latch unfired for a
+/// later attempt. Lock order: notice lock, then the stderr lock
+/// inside `err_line[_bounded]` — never the reverse.
+static NOTICE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static NOTICE_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Detailed variant (S1 audit text): names the target pid and the
 /// observation window. Routes without a single pid/window (provider
@@ -135,49 +139,23 @@ pub(crate) fn attach_notice_line_detail(detail: &str) -> String {
 /// first successful session open. Call sites prove attachment
 /// (an open plane), never an attempt: denied hosts stay silent.
 pub(crate) fn note_attach_start() {
-    ATTACH_NOTICED.call_once(|| {
-        crate::report::err_line(attach_notice_line());
-    });
+    let _guard = NOTICE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if NOTICE_FIRED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    crate::report::err_line(attach_notice_line());
+    NOTICE_FIRED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Detailed variant of [`note_attach_start`]: `detail` names the
 /// target and window (e.g. `pid 123, 5s window`). Same once latch.
 pub(crate) fn note_attach_start_detail(detail: &str) {
-    ATTACH_NOTICED.call_once(|| {
-        crate::report::err_line(&attach_notice_line_detail(detail));
-    });
-}
-
-/// Is stderr writable right now (bounded by `deadline`)? A poll
-/// for `POLLOUT` that never blocks past the deadline and never
-/// touches fd flags (no `O_NONBLOCK` flip — race-free under
-/// threads). Closed/broken stderr reads unwritable: skip.
-fn stderr_writable_until(deadline: std::time::Instant) -> bool {
-    use std::os::unix::io::AsRawFd as _;
-    let fd = std::io::stderr().as_raw_fd();
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd, nfds=1, bounded timeout.
-        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
-        if ready > 0 {
-            return pfd.revents & libc::POLLOUT != 0;
-        }
-        if ready == 0 {
-            return false;
-        }
-        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return false;
-        }
+    let _guard = NOTICE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if NOTICE_FIRED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
     }
+    crate::report::err_line(&attach_notice_line_detail(detail));
+    NOTICE_FIRED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Best-effort variant of [`note_attach_start_detail`] for
@@ -186,8 +164,12 @@ fn stderr_writable_until(deadline: std::time::Instant) -> bool {
 /// silently instead (the latch stays unfired, so a later attach
 /// can still report). Same once latch on success.
 pub(crate) fn note_attach_start_detail_bounded(detail: &str, deadline: std::time::Instant) {
-    if stderr_writable_until(deadline) {
-        note_attach_start_detail(detail);
+    let _guard = NOTICE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if NOTICE_FIRED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if crate::report::err_line_bounded(&attach_notice_line_detail(detail), deadline) {
+        NOTICE_FIRED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -685,22 +667,85 @@ mod preview_tests {
         assert!(joined.contains("violation"), "{joined}");
     }
 
-    /// S1: the writability probe honors an expired deadline
+    /// S1: the bounded write honors an expired deadline
     /// without polling (deterministic skip).
     #[test]
-    fn stderr_probe_expired_deadline_skips() {
+    fn stderr_bounded_expired_deadline_skips() {
         let past = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(1))
             .unwrap();
-        assert!(!stderr_writable_until(past));
+        assert!(!crate::report::err_line_bounded("unseen", past));
     }
 
-    /// S1: the writability probe passes on a writable stderr
+    /// S1: the bounded write passes on a writable stderr
     /// (captured test pipe has room).
     #[test]
-    fn stderr_probe_writable_stderr_passes() {
+    fn stderr_bounded_writable_stderr_passes() {
         let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        assert!(stderr_writable_until(future));
+        assert!(crate::report::err_line_bounded("probe-line", future));
+    }
+
+    /// S1: a saturated stderr pipe skips within the notice
+    /// budget instead of blocking (the pipe starts full, so even
+    /// the first write would stall a blocking writer). Swaps fd 2
+    /// onto a filled pipe for the call only; a guard restores it
+    /// (panic-safe, and the suite runs single-threaded).
+    #[test]
+    fn stderr_bounded_saturated_pipe_skips_fast() {
+        use std::os::unix::io::RawFd;
+        struct Fd2Guard {
+            saved: RawFd,
+        }
+        impl Drop for Fd2Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::dup2(self.saved, libc::STDERR_FILENO);
+                    libc::close(self.saved);
+                }
+            }
+        }
+        // Fill a pipe to saturation (nonblocking fill loop).
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rfd, wfd) = (fds[0], fds[1]);
+        let flags = unsafe { libc::fcntl(wfd, libc::F_GETFL) };
+        unsafe {
+            libc::fcntl(wfd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let chunk = vec![0u8; 65536];
+        loop {
+            let r = unsafe { libc::write(wfd, chunk.as_ptr() as *const libc::c_void, chunk.len()) };
+            if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN) {
+                break;
+            }
+            assert!(r > 0);
+        }
+        // Swap fd 2 onto the saturated pipe (guard restores).
+        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(saved >= 0);
+        let _guard = Fd2Guard { saved };
+        assert_eq!(
+            unsafe { libc::dup2(wfd, libc::STDERR_FILENO) },
+            libc::STDERR_FILENO
+        );
+        // The bounded write must skip within its budget (~250ms),
+        // never block: generous 5s bound, no timing assumption.
+        // Restore fd 2 BEFORE asserting, so a failure panic never
+        // itself blocks on the saturated pipe.
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let start = std::time::Instant::now();
+        let skipped = !crate::report::err_line_bounded("unseen-by-design", future);
+        let elapsed = start.elapsed();
+        drop(_guard);
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
+        }
+        assert!(skipped, "saturated pipe must skip");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "bounded skip took {elapsed:?}"
+        );
     }
 
     /// S1: the detailed first-attach notice names the target pid
