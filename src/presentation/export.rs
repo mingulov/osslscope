@@ -1296,12 +1296,18 @@ fn is_uri_scheme(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
+/// S5: is `p` an echoable port — 1-5 digits in u16 range (a
+/// digit run of any length could pad stderr unboundedly)?
+fn is_echoable_port(p: &str) -> bool {
+    !p.is_empty() && p.len() <= 5 && p.parse::<u16>().is_ok()
+}
+
 /// S5: is `s` an echoable host[:port] — an IP literal with an
-/// optional digits-only port (names never echo: unverifiable
-/// without resolving)?
+/// optional valid port (names never echo: unverifiable without
+/// resolving)?
 fn is_echoable_host_port(s: &str) -> bool {
     if let Some(rest) = s.strip_prefix('[') {
-        // Bracketed v6 with optional :digits port.
+        // Bracketed v6 with optional :port.
         let (host, port) = match rest.split_once(']') {
             Some(pair) => pair,
             None => return false,
@@ -1309,19 +1315,15 @@ fn is_echoable_host_port(s: &str) -> bool {
         if host.parse::<std::net::Ipv6Addr>().is_err() {
             return false;
         }
-        return port.is_empty()
-            || port
-                .strip_prefix(':')
-                .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+        return port.is_empty() || port.strip_prefix(':').is_some_and(is_echoable_port);
     }
     match s.rsplit_once(':') {
-        // Unbracketed colon: only host:digits with a v4 host
+        // Unbracketed colon: only host:port with a v4 host
         // (anything else is ambiguous or malformed).
         Some((host, port)) => {
             !host.contains(':')
                 && host.parse::<std::net::Ipv4Addr>().is_ok()
-                && !port.is_empty()
-                && port.bytes().all(|b| b.is_ascii_digit())
+                && is_echoable_port(port)
         }
         // Bare IP literal, no port.
         None => s.parse::<std::net::IpAddr>().is_ok(),
@@ -1783,6 +1785,16 @@ mod tests {
         assert_eq!(endpoint_display("collector=http://DEMO_SECRET"), "endpoint");
         assert_eq!(
             endpoint_display("http://127.0.0.1:token=DEMO_SECRET"),
+            "endpoint"
+        );
+        // Tier-1 round 5: over-long/out-of-range ports render
+        // generic (echo stays short by construction).
+        assert_eq!(
+            endpoint_display("http://127.0.0.1:431899/v1/metrics"),
+            "endpoint"
+        );
+        assert_eq!(
+            endpoint_display(&format!("http://127.0.0.1:{}/x", "4".repeat(500))),
             "endpoint"
         );
         assert_eq!(
