@@ -210,6 +210,24 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
                 out.write_all(b"\n")?;
             }
             out.write_all(b"  historical_activation=unknown execution=not_observed\n")?;
+            // First-run journey (D48): every bare-doctor run ends
+            // with concrete next actions, so an unprivileged
+            // first run is a guided starting point, never a
+            // dead end. Human output only — JSON is unchanged.
+            // Routes are hedged (`try`, `needs`): rows above
+            // carry the verdicts, this footer only points.
+            if available {
+                out.write_all(b"  next: observation ready, pick a route:\n")?;
+            } else {
+                out.write_all(b"  next: some capabilities blocked, what you can try:\n")?;
+            }
+            out.write_all(b"  next: try passive inventory: 'osslscope scan --pid <PID>'\n")?;
+            out.write_all(
+                b"  next: owned workloads: 'osslscope run -- <cmd>' (needs the capabilities above)\n",
+            )?;
+            out.write_all(
+                b"  next: foreign target: 'osslscope doctor --pid PID' (needs root/capable proof)\n",
+            )?;
         }
         out.flush()
     })();

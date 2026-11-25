@@ -180,6 +180,34 @@ fn doctor_sectioned_help_names_exit_codes() {
     );
 }
 
+/// First-run journey (D48): bare doctor human output ends with
+/// concrete next actions (never a dead end); JSON stays schema-
+/// pure with no footer.
+#[test]
+fn doctor_bare_human_ends_with_next_actions() {
+    let out = doctor(&[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for needle in [
+        "  next: ",
+        "osslscope scan --pid <PID>",
+        "osslscope run -- <cmd>",
+        "osslscope doctor --pid PID",
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "bare doctor lacks next-action '{needle}':\n{stdout}"
+        );
+    }
+    let json = doctor(&["--json"]);
+    let text = String::from_utf8_lossy(&json.stdout);
+    assert!(
+        !text.contains("next:"),
+        "doctor JSON must stay footer-free:\n{text}"
+    );
+    // ... and still parses as one JSON record.
+    let _: serde_json::Value = serde_json::from_str(&text).expect("doctor --json parses");
+}
+
 #[test]
 fn doctor_focused_help_names_exit_codes() {
     // Focused self-controls emit 0/1/2/3 only (unavailable lands
