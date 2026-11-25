@@ -864,13 +864,13 @@ fn t6_scanner_cross_line_states_hold() {
     assert!(!in_str && o == ";");
     let o = strip_block_scan("}", &mut depth, &mut raw, &mut in_str);
     assert!(o == "}" && depth == 0 && raw.is_none() && !in_str);
-    // P3 (Tier-1 R4): a continuation line shaped like a
-    // closer must not close.
+    // P3 (Tier-1 R4): a continuation line containing `}`
+    // must not leak it as code (the string still closes).
     let mut depth = 0u32;
     let mut raw = None;
     let mut in_str = false;
     let o = strip_block_scan("let h = \"a\\", &mut depth, &mut raw, &mut in_str);
-    assert!(in_str);
+    assert!(in_str && o == "let h = ");
     let o = strip_block_scan("}\";", &mut depth, &mut raw, &mut in_str);
     assert!(!in_str && o == ";");
     // P4 (Tier-1 R4): byte-string continuation, plain and
