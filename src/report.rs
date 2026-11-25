@@ -3432,10 +3432,13 @@ pub fn err_line(text: &str) {
     let _ = writeln!(locked, "{text}");
 }
 
-/// Is fd 2 a FIFO (the only stderr kind whose small writes can
-/// stall)? Files, terminals, `/dev/null`, and closed/broken fds
-/// take the classic path below — only pipes need the private
-/// description, and pipes have no file offsets to clobber.
+/// Is fd 2 a FIFO? Pipes are the stderr kind this helper
+/// bounds (finite buffer + stalled reader stalls small writes).
+/// Files, terminals, `/dev/null`, and closed/broken fds take the
+/// classic path below — only pipes get the private description,
+/// and pipes have no file offsets to clobber. (Sockets, ptys,
+/// and hard-mounted NFS can stall in theory; none is a
+/// plausible stderr here, and all keep legacy behavior.)
 fn stderr_is_fifo() -> bool {
     let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
     // SAFETY: `fstat` on fd 2 with a valid out-pointer.
@@ -3456,9 +3459,12 @@ fn stderr_is_fifo() -> bool {
 /// All other fds take the classic shared-description path.
 /// Total waiting is capped well under
 /// `deadline` (`NOTICE_WAIT_MS`): past it the line is skipped,
-/// never forced. Returns whether the full line was written (a
-/// broken fd, a dead reader, or an expired deadline reads
-/// unwritable: skip, `false`). Panic-free like [`err_line`].
+/// never forced. Returns whether the full line was written; on
+/// the FIFO path a broken fd, a dead reader, or an expired
+/// deadline reads unwritable (skip, `false`), while the classic
+/// path always reports attempted (matching legacy fire-and-
+/// forget). Short FIFO lines complete in one pipe-atomic write.
+/// Panic-free like [`err_line`].
 pub fn err_line_bounded(text: &str, deadline: std::time::Instant) -> bool {
     /// Max time spent waiting for a stalled stderr reader per
     /// call — one hostile-quantum-scale budget. The caller's
