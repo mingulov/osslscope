@@ -188,16 +188,6 @@ starttime and namespace identities distinguish observed incarnations, including
 PID reuse. Review those identities when correlating samples with other tools.
 No selector grants additional access or enters a target namespace.
 
-Measured coverage limits (guest witness, 0.8.0 development): a cold
-targeted watch needs roughly four to five seconds of attach lead
-before a workload's first call to capture it; sub-second external
-processes are effectively uncovered, and multi-member cgroup
-watches admit one heavy session at a time (a long-lived member
-holding a session keeps short-lived siblings queued behind the
-admission limit until they exit). Short-lived external processes
-stay PARTIAL rather than invented; per-object pre-armed attach is
-future work, not this release.
-
 ### Host-side container workflows
 
 Run osslscope in the host procfs and cgroup view when selecting host processes.
@@ -545,6 +535,20 @@ snapshot's inventory completeness. Polling can miss activity entirely between
 samples and has sampling/read lag. Only the immediately previous bounded
 snapshot is retained, so visibility recovery may report `seen` again. Watch
 establishes no lossless event history, activation, execution or non-use claim.
+
+Measured coverage limits (guest witness, `--observe-crypto`,
+0.8.0 development): a cold targeted watch needs roughly four to
+five seconds of attach lead before a workload's first call to
+capture it. Sub-second external processes may never appear at
+all — one ~50 ms process left no record anywhere in the output,
+so this is not merely PARTIAL coverage. In the witnessed guest
+configuration, multi-member watches admit one heavy session at
+a time (pool headroom decides how many fit): a long-lived
+member holding a session keeps short-lived siblings queued
+behind the admission limit until they exit. Observed-but-
+incomplete runs stay PARTIAL rather than invented; unseen
+processes leave no record at all. Per-object pre-armed attach
+is future work, not this release.
 
 `ScopedScanner` retains at most `max_objects` metadata/descriptor cache entries
 between snapshots. Stable native file fingerprints reuse parsed metadata;

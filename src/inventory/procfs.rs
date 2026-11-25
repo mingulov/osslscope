@@ -738,9 +738,13 @@ impl Work<'_> {
     /// overrunning sample still warms the cache, so the next sample
     /// hits it instead of re-parsing the same bytes. The entry
     /// check in [`inspect`] still bounds overrun to one object per
-    /// sample; the fingerprint check still precedes the insert
-    /// (never bank a changed file). Returns the parse result on
-    /// time, or `Deadline` (banked) past it.
+    /// sample. Two guards keep the delta minimal: never bank a
+    /// changed file, and never bank an error past the deadline (a
+    /// transient read failure must not poison later samples —
+    /// expired errors behave exactly as before this fix). Expiry
+    /// reports `Deadline` even when the file also changed (the
+    /// pre-fix precedence — watchers treat `Changed` as
+    /// sample-wide exclusion evidence).
     fn bank_inspect(
         &mut self,
         key: CacheKey,
@@ -750,44 +754,51 @@ impl Work<'_> {
         lease: Option<crate::observation_memory::MemoryLease>,
         result: Result<ModuleInfo, GapReason>,
     ) -> Result<ModuleInfo, GapReason> {
-        if file.metadata().map(|m| Fingerprint::from(&m)).ok().as_ref() != Some(&fingerprint) {
+        let expired = self.deadline().is_err();
+        let changed =
+            file.metadata().map(|m| Fingerprint::from(&m)).ok().as_ref() != Some(&fingerprint);
+        if !changed && (result.is_ok() || !expired) {
+            // F8d restoration: prefill the run-shared parsed-object
+            // cache from this first-sight parse while the pool is
+            // idle; sessions under contention then hit the cache
+            // instead of re-parsing the same bytes.
+            if let Ok(info) = &result {
+                if !info.exports.is_empty() {
+                    self.prefill_parsed_cache(&mut file, metadata, info);
+                }
+            }
+            // Current-snapshot attempts are capped by max_objects. Prefer dropping
+            // an unseen retained entry before admitting a newly observed object.
+            if self.cache.len() >= self.options.limits.max_objects {
+                let victim = self
+                    .cache
+                    .iter()
+                    .find(|(_, value)| !value.seen)
+                    .map(|(key, _)| key.clone());
+                if let Some(victim) = victim {
+                    self.cache.remove(&victim);
+                }
+            }
+            self.cache.insert(
+                key,
+                Cached {
+                    _memory: lease,
+                    file,
+                    info: result.clone(),
+                    seen: true,
+                    // Proven later by the verify caller (which holds
+                    // the mapping); cache hits reuse the retained one.
+                    locator: None,
+                    locator_kind: LocatorKind::HostDirect,
+                },
+            );
+        }
+        if expired {
+            return Err(GapReason::Deadline);
+        }
+        if changed {
             return Err(GapReason::Changed);
         }
-        // F8d restoration: prefill the run-shared parsed-object
-        // cache from this first-sight parse while the pool is
-        // idle; sessions under contention then hit the cache
-        // instead of re-parsing the same bytes.
-        if let Ok(info) = &result {
-            if !info.exports.is_empty() {
-                self.prefill_parsed_cache(&mut file, metadata, info);
-            }
-        }
-        // Current-snapshot attempts are capped by max_objects. Prefer dropping
-        // an unseen retained entry before admitting a newly observed object.
-        if self.cache.len() >= self.options.limits.max_objects {
-            let victim = self
-                .cache
-                .iter()
-                .find(|(_, value)| !value.seen)
-                .map(|(key, _)| key.clone());
-            if let Some(victim) = victim {
-                self.cache.remove(&victim);
-            }
-        }
-        self.cache.insert(
-            key,
-            Cached {
-                _memory: lease,
-                file,
-                info: result.clone(),
-                seen: true,
-                // Proven later by the verify caller (which holds
-                // the mapping); cache hits reuse the retained one.
-                locator: None,
-                locator_kind: LocatorKind::HostDirect,
-            },
-        );
-        self.deadline()?;
         result
     }
 }
@@ -1805,6 +1816,119 @@ mod tests {
         let cached = work.cache.get(&key).expect("expired parse is banked");
         assert!(cached.seen);
         assert!(cached.info.is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// B1/codex: an expired error is NOT banked (a transient
+    /// read failure must not poison later samples) but still
+    /// reports Deadline, exactly as before the fix.
+    #[test]
+    fn b1_expired_error_is_not_banked() {
+        let options = SnapshotOptions {
+            pids: vec![],
+            resolve_paths: false,
+            limits: super::super::Limits {
+                timeout: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+        };
+        let mut work = Work {
+            records_memory: Vec::new(),
+            memory: None,
+            options: &options,
+            include_other: false,
+            cancel: &NEVER_CANCELLED,
+            started: Instant::now(),
+            totals: WorkTotals::default(),
+            gaps: BTreeSet::new(),
+            cache: BTreeMap::new(),
+            backing_limit: None,
+            sidecar: resolve::ResolveSidecar::default(),
+            resolve_staged: Vec::new(),
+            resolve_bytes: 0,
+            parsed_cache: None,
+            prefill_used: 0,
+        };
+        let path = std::env::temp_dir().join(format!("b1-err-{}", std::process::id()));
+        std::fs::write(&path, b"elf-bytes").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let fingerprint = Fingerprint::from(&metadata);
+        let key = (fingerprint.clone(), None);
+        let outcome = work.bank_inspect(
+            key.clone(),
+            file,
+            &metadata,
+            fingerprint,
+            None,
+            Err(GapReason::NonRegular),
+        );
+        assert_eq!(outcome.unwrap_err(), GapReason::Deadline);
+        assert!(
+            !work.cache.contains_key(&key),
+            "expired errors stay unbanked"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// B1/codex: expiry keeps Deadline precedence over Changed
+    /// (watchers treat Changed as sample-wide exclusion evidence),
+    /// and a changed file is never banked.
+    #[test]
+    fn b1_expired_changed_reports_deadline_unbanked() {
+        let options = SnapshotOptions {
+            pids: vec![],
+            resolve_paths: false,
+            limits: super::super::Limits {
+                timeout: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+        };
+        let mut work = Work {
+            records_memory: Vec::new(),
+            memory: None,
+            options: &options,
+            include_other: false,
+            cancel: &NEVER_CANCELLED,
+            started: Instant::now(),
+            totals: WorkTotals::default(),
+            gaps: BTreeSet::new(),
+            cache: BTreeMap::new(),
+            backing_limit: None,
+            sidecar: resolve::ResolveSidecar::default(),
+            resolve_staged: Vec::new(),
+            resolve_bytes: 0,
+            parsed_cache: None,
+            prefill_used: 0,
+        };
+        let path = std::env::temp_dir().join(format!("b1-chg-{}", std::process::id()));
+        std::fs::write(&path, b"elf-bytes").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let fingerprint = Fingerprint::from(&metadata);
+        let key = (fingerprint.clone(), None);
+        // Mutate after the fingerprint: size differs, so Changed.
+        std::fs::write(&path, b"elf-bytes-changed-longer").unwrap();
+        let info = super::super::ModuleInfo {
+            sha256: String::new(),
+            device: 0,
+            inode: 0,
+            size_bytes: 9,
+            architecture: super::super::Architecture::X86_64,
+            kind: super::super::ObjectKind::Other,
+            exports: Vec::new(),
+            depends_on_libcrypto: false,
+            depends_on_libssl: false,
+            file_soname: None,
+            file_openssl_version: None,
+            file_version_status: super::super::FileVersionStatus::Absent,
+        };
+        let outcome = work.bank_inspect(key.clone(), file, &metadata, fingerprint, None, Ok(info));
+        assert_eq!(outcome.unwrap_err(), GapReason::Deadline);
+        assert!(
+            !work.cache.contains_key(&key),
+            "changed files stay unbanked"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
