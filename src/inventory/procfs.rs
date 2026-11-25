@@ -755,6 +755,14 @@ impl Work<'_> {
         result: Result<ModuleInfo, GapReason>,
     ) -> Result<ModuleInfo, GapReason> {
         let expired = self.deadline().is_err();
+        if expired && result.is_err() {
+            // Expired error: nothing to bank and no verdict to
+            // refine — report Deadline immediately, exactly as
+            // pre-B1. In particular, skip the fstat below: a
+            // stalled metadata read must not delay the gap or
+            // hold the leases when its answer changes nothing.
+            return Err(GapReason::Deadline);
+        }
         let changed =
             file.metadata().map(|m| Fingerprint::from(&m)).ok().as_ref() != Some(&fingerprint);
         if !changed && (result.is_ok() || !expired) {
