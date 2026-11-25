@@ -3432,39 +3432,124 @@ pub fn err_line(text: &str) {
     let _ = writeln!(locked, "{text}");
 }
 
-/// Is fd 2 a FIFO? Pipes are the stderr kind this helper
-/// bounds (finite buffer + stalled reader stalls small writes).
-/// Files, terminals, `/dev/null`, and closed/broken fds take the
-/// classic path below — only pipes get the private description,
-/// and pipes have no file offsets to clobber. (Sockets, ptys,
-/// and hard-mounted NFS can stall in theory; none is a
-/// plausible stderr here, and all keep legacy behavior.)
-fn stderr_is_fifo() -> bool {
+/// What kind of sink is fd 2? Only the answer routes the
+/// bounded write below; anything unexpected keeps legacy
+/// behavior.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StderrKind {
+    /// Pipes and character devices (ptys, `/dev/null`,
+    /// `/dev/full`): no file offsets, so a private `O_NONBLOCK`
+    /// description is safe — and their writes can stall or
+    /// fail, so the bound matters.
+    Private,
+    /// Sockets (systemd journal stderr is one): cannot be
+    /// reopened (`/proc/self/fd` fails `ENXIO`), have no
+    /// offsets, and can stall — `send` with `MSG_DONTWAIT`.
+    Socket,
+    /// Regular files and everything else: the classic
+    /// shared-description path (files must keep fd 2's offset
+    /// exactly; exotic fds keep legacy semantics).
+    Classic,
+}
+
+/// Classify fd 2 for [`err_line_bounded`]. An `fstat` failure
+/// (closed fd) routes classic: `err_line` degrades to silence
+/// there anyway.
+fn stderr_kind() -> StderrKind {
     let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
     // SAFETY: `fstat` on fd 2 with a valid out-pointer.
     if unsafe { libc::fstat(libc::STDERR_FILENO, st.as_mut_ptr()) } != 0 {
-        return false;
+        return StderrKind::Classic;
     }
     // SAFETY: `fstat` succeeded, so the struct is initialized.
     let st = unsafe { st.assume_init() };
-    st.st_mode & libc::S_IFMT == libc::S_IFIFO
+    let file_type = st.st_mode & libc::S_IFMT;
+    if file_type == libc::S_IFIFO || file_type == libc::S_IFCHR {
+        StderrKind::Private
+    } else if file_type == libc::S_IFSOCK {
+        StderrKind::Socket
+    } else {
+        StderrKind::Classic
+    }
 }
 
-/// Bounded best-effort stderr line (S1). Pipes (the only stderr
-/// kind whose small writes can stall) go through a FRESH
-/// `O_NONBLOCK` description of fd 2 (reopened via
-/// `/proc/self/fd`), so no flag mutation can race other stderr
-/// users and no lock wait can defeat the bound; pipes have no
-/// offsets, so the private description cannot clobber anything.
-/// All other fds take the classic shared-description path.
-/// Total waiting is capped well under
-/// `deadline` (`NOTICE_WAIT_MS`): past it the line is skipped,
-/// never forced. Returns whether the full line was written; on
-/// the FIFO path a broken fd, a dead reader, or an expired
+/// Bounded best-effort stderr line (S1), routed by sink kind:
+/// pipes and character devices go through a FRESH `O_NONBLOCK`
+/// description of fd 2 (reopened via `/proc/self/fd`), so no
+/// flag mutation can race other stderr users and no lock wait
+/// can defeat the bound (neither kind has file offsets, so the
+/// private description cannot clobber anything); sockets go
+/// through `send` with `MSG_DONTWAIT` (unreopenable, offsetless);
+/// everything else takes the classic shared-description path.
+/// Total waiting is capped well under `deadline`
+/// (`NOTICE_WAIT_MS`): past it the line is skipped, never
+/// forced. Returns whether the full line was written; on the
+/// bounded paths a broken fd, a dead reader, or an expired
 /// deadline reads unwritable (skip, `false`), while the classic
 /// path always reports attempted (matching legacy fire-and-
-/// forget). Short FIFO lines complete in one pipe-atomic write.
-/// Panic-free like [`err_line`].
+/// forget). Panic-free like [`err_line`].
+/// Best-effort line to a socket fd 2 (systemd journal stderr
+/// is one): `send` with `MSG_DONTWAIT` needs no flag mutation,
+/// no reopen, and no lock waits; retries within `cap`. Stream
+/// sockets have no message boundaries, so concurrent senders
+/// could interleave bytes — none exists on the stopped-child
+/// notice paths (audited: notices are latch-serialized,
+/// diagnostics buffered, workloads stopped).
+fn send_socket(text: &str, cap: std::time::Instant) -> bool {
+    let mut line = Vec::with_capacity(text.len() + 1);
+    line.extend_from_slice(text.as_bytes());
+    line.push(b'\n');
+    let mut pending = &line[..];
+    while !pending.is_empty() {
+        if std::time::Instant::now() >= cap {
+            return false;
+        }
+        // SAFETY: `send` on fd 2 with a valid buffer slice;
+        // `MSG_DONTWAIT` never blocks.
+        let r = unsafe {
+            libc::send(
+                libc::STDERR_FILENO,
+                pending.as_ptr() as *const libc::c_void,
+                pending.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if r < 0 {
+            let err = std::io::Error::last_os_error().raw_os_error();
+            if err == Some(libc::EINTR) {
+                continue;
+            }
+            if err != Some(libc::EAGAIN) {
+                return false;
+            }
+            let ms = cap.saturating_duration_since(std::time::Instant::now());
+            if ms.is_zero() {
+                return false;
+            }
+            let mut pfd = libc::pollfd {
+                fd: libc::STDERR_FILENO,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd, nfds=1, bounded timeout.
+            let ready =
+                unsafe { libc::poll(&mut pfd, 1, ms.as_millis().min(i32::MAX as u128) as i32) };
+            if ready < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return false;
+            }
+            continue;
+        }
+        // A zero return with a non-empty buffer cannot advance;
+        // fail closed rather than spin.
+        let n = r as usize;
+        if n == 0 {
+            return false;
+        }
+        pending = &pending[n.min(pending.len())..];
+    }
+    true
+}
+
 pub fn err_line_bounded(text: &str, deadline: std::time::Instant) -> bool {
     /// Max time spent waiting for a stalled stderr reader per
     /// call — one hostile-quantum-scale budget. The caller's
@@ -3475,16 +3560,27 @@ pub fn err_line_bounded(text: &str, deadline: std::time::Instant) -> bool {
     if std::time::Instant::now() >= deadline {
         return false;
     }
-    if !stderr_is_fifo() {
-        // Files, terminals, `/dev/null`: small writes never stall
-        // here, and the shared description preserves fd 2's offset
-        // exactly (a private description would start at 0 and
-        // clobber regular files, or race their offsets).
-        err_line(text);
-        return true;
-    }
+    // All bounded paths share one cap: the caller's deadline, but
+    // never more than one notice budget past now (a far-future
+    // setup deadline must not authorize a minutes-long stall).
     let cap =
         deadline.min(std::time::Instant::now() + std::time::Duration::from_millis(NOTICE_WAIT_MS));
+    match stderr_kind() {
+        // Files and everything unexpected: the shared description
+        // preserves fd 2's offset exactly (a private description
+        // would start at 0 and clobber regular files).
+        StderrKind::Classic => {
+            err_line(text);
+            return true;
+        }
+        // Sockets (systemd journal stderr is one): `send` with
+        // `MSG_DONTWAIT` — no flag mutation, no reopen (impossible
+        // on sockets), no lock waits.
+        StderrKind::Socket => {
+            return send_socket(text, cap);
+        }
+        StderrKind::Private => {}
+    }
     let path = format!("/proc/self/fd/{}", libc::STDERR_FILENO);
     let Ok(cstr) = std::ffi::CString::new(path) else {
         return false;

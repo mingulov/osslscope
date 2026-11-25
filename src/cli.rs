@@ -667,6 +667,36 @@ mod preview_tests {
         assert!(joined.contains("violation"), "{joined}");
     }
 
+    /// Swap fd 2 onto `new_fd`, restoring on drop (panic-safe).
+    /// Single-threaded suite only: fd 2 is process-global. Tests
+    /// must still drop explicitly before asserting, so a failure
+    /// panic never itself writes to the swapped fd.
+    struct Fd2Guard {
+        saved: std::os::unix::io::RawFd,
+    }
+
+    impl Fd2Guard {
+        fn swap(new_fd: std::os::unix::io::RawFd) -> Self {
+            let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+            assert!(saved >= 0);
+            let guard = Self { saved };
+            assert_eq!(
+                unsafe { libc::dup2(new_fd, libc::STDERR_FILENO) },
+                libc::STDERR_FILENO
+            );
+            guard
+        }
+    }
+
+    impl Drop for Fd2Guard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::dup2(self.saved, libc::STDERR_FILENO);
+                libc::close(self.saved);
+            }
+        }
+    }
+
     /// S1: the bounded write honors an expired deadline
     /// without polling (deterministic skip).
     #[test]
@@ -692,18 +722,6 @@ mod preview_tests {
     /// (panic-safe, and the suite runs single-threaded).
     #[test]
     fn stderr_bounded_saturated_pipe_skips_fast() {
-        use std::os::unix::io::RawFd;
-        struct Fd2Guard {
-            saved: RawFd,
-        }
-        impl Drop for Fd2Guard {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::dup2(self.saved, libc::STDERR_FILENO);
-                    libc::close(self.saved);
-                }
-            }
-        }
         // Fill a pipe to saturation (nonblocking fill loop).
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -721,13 +739,7 @@ mod preview_tests {
             assert!(r > 0);
         }
         // Swap fd 2 onto the saturated pipe (guard restores).
-        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
-        assert!(saved >= 0);
-        let _guard = Fd2Guard { saved };
-        assert_eq!(
-            unsafe { libc::dup2(wfd, libc::STDERR_FILENO) },
-            libc::STDERR_FILENO
-        );
+        let _guard = Fd2Guard::swap(wfd);
         // The bounded write must skip within its budget (~250ms),
         // never block: generous 5s bound, no timing assumption.
         // Restore fd 2 BEFORE asserting, so a failure panic never
@@ -755,18 +767,7 @@ mod preview_tests {
     /// restores it (panic-safe, single-threaded suite).
     #[test]
     fn stderr_bounded_file_stderr_appends_intact() {
-        use std::os::unix::io::{AsRawFd as _, RawFd};
-        struct Fd2Guard {
-            saved: RawFd,
-        }
-        impl Drop for Fd2Guard {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::dup2(self.saved, libc::STDERR_FILENO);
-                    libc::close(self.saved);
-                }
-            }
-        }
+        use std::os::unix::io::AsRawFd as _;
         let path = std::env::temp_dir().join(format!("bounded-file-{}", std::process::id()));
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -775,13 +776,7 @@ mod preview_tests {
             .truncate(true)
             .open(&path)
             .unwrap();
-        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
-        assert!(saved >= 0);
-        let _guard = Fd2Guard { saved };
-        assert_eq!(
-            unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) },
-            libc::STDERR_FILENO
-        );
+        let _guard = Fd2Guard::swap(file.as_raw_fd());
         let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
         assert!(crate::report::err_line_bounded("first", future));
         crate::report::err_line("second");
@@ -791,6 +786,122 @@ mod preview_tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(content, "first\nsecond\nthird\n");
+    }
+
+    /// S1: socket stderr (systemd journal shape) delivers through
+    /// `send(MSG_DONTWAIT)`: swap fd 2 onto one end of a
+    /// socketpair, read the line back from the other end. The
+    /// read end goes nonblocking first, so a regression fails
+    /// loudly instead of hanging.
+    #[test]
+    fn stderr_bounded_socket_delivers() {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        let (rfd, wfd) = (fds[0], fds[1]);
+        let flags = unsafe { libc::fcntl(rfd, libc::F_GETFL) };
+        unsafe {
+            libc::fcntl(rfd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let _guard = Fd2Guard::swap(wfd);
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let delivered = crate::report::err_line_bounded("sock-line", future);
+        drop(_guard);
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(rfd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
+        }
+        assert!(delivered, "socket stderr must deliver");
+        assert!(n > 0, "nothing arrived on the socket");
+        assert_eq!(&buf[..n as usize], b"sock-line\n");
+    }
+
+    /// S1: a saturated socket skips within budget (never blocks):
+    /// fill one end with no reader, swap fd 2 onto it, expect a
+    /// fast skip. Guarded to fail loudly (not hang) on regress.
+    #[test]
+    fn stderr_bounded_saturated_socket_skips_fast() {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        let (rfd, wfd) = (fds[0], fds[1]);
+        let flags = unsafe { libc::fcntl(wfd, libc::F_GETFL) };
+        unsafe {
+            libc::fcntl(wfd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let chunk = vec![0u8; 65536];
+        let mut saturated = false;
+        for _ in 0..128 {
+            let r = unsafe {
+                libc::send(
+                    wfd,
+                    chunk.as_ptr() as *const libc::c_void,
+                    chunk.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN) {
+                saturated = true;
+                break;
+            }
+            assert!(r > 0);
+        }
+        assert!(saturated, "socket never saturated: vacuous test");
+        let _guard = Fd2Guard::swap(wfd);
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let start = std::time::Instant::now();
+        let skipped = !crate::report::err_line_bounded("unseen-by-design", future);
+        let elapsed = start.elapsed();
+        drop(_guard);
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
+        }
+        assert!(skipped, "saturated socket must skip");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "bounded skip took {elapsed:?}"
+        );
+    }
+
+    /// S1: character-device stderr takes the private path:
+    /// `/dev/null` delivers, `/dev/full` fails fast (no hang,
+    /// no panic). Pins the fstat routing for the chr branch.
+    #[test]
+    fn stderr_bounded_char_devices() {
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+        assert!(null >= 0);
+        let full = unsafe { libc::open(c"/dev/full".as_ptr(), libc::O_WRONLY) };
+        assert!(full >= 0);
+        let null_guard = Fd2Guard::swap(null);
+        assert!(
+            crate::report::err_line_bounded("null-line", future),
+            "/dev/null must deliver"
+        );
+        drop(null_guard);
+        let full_guard = Fd2Guard::swap(full);
+        let start = std::time::Instant::now();
+        assert!(
+            !crate::report::err_line_bounded("full-line", future),
+            "/dev/full must fail fast"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "/dev/full write took {elapsed:?}",
+            elapsed = start.elapsed()
+        );
+        drop(full_guard);
+        unsafe {
+            libc::close(null);
+            libc::close(full);
+        }
     }
 
     /// S1: the detailed first-attach notice names the target pid
