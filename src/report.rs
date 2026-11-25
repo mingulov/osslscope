@@ -3432,17 +3432,34 @@ pub fn err_line(text: &str) {
     let _ = writeln!(locked, "{text}");
 }
 
-/// Bounded best-effort stderr line (S1): writes through a FRESH
-/// `O_NONBLOCK` description of fd 2 (reopened via `/proc/self/fd`),
-/// so no flag mutation can race other stderr users (`O_NONBLOCK`
-/// lives on the description, not the fd) and no lock wait can
-/// defeat the bound. Total waiting is capped well under
+/// Bounded best-effort stderr line (S1). Pipes (the only stderr
+/// kind whose small writes can stall) go through a FRESH
+/// `O_NONBLOCK` description of fd 2 (reopened via
+/// `/proc/self/fd`), so no flag mutation can race other stderr
+/// users and no lock wait can defeat the bound; pipes have no
+/// offsets, so the private description cannot clobber anything.
+/// All other fds take the classic shared-description path.
+/// Total waiting is capped well under
 /// `deadline` (`NOTICE_WAIT_MS`): past it the line is skipped,
 /// never forced. Returns whether the full line was written (a
 /// broken fd, a dead reader, or an expired deadline reads
-/// unwritable: skip, `false`). Short lines complete in one
-/// pipe-atomic write; concurrent writers can only reorder whole
-/// lines, never interleave bytes. Panic-free like [`err_line`].
+/// unwritable: skip, `false`). Panic-free like [`err_line`].
+
+/// Is fd 2 a FIFO (the only stderr kind whose small writes can
+/// stall)? Files, terminals, `/dev/null`, and closed/broken fds
+/// take the classic path below — only pipes need the private
+/// description, and pipes have no file offsets to clobber.
+fn stderr_is_fifo() -> bool {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `fstat` on fd 2 with a valid out-pointer.
+    if unsafe { libc::fstat(libc::STDERR_FILENO, st.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `fstat` succeeded, so the struct is initialized.
+    let st = unsafe { st.assume_init() };
+    (st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFIFO as u32
+}
+
 pub fn err_line_bounded(text: &str, deadline: std::time::Instant) -> bool {
     /// Max time spent waiting for a stalled stderr reader per
     /// call — one hostile-quantum-scale budget. The caller's
@@ -3452,6 +3469,14 @@ pub fn err_line_bounded(text: &str, deadline: std::time::Instant) -> bool {
     use std::os::unix::io::{FromRawFd as _, RawFd};
     if std::time::Instant::now() >= deadline {
         return false;
+    }
+    if !stderr_is_fifo() {
+        // Files, terminals, `/dev/null`: small writes never stall
+        // here, and the shared description preserves fd 2's offset
+        // exactly (a private description would start at 0 and
+        // clobber regular files, or race their offsets).
+        err_line(text);
+        return true;
     }
     let cap =
         deadline.min(std::time::Instant::now() + std::time::Duration::from_millis(NOTICE_WAIT_MS));

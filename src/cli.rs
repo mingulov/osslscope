@@ -748,6 +748,51 @@ mod preview_tests {
         );
     }
 
+    /// S1: file stderr keeps shared-description semantics —
+    /// interleaved bounded + plain writes land complete and
+    /// ordered (no offset-0 clobber, no stale-offset overwrite).
+    /// Swaps fd 2 onto a temp file for the writes only; a guard
+    /// restores it (panic-safe, single-threaded suite).
+    #[test]
+    fn stderr_bounded_file_stderr_appends_intact() {
+        use std::os::unix::io::{AsRawFd as _, RawFd};
+        struct Fd2Guard {
+            saved: RawFd,
+        }
+        impl Drop for Fd2Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::dup2(self.saved, libc::STDERR_FILENO);
+                    libc::close(self.saved);
+                }
+            }
+        }
+        let path = std::env::temp_dir().join(format!("bounded-file-{}", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(saved >= 0);
+        let _guard = Fd2Guard { saved };
+        assert_eq!(
+            unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) },
+            libc::STDERR_FILENO
+        );
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert!(crate::report::err_line_bounded("first", future));
+        crate::report::err_line("second");
+        assert!(crate::report::err_line_bounded("third", future));
+        drop(_guard);
+        drop(file);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(content, "first\nsecond\nthird\n");
+    }
+
     /// S1: the detailed first-attach notice names the target pid
     /// and window (audit text); the generic line is unchanged.
     #[test]
