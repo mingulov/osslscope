@@ -190,7 +190,7 @@ fn doctor_bare_human_ends_with_next_actions() {
     for needle in [
         "  next: ",
         "osslscope scan --pid <PID>",
-        "osslscope run -- <cmd>",
+        "osslscope report run -- <cmd>",
         "osslscope doctor --pid PID",
     ] {
         assert!(
@@ -198,6 +198,19 @@ fn doctor_bare_human_ends_with_next_actions() {
             "bare doctor lacks next-action '{needle}':\n{stdout}"
         );
     }
+    // Codex round 1: the advertised owned-workload route must
+    // actually dispatch (a string-only pin admitted a nonexistent
+    // `run` subcommand). A 1s owned `/bin/true` run proves the
+    // route parses and starts; any non-dispatch exit is fine.
+    let owned = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(["report", "--duration", "1", "run", "--", "/bin/true"])
+        .output()
+        .expect("run advertised owned route");
+    let owned_err = String::from_utf8_lossy(&owned.stderr);
+    assert!(
+        !owned_err.contains("unknown subcommand"),
+        "advertised route does not dispatch:\n{owned_err}"
+    );
     let json = doctor(&["--json"]);
     let text = String::from_utf8_lossy(&json.stdout);
     assert!(

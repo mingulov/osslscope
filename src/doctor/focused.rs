@@ -223,7 +223,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             }
             out.write_all(b"  next: try passive inventory: 'osslscope scan --pid <PID>'\n")?;
             out.write_all(
-                b"  next: owned workloads: 'osslscope run -- <cmd>' (needs the capabilities above)\n",
+                b"  next: owned workloads: 'osslscope report run -- <cmd>' (needs the capabilities above)\n",
             )?;
             out.write_all(
                 b"  next: foreign target: 'osslscope doctor --pid PID' (needs root/capable proof)\n",
