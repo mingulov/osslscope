@@ -969,13 +969,17 @@ fn t6_scanner_cross_line_states_hold() {
 fn t6_matcher_flags_and_skips_hold() {
     // F1-forward (codex R9): mid-line `mod tests {` promoted
     // by a consumed string-closer + block prefix must NOT
-    // open — the production unwrap is flagged.
+    // open — the production unwrap is flagged. Attr-adjacent
+    // shape (Tier-1 R7): `"a\` scans empty so `prev` stays
+    // the attribute — every opener conjunct except `src_col0`
+    // holds, isolating the gate (differentially verified:
+    // pre-fix misses, post-fix flags :5:).
     let v = t6_violations(
-        "macro_rules! w { ($h:literal mod $n:ident $b:block) => {}; }\nw!(\n\"a\\\nsecond\"/*c*/mod tests {\n}\n);\npub fn p() -> u8 {\nSome(1).unwrap()\n}\n",
+        "#[cfg(test)]\n\"a\\\nsecond\"/*c*/mod tests {\npub fn p() -> u8 {\nSome(1).unwrap()\n}\n",
         "synth.rs",
     );
     assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":8:") && v[0].contains(".unwrap("), "{v:?}");
+    assert!(v[0].contains(":5:") && v[0].contains(".unwrap("), "{v:?}");
     // F1-reverse (codex R9): a promoted mid-line `}` must NOT
     // close early — the test unwrap stays skipped. (The
     // macro's own braces stay indented: any SOURCE column-0
@@ -1049,6 +1053,7 @@ fn t6_matcher_flags_and_skips_hold() {
 /// - Patterns match the stateful scan, not the line (codex
 ///   R9-F2 / claude R1-F1): the stateless stripper misreads
 ///   quotes in chars, raws, blocks, and continuations.
+///
 /// No other known residual for rustfmt-formatted code.
 fn t6_violations(text: &str, rel: &str) -> Vec<String> {
     let mut violations = Vec::new();
