@@ -1283,14 +1283,15 @@ fn endpoint_is_loopback(endpoint: &str) -> bool {
 }
 
 /// S5: endpoint rendering for diagnostics — host[:port] only, no
-/// userinfo/path/query (credentials must never reach stderr),
-/// defensively length-capped.
+/// userinfo/path/query/fragment (credentials must never reach
+/// stderr), defensively length-capped. Cuts at `/`, `?`, AND `#`:
+/// a query/fragment without a slash still leaks otherwise.
 fn endpoint_display(endpoint: &str) -> String {
     let rest = endpoint
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(endpoint);
-    let authority = rest.split('/').next().unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host_port = authority.rsplit('@').next().unwrap_or("");
     const MAX: usize = 256;
     if host_port.len() > MAX {
@@ -1362,7 +1363,7 @@ pub fn serve_with_shutdown(
         Ok(p) => p,
         Err(e) => {
             let line = format!("osslscope: {e}");
-            eprintln!("{line}");
+            crate::report::err_line(&line);
             #[cfg(test)]
             if let Some(sink) = diagnostic_sink.as_ref() {
                 sink.lock().unwrap().push(line);
@@ -1374,7 +1375,7 @@ pub fn serve_with_shutdown(
         Ok(l) => l,
         Err(e) => {
             let line = format!("osslscope: listen {}: {e}", opts.listen);
-            eprintln!("{line}");
+            crate::report::err_line(&line);
             #[cfg(test)]
             if let Some(sink) = diagnostic_sink.as_ref() {
                 sink.lock().unwrap().push(line);
@@ -1384,7 +1385,7 @@ pub fn serve_with_shutdown(
     };
     if let Err(e) = listener.set_nonblocking(true) {
         let line = format!("osslscope: listen: {e}");
-        eprintln!("{line}");
+        crate::report::err_line(&line);
         #[cfg(test)]
         if let Some(sink) = diagnostic_sink.as_ref() {
             sink.lock().unwrap().push(line);
@@ -1451,7 +1452,7 @@ pub fn serve_with_shutdown(
                             let line = format!(
                                 "osslscope: refresh: checkpoint committed with residue: {r}"
                             );
-                            eprintln!("{line}");
+                            crate::report::err_line(&line);
                             #[cfg(test)]
                             if let Some(sink) = diagnostic_sink.as_ref() {
                                 sink.lock().unwrap().push(line);
@@ -1477,7 +1478,7 @@ pub fn serve_with_shutdown(
                         // frozen — never extrapolated, §6C-8;
                         // freshness advances at serve time).
                         let line = format!("osslscope: refresh: {e}");
-                        eprintln!("{line}");
+                        crate::report::err_line(&line);
                         #[cfg(test)]
                         if let Some(sink) = diagnostic_sink.as_ref() {
                             sink.lock().unwrap().push(line);
@@ -1597,7 +1598,7 @@ pub fn serve_with_shutdown(
     match shutdown {
         Err(e) => {
             let line = format!("osslscope: shutdown checkpoint flush failed: {e}");
-            eprintln!("{line}");
+            crate::report::err_line(&line);
             #[cfg(test)]
             if let Some(sink) = diagnostic_sink.as_ref() {
                 sink.lock().unwrap().push(line.clone());
@@ -1613,7 +1614,7 @@ pub fn serve_with_shutdown(
             for r in outcome.residue {
                 let line =
                     format!("osslscope: shutdown checkpoint flush committed with residue: {r}");
-                eprintln!("{line}");
+                crate::report::err_line(&line);
                 #[cfg(test)]
                 if let Some(sink) = diagnostic_sink.as_ref() {
                     sink.lock().unwrap().push(line.clone());
@@ -1704,6 +1705,15 @@ mod tests {
             "127.0.0.1:4318"
         );
         assert_eq!(endpoint_display("http://[::1]/x"), "[::1]");
+        // Tier-1 round 2: slash-less query/fragment must not leak.
+        assert_eq!(
+            endpoint_display("http://203.0.113.1:4318?token=DEMO"),
+            "203.0.113.1:4318"
+        );
+        assert_eq!(
+            endpoint_display("http://203.0.113.1:4318#frag"),
+            "203.0.113.1:4318"
+        );
         let long = format!("http://{}.example:1/x", "a".repeat(300));
         let shown = endpoint_display(&long);
         assert!(shown.len() <= 260 && shown.ends_with('\u{2026}'));
