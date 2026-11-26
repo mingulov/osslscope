@@ -875,14 +875,15 @@ fn t6_path_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
 
 /// True when `level[j..]` opens turbofish whose close is
 /// followed by another path segment: `expect::<u8>::Some`
-/// still continues the path (codex R16-F3). Requires an
-/// anchored, balanced angle suffix plus a joint `::`
-/// continuation — pure balance-counting with NO content
-/// rejections (codex R23: every rejected token was
-/// exhibited in compilable macro data, so any rejection
-/// here flags valid macro data as a terminal path).
-/// Joint `=>` and `->` count as balancing units (skipped,
-/// never closers — `->` since R16, `=>` since R23).
+/// still continues the path (codex R16-F3). Requires a
+/// caller-anchored, balanced angle suffix plus a joint
+/// `::` continuation — pure balance-counting with NO
+/// content rejections (codex R23: every rejected token
+/// was exhibited in compilable macro data, so any
+/// rejection here flags valid macro data as a terminal
+/// path). Spacing-blind `=>` and `->` count as balancing
+/// units (skipped, never closers — `->` since R16, `=>`
+/// since R23).
 /// Unbalanced turbofish, or turbofish followed by
 /// anything but a joint `::` segment (e.g. the paren
 /// call), returns false.
@@ -980,8 +981,8 @@ fn t6_float_chain_rooted(level: &[proc_macro2::TokenTree], k: usize) -> bool {
 ///   CONTINUATIONS need only a balanced angle suffix
 ///   plus a joint `::` segment — NO content rejections
 ///   (codex R23: balanced `<>` + `::` is the exhibited
-///   macro-data shape); joint `=>`/`->` are balancing
-///   units, never closers.
+///   macro-data shape); spacing-blind `=>`/`->` are
+///   balancing units, never closers.
 ///   Raw `r#…` spellings included — same names. Siblings
 ///   only — a triple split across a group boundary never
 ///   matches.
@@ -2148,10 +2149,11 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // Unbalanced fat arrow in a path continuation: loud.
-    // (The `=>` unit-skip leaves one angle pair whose
-    // close has no `::` follower — unbalanced, so the
-    // path is terminal. Preserved through codex R23.)
+    // Balanced-but-followerless fat arrow in a path
+    // continuation: loud. (The `=>` unit-skip leaves one
+    // angle pair whose close has no `::` follower, so the
+    // path is terminal — balanced, decided by the
+    // follower check. Preserved through codex R23.)
     let v = t6_violations(
         "pub fn p() {\n    let _ = crate::expect::<a => ::Assoc>;\n}\n",
         "synth.rs",
