@@ -8,16 +8,16 @@ algorithm or exact-build admission list on the normal path.
 
 v0.3.0 is published. The v0.4.0 automatic-observation state is published as a
 current-state alpha, with its finite installed qualification and known limits
-described in [the alpha notes](docs/release-v0.4.0.md). v0.7.0 is the
-current release (interim Phase 1+2 aggregate-only close-out; explicitly
-**not** the feature-complete milestone once planned under the v0.7
-number). The next release, v0.8.0, covers the fork-classifier fix,
-the audit remainder, observer hardening (sampling progress,
-measured coverage limits), the first-run journey, and flake
-gates; per-object pre-armed attach stays deferred to the later
-combined redesign, as does every item under "Beyond v0.7.0"
-below (assigning deferred items a version number remains an
-owner decision).
+described in [the alpha notes](docs/release-v0.4.0.md). v0.8.0 is the
+current release (robustness close-out over the interim v0.7.0:
+fork-classifier fix, audit remainder, observer hardening,
+first-run journey, flake gates). v0.7.0 was the interim Phase 1+2
+aggregate-only close-out; explicitly **not** the feature-complete
+milestone once planned under the v0.7 number. The next release
+after v0.8.0 is owner-decided; per-object pre-armed attach stays
+deferred to the later combined redesign, as does every item under
+"Beyond v0.7.0" below (assigning deferred items a version number
+remains an owner decision).
 The milestones below are planned capabilities, not claims about the current app,
 except where a status paragraph says otherwise.
 

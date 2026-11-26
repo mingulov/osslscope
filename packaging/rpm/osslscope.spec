@@ -95,6 +95,11 @@ exit 0
 /usr/share/doc/%{name}/
 
 %changelog
+* Thu Nov 26 2026 Denis Mingulov <denis@mingulov.com> - 0.8.0-1
+- 0.8.0 candidate package: robustness close-out over 0.7.0
+  (fork-aware discovery, guided first runs, inspect banking,
+  audit remainder, hardened CI audit); reports stay PARTIAL,
+  C023 OPEN, short-lived floor carried.
 * Tue Nov 24 2026 Denis Mingulov <denis@mingulov.com> - 0.7.0-1
 - 0.7.0 candidate package: interim Phase 1+2 aggregate-only close-out
   (expanded fetch evidence, focused per-window capture, service windows

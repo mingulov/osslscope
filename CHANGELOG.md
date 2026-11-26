@@ -1,6 +1,43 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
+## 0.8.0 (2026-11-26)
+
+- Robustness close-out over 0.7.0 (RnD): no new observation
+  surface — fork-aware discovery, guided first runs, inspect
+  robustness, the audit remainder, and a hardened CI audit.
+  Reports stay PARTIAL, algorithm checks stay inconclusive on
+  Unknown-only evidence, and no definite algorithm/provider
+  count or CBOM asset is claimed from normal runs.
+- Fork-aware discovery (R0): the fork classifier checks
+  `AWSLC_` before compat `BoringSSL_*` symbols, so real
+  AWS-LC (which exports both) no longer mislabels as
+  BoringSSL; plus a `bcm_`-only classifier cell.
+- Guided first runs (D48): bare `doctor` human output ends
+  with concrete next actions (owned `run --`, foreign
+  `--pid`), so an unprivileged first run is a guided
+  starting point; the owned-workload route is advertised
+  truthfully and pinned to parse to Spawn.
+- Inspect robustness (B1): overrunning procfs samples bank
+  before the deadline check, so completed parses warm the
+  cache under churn instead of being discarded; measured
+  coverage limits documented; error banking with precedence;
+  no fstat on the expired-error bank path.
+- Audit remainder: bare-doctor help points at sectioned
+  selectors; service help names exits; selector-less live
+  watch warns once on stderr (never refuses); export warns
+  on non-loopback endpoints (fail-closed); service-created
+  state is owner-private (0o600/0o700); bounded stderr
+  writer fixes (socket/char-device paths, FIFO-only private
+  fd); port/display validation; redaction hole closed.
+- Known limits carried (see README): short-lived external
+  processes have a 50–200 ms observation floor and there is
+  no pre-armed library mode (guest-witnessed, descoped to
+  the redesign track); latency/rate numbers stay
+  characterization-only (C023 OPEN); service trace serving
+  stays deferred; fetch/load/query evidence never means
+  execution.
+
 ## 0.7.0 (2026-11-24)
 
 - Interim v0.7.0: Phase 1+2 aggregate-only close-out over 0.6.0 — NOT the

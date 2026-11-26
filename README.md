@@ -7,12 +7,15 @@ for selected processes or automatically discovered watched scopes. Normal workfl
 need no enrolled library profile,
 manual offsets or application changes.
 
-**v0.7.0 RnD release (interim Phase 1+2 aggregate-only close-out).** Honest PARTIAL-only
+**v0.8.0 RnD release (robustness close-out over 0.7.0).** Honest PARTIAL-only
 observation on one declared lane (table below): short owned commands,
 warm processes and sampled watched scopes expose physical callback
-entries and separate public API activity. Reports stay PARTIAL,
-algorithm checks stay inconclusive on Unknown-only evidence, and no
-definite algorithm/provider count or CBOM asset is claimed. Start with
+entries and separate public API activity. New in this release:
+fork-aware discovery (AWS-LC vs BoringSSL), guided first runs,
+inspect robustness under churn, and the audit remainder. Reports
+stay PARTIAL, algorithm checks stay inconclusive on Unknown-only
+evidence, and no definite algorithm/provider count or CBOM asset
+is claimed. Start with
 the [quickstart](docs/quickstart.md). The [v0.4.0 alpha
 notes](docs/release-v0.4.0.md) and the [v0.3.0 release
 record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0)
@@ -20,7 +23,7 @@ retain their historical artifact-specific scope. This is not
 the feature-complete milestone once planned under the v0.7.0
 number; see the [roadmap](ROADMAP.md).
 
-## Support matrix (0.7.0 lane)
+## Support matrix (0.8.0 lane)
 
 | Requirement | Lane |
 | --- | --- |
@@ -167,7 +170,7 @@ sudo rm -rf /usr/local/bin/osslscope /usr/local/lib/osslscope /usr/local/share/o
 ```
 
 ```sh
-docker rmi osslscope:0.7.0
+docker rmi osslscope:0.8.0
 kubectl delete -f deploy/kubernetes/daemonset.yaml \
   -f deploy/kubernetes/job-report.yaml \
   -f deploy/kubernetes/configmap.yaml \
@@ -211,17 +214,19 @@ collision: `osslscope inspect` (process/module inventory) is unrelated
 to `docker inspect` (container config; used to verify
 `Privileged=false` and the cap set).
 
-## Known issues (0.7.0)
+## Known issues (0.8.0)
 
 Honest limits of this release; all planned for later work:
 
 - Unprivileged first runs see limited evidence (other users' processes
-  need privileges to inspect); run `--help` first, privileged runs where
-  the docs say so.
-- Short-lived external processes can be missed between discovery and
-  attach; results stay PARTIAL rather than invented.
-- No pre-armed library mode yet: you cannot enroll a library by
-  path/hash/build-id for instant attach (planned next).
+  need privileges to inspect); bare `doctor` now ends with concrete
+  next actions, privileged runs where the docs say so.
+- Short-lived external processes have a 50–200 ms observation floor
+  (guest-witnessed: immediately-exiting callers cannot have their
+  first call counted); results stay PARTIAL rather than invented.
+- No pre-armed library mode: you cannot enroll a library by
+  path/hash/build-id for instant attach (descoped to the redesign
+  track after the guest witness).
 - Latency/rate numbers are characterization-only (OPEN); `--trace`
   latency/status/all degrade to aggregate-only on every public path.
 - Service trace serving is deferred; a fresh service starts PARTIAL
@@ -229,7 +234,8 @@ Honest limits of this release; all planned for later work:
 - Fetch/load/query evidence never means execution: requesting an
   algorithm is not using it.
 - Known intermittent test/harness flakes (H5, SIGINT, drain, G3 attach,
-  w079) stay OPEN with cause unproved; batteries rerun them on record.
+  w079, sleep-child probe) stay OPEN with cause unproved; batteries
+  rerun them on record.
 
 ## License
 

@@ -1,11 +1,11 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Build from source
 
-Build the v0.7.0 automatic observation candidate for Linux x86-64 using pinned host/BPF
+Build the v0.8.0 automatic observation candidate for Linux x86-64 using pinned host/BPF
 toolchains and locked dependencies. Compilation and pure object preparation
 are separate from installed verifier/runtime qualification; see the
 [release qualification procedure](release-v0.4.0.md) (latest
-versioned qualification record file; 0.5.0/0.6.0/0.7.0 status lives in
+versioned qualification record file; 0.5.0/0.6.0/0.7.0/0.8.0 status lives in
 the [CHANGELOG](../CHANGELOG.md) and the README lane). The historical exact-profile
 diagnostic is selected only with `--libcrypto`.
 
