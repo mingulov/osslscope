@@ -1019,9 +1019,20 @@ fn t6_violations(text: &str, rel: &str) -> Vec<String> {
                 // leads to another segment, a braced import, or
                 // a glob — including through turbofish args
                 // (`expect::<u8>::Some`), which the balance
-                // scan looks past.
-                let continued =
-                    t6_path_continues(&level, k + 3) || t6_turbofish_continues(&level, k + 5);
+                // scan looks past. The turbofish arm is ANCHORED
+                // on the joint pair (Tier-1 R17-F1): without the
+                // anchor, a `<` five tokens later (e.g. a
+                // qualified path in the NEXT statement) would
+                // silence a real preceding call.
+                let joint_here = matches!(
+                    (level.get(k + 3), level.get(k + 4)),
+                    (Some(TokenTree::Punct(a)), Some(TokenTree::Punct(b)))
+                        if a.as_char() == ':'
+                            && a.spacing() == proc_macro2::Spacing::Joint
+                            && b.as_char() == ':'
+                );
+                let continued = t6_path_continues(&level, k + 3)
+                    || (joint_here && t6_turbofish_continues(&level, k + 5));
                 if joint_pair
                     && !continued
                     && (t6_ident_is(name, "unwrap") || t6_ident_is(name, "expect"))
@@ -1733,6 +1744,22 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
+    // Anchored turbofish scan (Tier-1 R17-F1): without the
+    // joint-pair anchor, the `<` of a qualified path in the
+    // NEXT statement sits exactly at k+5 and silences a real
+    // preceding call. Both must flag.
+    let v = t6_violations(
+        "pub fn p(v: Option<u8>) -> u8 {\n    Option::unwrap(v); <Vec<u8>>::new();\n    0\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:") && v[0].contains(".unwrap("), "{v:?}");
+    let v = t6_violations(
+        "pub fn p(v: Option<u8>) -> u8 {\n    Option::unwrap(v); <u8>::MAX;\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
 }
 
 #[test]
