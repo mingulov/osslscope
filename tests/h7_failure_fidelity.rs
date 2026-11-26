@@ -738,9 +738,10 @@ fn t6_call_follows(level: &[proc_macro2::TokenTree], j: usize) -> bool {
 
 /// True when `level[j..]` is balanced turbofish args plus the
 /// paren call: `<…>` (nesting counted over sibling puncts;
-/// `->` arrows don't count as closers; `;`/`@`/`|`/`#`/`.`
-/// and lone `:` preclude generic args) followed by `(`.
-/// Anything unbalanced or uncalled returns false.
+/// `->` arrows don't count as closers; denylisted puncts
+/// `;@|#.?%^/~` and lone `:` preclude generic args)
+/// followed by `(`. Anything unbalanced or uncalled
+/// returns false.
 fn t6_turbofish_call(level: &[proc_macro2::TokenTree], j: usize) -> bool {
     use proc_macro2::{Delimiter, TokenTree};
     if !matches!(level.get(j), Some(TokenTree::Punct(p)) if p.as_char() == '<') {
@@ -770,17 +771,26 @@ fn t6_turbofish_call(level: &[proc_macro2::TokenTree], j: usize) -> bool {
                 }
             }
             // Tokens impossible in generic args (codex R17-F2/R18-F2,
-            // Tier-1 R20-F1..F4): `;` (bare const exprs need
-            // braces), `@` (patterns need const blocks), `|`
+            // Tier-1 R20-F1..F4/R21-F1): `;` (bare const exprs
+            // need braces), `@` (patterns need const blocks), `|`
             // (bounds use `+`; closures/patterns grouped), `#`
             // (attrs never in args; raw idents lex whole), `.`
-            // (floats/chars lex whole; `a.b` is not a type).
-            // Each is macro data, never turbofish.
+            // (floats/chars lex whole; `a.b` is not a type),
+            // `?` (E0658 kills `?Trait` in objects; `?Sized`
+            // declaration-only), `%`/`^`/`/` (binops need
+            // const blocks), `~` (no unary `~`; `~const`
+            // declaration-only). Each is macro data, never
+            // turbofish.
             TokenTree::Punct(p) if p.as_char() == ';' => return false,
             TokenTree::Punct(p) if p.as_char() == '@' => return false,
             TokenTree::Punct(p) if p.as_char() == '|' => return false,
             TokenTree::Punct(p) if p.as_char() == '#' => return false,
             TokenTree::Punct(p) if p.as_char() == '.' => return false,
+            TokenTree::Punct(p) if p.as_char() == '?' => return false,
+            TokenTree::Punct(p) if p.as_char() == '%' => return false,
+            TokenTree::Punct(p) if p.as_char() == '^' => return false,
+            TokenTree::Punct(p) if p.as_char() == '/' => return false,
+            TokenTree::Punct(p) if p.as_char() == '~' => return false,
             TokenTree::Punct(p) if p.as_char() == ':' => {
                 // Lone `:` precludes generic args (Tier-1 R20-F4):
                 // joint `::` pairs (paths) are skipped, anything
@@ -823,11 +833,11 @@ fn t6_path_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
 /// True when `level[j..]` opens turbofish whose close is
 /// followed by another path segment: `expect::<u8>::Some`
 /// still continues the path (codex R16-F3). Balance-scans
-/// `<>` (`->` arrows don't count as closers; `;`/`@`/`|`/
-/// `#`/`.` and lone `:` preclude generic args, same rules
-/// as the call scan); unbalanced turbofish, or turbofish
-/// followed by anything but a joint `::` segment (e.g. the
-/// paren call), returns false.
+/// `<>` (`->` arrows don't count as closers; denylisted
+/// puncts `;@|#.?%^/~` and lone `:` preclude generic args,
+/// same rules as the call scan); unbalanced turbofish, or
+/// turbofish followed by anything but a joint `::` segment
+/// (e.g. the paren call), returns false.
 fn t6_turbofish_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
     use proc_macro2::TokenTree;
     if !matches!(level.get(j), Some(TokenTree::Punct(p)) if p.as_char() == '<') {
@@ -851,7 +861,7 @@ fn t6_turbofish_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
                 }
             }
             // Same impossible-token rules as the call scan
-            // (codex R17-F2/R18-F2, Tier-1 R20-F1..F4):
+            // (codex R17-F2/R18-F2, Tier-1 R20-F1..F4/R21-F1):
             // consistency between the two scanners; the loud
             // direction (flag) on rejected code.
             TokenTree::Punct(p) if p.as_char() == ';' => return false,
@@ -859,6 +869,11 @@ fn t6_turbofish_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
             TokenTree::Punct(p) if p.as_char() == '|' => return false,
             TokenTree::Punct(p) if p.as_char() == '#' => return false,
             TokenTree::Punct(p) if p.as_char() == '.' => return false,
+            TokenTree::Punct(p) if p.as_char() == '?' => return false,
+            TokenTree::Punct(p) if p.as_char() == '%' => return false,
+            TokenTree::Punct(p) if p.as_char() == '^' => return false,
+            TokenTree::Punct(p) if p.as_char() == '/' => return false,
+            TokenTree::Punct(p) if p.as_char() == '~' => return false,
             TokenTree::Punct(p) if p.as_char() == ':' => {
                 let pair = p.spacing() == proc_macro2::Spacing::Joint
                     && matches!(level.get(i + 1), Some(TokenTree::Punct(q)) if q.as_char() == ':');
@@ -915,11 +930,11 @@ fn t6_float_chain_rooted(level: &[proc_macro2::TokenTree], k: usize) -> bool {
 ///   call, hanging off tuple-field access (a standalone dot
 ///   or a chain of trailing-dot floats rooted at one; a
 ///   range's second dot never qualifies, wherever the chain
-///   bottoms out). Turbofish args must be `;`/`@`/`|`/`#`/
-///   `.`-free with no lone `:` (joint `::` pairs skipped),
-///   balanced, plus parens for calls. Raw `r#…` spellings
-///   included — same names. Siblings only — a triple split
-///   across a group boundary never matches.
+///   bottoms out). Turbofish args must be denylist-free
+///   (`;@|#.?%^/~`, no lone `:` — joint `::` pairs
+///   skipped), balanced, plus parens for calls. Raw `r#…`
+///   spellings included — same names. Siblings only — a
+///   triple split across a group boundary never matches.
 ///   Whitespace, comments, and line breaks between the
 ///   tokens are invisible (claude R4-M2). Reported with
 ///   the historical substring labels (`.unwrap(` etc.).
@@ -1992,6 +2007,76 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
+    // Bare `?` in turbofish (Tier-1 R21-F1): `?Trait` dead
+    // (E0658), `?Sized` declaration-only — macro data, silent.
+    let v = t6_violations(
+        "macro_rules! set {\n    ($record:ident . $name:ident :: < ? > $data:tt) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nset!(record.expect::<?>(\"x\"));\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // `?` in a path continuation: same rule — loud.
+    let v = t6_violations(
+        "pub fn p() {\n    let _ = crate::expect::<a ? b>::Assoc;\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Bare `%` in turbofish (Tier-1 R21-F1): binops need
+    // const blocks — macro data, silent.
+    let v = t6_violations(
+        "macro_rules! set {\n    ($record:ident . $name:ident :: < $a:ident $sep:tt $b:ident > $data:tt) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nset!(record.expect::<a % b>(\"x\"));\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // `%` in a path continuation: same rule — loud.
+    let v = t6_violations(
+        "pub fn p() {\n    let _ = crate::expect::<a % b>::Assoc;\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Bare `^` in turbofish (Tier-1 R21-F1): binops need
+    // const blocks — macro data, silent.
+    let v = t6_violations(
+        "macro_rules! set {\n    ($record:ident . $name:ident :: < $a:ident $sep:tt $b:ident > $data:tt) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nset!(record.expect::<a ^ b>(\"x\"));\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // `^` in a path continuation: same rule — loud.
+    let v = t6_violations(
+        "pub fn p() {\n    let _ = crate::expect::<a ^ b>::Assoc;\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Bare `/` in turbofish (Tier-1 R21-F1): binops need
+    // const blocks — macro data, silent.
+    let v = t6_violations(
+        "macro_rules! set {\n    ($record:ident . $name:ident :: < $a:ident $sep:tt $b:ident > $data:tt) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nset!(record.expect::<a / b>(\"x\"));\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // `/` in a path continuation: same rule — loud.
+    let v = t6_violations(
+        "pub fn p() {\n    let _ = crate::expect::<a / b>::Assoc;\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Bare `~` in turbofish (Tier-1 R21-F1): no unary `~`,
+    // `~const` declaration-only — macro data, silent.
+    let v = t6_violations(
+        "macro_rules! set {\n    ($record:ident . $name:ident :: < $a:ident $sep:tt $b:ident > $data:tt) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nset!(record.expect::<a ~ b>(\"x\"));\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // `~` in a path continuation: same rule — loud.
+    let v = t6_violations(
+        "pub fn p() {\n    let _ = crate::expect::<a ~ b>::Assoc;\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
 }
 
 #[test]
