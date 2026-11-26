@@ -648,6 +648,11 @@ fn h7_close_flow_never_questions_nor_discards() {
 // those ever need coverage, clippy restriction lints run
 // after expansion (`unwrap_used`, `expect_used`, `panic`,
 // `print_stderr` denied on these modules — post-stop).
+// `assert!` is deliberately out (claude R6): its 282 hits are
+// invariant checks, a different contract from error-path
+// panics — not an oversight. (`unreachable!`/`todo!`/
+// `unimplemented!` censused 2-test-skipped/0/0, kept out per
+// codex R14; revisit with the census if the contract grows.)
 //
 // After three rounds of hand-lexer desync classes (N1→C1→F1→
 // M1/M2/LRM, codex R12 + claude R4), the matcher works
@@ -655,12 +660,14 @@ fn h7_close_flow_never_questions_nor_discards() {
 // rustc's front-end agrees with — so there is no second
 // lexer to desync and no differential to keep. Patterns are
 // sibling token triples (`.` + `unwrap`/`expect` + paren
-// group; `panic`/`eprintln`/`eprint` + `!` + group; `::` +
-// `unwrap`/`expect`, call or fn-pointer), matched at every
-// nesting level; skips are top-level `#[cfg(test)] mod`
-// brace spans (half-open). Threat model: files that lex (an
-// unlexable file cannot compile, so it cannot ship); a lex
-// failure is a loud test error, never a silent pass.
+// group; `panic`/`eprintln`/`eprint` + `!` + group; joint
+// terminal `::` + `unwrap`/`expect`, call or fn-pointer;
+// trailing-dot float + `unwrap`/`expect` + paren group),
+// matched at every nesting level; skips are top-level
+// `#[cfg(test)] mod` brace spans (half-open). Threat model:
+// files that lex (an unlexable file cannot compile, so it
+// cannot ship); a lex failure is a loud test error, never
+// a silent pass.
 
 const T6_FILES: &[&str] = &[
     "src/report.rs",
@@ -715,8 +722,13 @@ fn t6_ident_is(ident: &proc_macro2::Ident, name: &str) -> bool {
 ///   level: `.` + `unwrap`/`expect` + paren group (the dot
 ///   must be standalone — a range's second dot never starts
 ///   a triple), `panic`/`eprintln`/`eprint` + `!` + group,
-///   or `::` + `unwrap`/`expect` with or without a call
-///   (path and fn-pointer forms). Raw `r#…` spellings
+///   `::` + `unwrap`/`expect` with or without a call (path
+///   and fn-pointer forms; the separator must be a joint
+///   pair with no preceding colon, and the name must be
+///   terminal — a following `::Ident` makes it a namespace
+///   segment), or float-literal-ending-in-dot +
+///   `unwrap`/`expect` + paren group (tuple-field access
+///   swallowed the dot at lex time). Raw `r#…` spellings
 ///   included — same names. Siblings only — a triple split
 ///   across a group boundary never matches.
 ///   Whitespace, comments, and line breaks between the
@@ -862,15 +874,64 @@ fn t6_violations(text: &str, rel: &str) -> Vec<String> {
             // without a group. Residual: a path call to a
             // same-named free function over-flags (no corpus
             // instance; excluding it needs name resolution).
+            // Refinements (codex R14): the separator must be
+            // a joint pair (rustc rejects `: :`), with no
+            // preceding colon (so `:::` can't supply a suffix
+            // pair), and the name must be terminal — a joint
+            // `::Ident` after it makes it a namespace segment
+            // (turbofish `::<>` preserves the call).
             if let (
                 Some(TokenTree::Punct(c1)),
                 Some(TokenTree::Punct(c2)),
                 Some(TokenTree::Ident(name)),
             ) = triple
             {
-                if c1.as_char() == ':'
+                let joint_pair = c1.as_char() == ':'
+                    && c1.spacing() == proc_macro2::Spacing::Joint
                     && c2.as_char() == ':'
+                    && (k == 0
+                        || !matches!(level.get(k - 1), Some(TokenTree::Punct(p)) if p.as_char() == ':'));
+                let continued = matches!(
+                    (level.get(k + 3), level.get(k + 4), level.get(k + 5)),
+                    (
+                        Some(TokenTree::Punct(a)),
+                        Some(TokenTree::Punct(b)),
+                        Some(TokenTree::Ident(_)),
+                    ) if a.as_char() == ':'
+                        && a.spacing() == proc_macro2::Spacing::Joint
+                        && b.as_char() == ':'
+                );
+                if joint_pair
+                    && !continued
                     && (t6_ident_is(name, "unwrap") || t6_ident_is(name, "expect"))
+                {
+                    let s = name.span().start();
+                    let pat = if t6_ident_is(name, "unwrap") {
+                        ".unwrap("
+                    } else {
+                        ".expect("
+                    };
+                    hits.push(((s.line, s.column), pat));
+                }
+            }
+            // Tuple-field float (claude R6-FL1): `x.1. unwrap`
+            // (space/comment/newline after the dot) lexes `1.`
+            // as one float literal in pm AND rustc (the parser
+            // splits it back into field access), swallowing the
+            // dot — match the literal directly, reported at the
+            // name. It can't over-flag: rustc only accepts
+            // trailing-dot-float + identifier as field access,
+            // and anything else is fail-closed noise on
+            // rejected code.
+            if let (
+                Some(TokenTree::Literal(lit)),
+                Some(TokenTree::Ident(name)),
+                Some(TokenTree::Group(args)),
+            ) = triple
+            {
+                if lit.to_string().ends_with('.')
+                    && (t6_ident_is(name, "unwrap") || t6_ident_is(name, "expect"))
+                    && args.delimiter() == Delimiter::Parenthesis
                 {
                     let s = name.span().start();
                     let pat = if t6_ident_is(name, "unwrap") {
@@ -1377,6 +1438,72 @@ fn t6_matcher_r12_token_rules_hold() {
     let v = t6_violations("pub fn p() {\nr#eprint!(\"boom\");\n}\n", "synth.rs");
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(v[0].contains(":2:"), "{v:?}");
+    // UFCS namespace segment (codex R14-F1): `expect` followed
+    // by `::Spec` is a qualifier, not a call — silent.
+    let v = t6_violations(
+        "pub mod expect {\n    pub struct Spec;\n}\n\npub fn spec() -> crate::expect::Spec {\n    expect::Spec\n}\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // UFCS triple colon (codex R14-F2): `:::` supplies no
+    // suffix pair — silent.
+    let v = t6_violations(
+        "macro_rules! flags {\n    ($key:ident :: : $value:ident) => {};\n}\n\nflags!(status:::expect);\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // UFCS spaced colons (codex R14-F2): `: :` is not a path
+    // separator — silent.
+    let v = t6_violations(
+        "macro_rules! flags {\n    ($key:ident : : $value:ident) => {};\n}\n\nflags!(status: : expect);\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // UFCS terminal turbofish: `::<>` after the name preserves
+    // the call (E0107 for std unwrap — synth-only shape that
+    // locks the terminal check from over-skipping).
+    let v = t6_violations(
+        "pub fn p(v: Option<u8>) -> u8 {\n    Option::unwrap::<u8>(v)\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // UFCS spaced separator: `Option :: unwrap ( v )` compiles
+    // (Tier-1 R14 probed) — the joint pair is what matters.
+    let v = t6_violations(
+        "pub fn p(v: Option<u8>) -> u8 {\n    Option :: unwrap ( v )\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Tuple-field float, spaced (claude R6-FL1): `1.` lexes as
+    // one float, swallowing the dot — matched literally.
+    let v = t6_violations(
+        "pub fn p(x: (u8, Option<u8>)) -> u8 {\n    x.1. unwrap()\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:") && v[0].contains(".unwrap("), "{v:?}");
+    // Tuple-field float, comment-split: same, with `/**/` where
+    // the dot was.
+    let v = t6_violations(
+        "pub fn p(x: (u8, Result<u8, String>)) -> u8 {\n    x.1./**/expect(\"m\")\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:") && v[0].contains(".expect("), "{v:?}");
+    // Tuple-field control: unspaced, the dot stays separate and
+    // the ordinary method rule fires.
+    let v = t6_violations(
+        "pub fn p(x: (u8, Option<u8>)) -> u8 {\n    x.1.unwrap()\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // `assert!` stays out (claude R6): deliberate invariant
+    // checks, a different contract — locked silent.
+    let v = t6_violations("pub fn p(x: bool) {\n    assert!(x);\n}\n", "synth.rs");
+    assert!(v.is_empty(), "{v:?}");
 }
 
 #[test]
