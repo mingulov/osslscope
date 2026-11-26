@@ -655,11 +655,12 @@ fn h7_close_flow_never_questions_nor_discards() {
 // rustc's front-end agrees with — so there is no second
 // lexer to desync and no differential to keep. Patterns are
 // sibling token triples (`.` + `unwrap`/`expect` + paren
-// group; `panic`/`eprintln` + `!` + group), matched at every
+// group; `panic`/`eprintln`/`eprint` + `!` + group; `::` +
+// `unwrap`/`expect`, call or fn-pointer), matched at every
 // nesting level; skips are top-level `#[cfg(test)] mod`
-// brace spans. Threat model: files that lex (an unlexable
-// file cannot compile, so it cannot ship); a lex failure is
-// a loud test error, never a silent pass.
+// brace spans (half-open). Threat model: files that lex (an
+// unlexable file cannot compile, so it cannot ship); a lex
+// failure is a loud test error, never a silent pass.
 
 const T6_FILES: &[&str] = &[
     "src/report.rs",
