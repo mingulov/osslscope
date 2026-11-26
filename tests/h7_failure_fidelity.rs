@@ -877,56 +877,95 @@ fn t6_path_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
 /// followed by another path segment: `expect::<u8>::Some`
 /// still continues the path (codex R16-F3). Requires a
 /// caller-anchored, balanced angle suffix plus a joint
-/// `::` continuation — pure balance-counting with NO
-/// content rejections (codex R23: every rejected token
-/// was exhibited in compilable macro data, so any
-/// rejection here flags valid macro data as a terminal
-/// path). Spacing-blind `=>` and `->` count as balancing
-/// units (skipped, never closers — `->` since R16, `=>`
-/// since R23).
+/// `::` continuation — balance-counting with NO content
+/// rejections (codex R23: every rejected token was
+/// exhibited in compilable macro data, so any rejection
+/// here flags valid macro data as a terminal path).
+/// Joint `=>` and `->` are balancing units (skipped,
+/// never closers); separated `= >` / `- >` may close or
+/// skip per interpretation (codex R24 — see below).
 /// Unbalanced turbofish, or turbofish followed by
 /// anything but a joint `::` segment (e.g. the paren
 /// call), returns false.
 fn t6_turbofish_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
     use proc_macro2::TokenTree;
+    use std::collections::BTreeSet;
     if !matches!(level.get(j), Some(TokenTree::Punct(p)) if p.as_char() == '<') {
         return false;
     }
     // NO content rejections here (codex R23) — DELIBERATE
-    // asymmetry with the call scan, applied uniformly
-    // (R22 established it for `<=`; R23 extends it to
-    // every rejected token on exhibited fixtures): a
-    // balanced `<>` followed by `::` is the
+    // asymmetry with the call scan, applied uniformly:
+    // a balanced `<>` followed by `::` is the
     // compilable-macro-data shape, and rejecting would
     // flag valid macro data as a terminal path. The call
     // side keeps all its rules (rejected `<>` + `(` is
     // never a continued path). Verdict polarity forces
     // the split: a rejection silences calls but LOUDENS
     // continuations.
-    let mut depth = 1u32;
+    //
+    // Arrow handling (codex R24): joint `=>` / `->` are
+    // unconditional units (a joint arrow is never a
+    // bracket). A SEPARATED `>` after `=` / `-` branches:
+    // it may close (when a balanced interpretation
+    // reaches the `::` follower through it) or skip (when
+    // closing would strand the scan). A greedy
+    // close-unless-breaking rule is WRONG here (it flags
+    // `<a <b = > (x)>(y)>::Assoc`, which is compilable
+    // macro data) — hence forward depth-reachability over
+    // a set of live depths (iterative, O(n·D), no
+    // recursion). A depth-0 transition needs the `::`
+    // follower or that path dies; any path reaching it
+    // returns true. Soundness: TRUE needs a concrete
+    // balanced + `::` parse, which real terminals and
+    // calls never admit.
+    let mut depths: BTreeSet<u32> = BTreeSet::from([1]);
     let mut i = j + 1;
     while let Some(tok) = level.get(i) {
+        let mut next: BTreeSet<u32> = BTreeSet::new();
         match tok {
-            TokenTree::Punct(p) if p.as_char() == '<' => depth += 1,
+            TokenTree::Punct(p) if p.as_char() == '<' => {
+                next.extend(depths.iter().map(|d| d + 1));
+            }
             TokenTree::Punct(p) if p.as_char() == '>' => {
-                // `=>` and `->` are balancing units (codex
-                // R23): skipped, never closers. (`->` since
-                // R16 — valid `fn() -> T` args; `=>` since
-                // R23 — match arms need blocks, so a `>`
-                // right after `=` opens nothing real.)
-                // Spacing-blind, like the old `->` rule.
-                let unit = matches!(
+                let joint_arrow = matches!(
                     level.get(i - 1),
-                    Some(TokenTree::Punct(q)) if q.as_char() == '=' || q.as_char() == '-'
+                    Some(TokenTree::Punct(q))
+                        if (q.as_char() == '=' || q.as_char() == '-')
+                            && q.spacing() == proc_macro2::Spacing::Joint
                 );
-                if !unit {
-                    depth -= 1;
-                    if depth == 0 {
-                        return t6_path_continues(level, i + 1);
+                let spaced_arrow = matches!(
+                    level.get(i - 1),
+                    Some(TokenTree::Punct(q))
+                        if (q.as_char() == '=' || q.as_char() == '-')
+                            && q.spacing() != proc_macro2::Spacing::Joint
+                );
+                for d in &depths {
+                    // Close branch (normal `>`, plus spaced
+                    // arrows that may close): depth 0 needs
+                    // the `::` follower or the path dies.
+                    if !joint_arrow {
+                        if *d == 1 {
+                            if t6_path_continues(level, i + 1) {
+                                return true;
+                            }
+                        } else {
+                            next.insert(d - 1);
+                        }
+                    }
+                    // Unit branch (joint forced, spaced
+                    // optional): keep the depth.
+                    if joint_arrow || spaced_arrow {
+                        next.insert(*d);
                     }
                 }
             }
-            _ => {}
+            _ => {
+                next.extend(depths.iter().copied());
+            }
+        }
+        depths = next;
+        if depths.is_empty() {
+            return false;
         }
         i += 1;
     }
@@ -981,8 +1020,10 @@ fn t6_float_chain_rooted(level: &[proc_macro2::TokenTree], k: usize) -> bool {
 ///   CONTINUATIONS need only a balanced angle suffix
 ///   plus a joint `::` segment — NO content rejections
 ///   (codex R23: balanced `<>` + `::` is the exhibited
-///   macro-data shape); spacing-blind `=>`/`->` are
-///   balancing units, never closers.
+///   macro-data shape); joint `=>`/`->` are balancing
+///   units while separated `= >`/`- >` may close or skip
+///   per interpretation (forward reachability, codex
+///   R24).
 ///   Raw `r#…` spellings included — same names. Siblings
 ///   only — a triple split across a group boundary never
 ///   matches.
@@ -2150,10 +2191,11 @@ fn t6_matcher_r12_token_rules_hold() {
     );
     assert!(v.is_empty(), "{v:?}");
     // Balanced-but-followerless fat arrow in a path
-    // continuation: loud. (The `=>` unit-skip leaves one
-    // angle pair whose close has no `::` follower, so the
-    // path is terminal — balanced, decided by the
-    // follower check. Preserved through codex R23.)
+    // continuation: loud. (The joint-`=>` unit-skip
+    // leaves one angle pair whose close has no `::`
+    // follower, so the path is terminal — balanced,
+    // decided by the follower check. Preserved through
+    // codex R24.)
     let v = t6_violations(
         "pub fn p() {\n    let _ = crate::expect::<a => ::Assoc>;\n}\n",
         "synth.rs",
@@ -2166,6 +2208,48 @@ fn t6_matcher_r12_token_rules_hold() {
     // silent. Codex bytes (compiles, const-only).
     let v = t6_violations(
         "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident => $target:tt > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<work => (worker)>::Assoc);\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Spaced arrows in a path continuation (codex R24):
+    // the first `= >` skips as a unit while the second
+    // `>` closes onto `::Assoc` — balanced + continued
+    // macro data, silent. Verbatim fixture (compiles
+    // lib+test, fmt-stable, const-only).
+    let v = t6_violations(
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident = > $target:tt $b:ident = > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<work = > (worker) tail = >::Assoc);\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Minimal spaced close (codex R24 simpler form):
+    // `= >` closes directly onto `::Assoc` — silent.
+    let v = t6_violations(
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident = > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<work = >::Assoc);\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Spaced skip then real close (codex R24 simpler
+    // form): the first `= >` skips (closing would strand
+    // on `(worker)`), the plain `>` closes — silent.
+    let v = t6_violations(
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident = > $target:tt > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<work = > (worker)>::Assoc);\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Greedy-killer (codex R24 design): a greedy
+    // close-unless-breaking rule flags this (the early
+    // close strands on `(y)`), but the skip-then-close
+    // interpretation continues — compilable macro data,
+    // silent. This pin forces the reachability design.
+    let v = t6_violations(
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident < $b:ident = > $x:tt > $y:tt > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a <b = > (x)>(y)>::Assoc);\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Spaced dash (codex R24 `- >` trade-off): same
+    // skip-or-close branching as `= >` — silent.
+    let v = t6_violations(
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $fn:ident $args:tt - > $ret:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<fn() - > u8>::Assoc);\n",
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
