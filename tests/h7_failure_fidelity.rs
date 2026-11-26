@@ -738,10 +738,10 @@ fn t6_call_follows(level: &[proc_macro2::TokenTree], j: usize) -> bool {
 
 /// True when `level[j..]` is balanced turbofish args plus the
 /// paren call: `<…>` (nesting counted over sibling puncts;
-/// `->` arrows don't count as closers; denylisted puncts
-/// `;@|#.?%^/~` and lone `:` preclude generic args)
-/// followed by `(`. Anything unbalanced or uncalled
-/// returns false.
+/// `->` arrows don't count as closers; denylisted puncts,
+/// `=>`, compounds, and `::` runs (see the match arms)
+/// preclude generic args) followed by `(`. Anything
+/// unbalanced or uncalled returns false.
 fn t6_turbofish_call(level: &[proc_macro2::TokenTree], j: usize) -> bool {
     use proc_macro2::{Delimiter, TokenTree};
     if !matches!(level.get(j), Some(TokenTree::Punct(p)) if p.as_char() == '<') {
@@ -755,6 +755,15 @@ fn t6_turbofish_call(level: &[proc_macro2::TokenTree], j: usize) -> bool {
         match tok {
             TokenTree::Punct(p) if p.as_char() == '<' => depth += 1,
             TokenTree::Punct(p) if p.as_char() == '>' => {
+                // Fat arrow (codex R20-F1): `=>` never closes —
+                // match arms need blocks. Contrast `->`, which
+                // must be skipped (valid `fn() -> T` args).
+                if matches!(
+                    level.get(i - 1),
+                    Some(TokenTree::Punct(q)) if q.as_char() == '='
+                ) {
+                    return false;
+                }
                 let arrow = matches!(
                     level.get(i - 1),
                     Some(TokenTree::Punct(q)) if q.as_char() == '-'
@@ -791,13 +800,29 @@ fn t6_turbofish_call(level: &[proc_macro2::TokenTree], j: usize) -> bool {
             TokenTree::Punct(p) if p.as_char() == '^' => return false,
             TokenTree::Punct(p) if p.as_char() == '/' => return false,
             TokenTree::Punct(p) if p.as_char() == '~' => return false,
+            // Compound comparisons/assignments preclude generic args
+            // (codex R20-F2): `==`/`!=`/`+=`/`-=`/`*=`/`&=` never
+            // appear ungrouped in turbofish (plain `=`/`!`/`+`/
+            // `-`/`*`/`&` preserved — bindings, never-type,
+            // bounds, unary minus, pointers).
+            TokenTree::Punct(p)
+                if matches!(p.as_char(), '=' | '!' | '+' | '-' | '*' | '&')
+                    && matches!(level.get(i + 1), Some(TokenTree::Punct(q)) if q.as_char() == '=') =>
+            {
+                return false;
+            }
             TokenTree::Punct(p) if p.as_char() == ':' => {
                 // Lone `:` precludes generic args (Tier-1 R20-F4):
                 // joint `::` pairs (paths) are skipped, anything
-                // else returns false.
+                // else returns false. A pair followed by another
+                // `:` is a run (`::::`), never a separator
+                // (codex R20-F2).
                 let pair = p.spacing() == proc_macro2::Spacing::Joint
                     && matches!(level.get(i + 1), Some(TokenTree::Punct(q)) if q.as_char() == ':');
                 if !pair {
+                    return false;
+                }
+                if matches!(level.get(i + 2), Some(TokenTree::Punct(q)) if q.as_char() == ':') {
                     return false;
                 }
                 i += 1; // consume the partner colon
@@ -834,10 +859,10 @@ fn t6_path_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
 /// followed by another path segment: `expect::<u8>::Some`
 /// still continues the path (codex R16-F3). Balance-scans
 /// `<>` (`->` arrows don't count as closers; denylisted
-/// puncts `;@|#.?%^/~` and lone `:` preclude generic args,
-/// same rules as the call scan); unbalanced turbofish, or
-/// turbofish followed by anything but a joint `::` segment
-/// (e.g. the paren call), returns false.
+/// puncts, `=>`, compounds, and `::` runs preclude generic
+/// args, same rules as the call scan); unbalanced
+/// turbofish, or turbofish followed by anything but a joint
+/// `::` segment (e.g. the paren call), returns false.
 fn t6_turbofish_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
     use proc_macro2::TokenTree;
     if !matches!(level.get(j), Some(TokenTree::Punct(p)) if p.as_char() == '<') {
@@ -849,6 +874,15 @@ fn t6_turbofish_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
         match tok {
             TokenTree::Punct(p) if p.as_char() == '<' => depth += 1,
             TokenTree::Punct(p) if p.as_char() == '>' => {
+                // Fat arrow (codex R20-F1): `=>` never closes —
+                // match arms need blocks. Contrast `->`, which
+                // must be skipped (valid `fn() -> T` args).
+                if matches!(
+                    level.get(i - 1),
+                    Some(TokenTree::Punct(q)) if q.as_char() == '='
+                ) {
+                    return false;
+                }
                 let arrow = matches!(
                     level.get(i - 1),
                     Some(TokenTree::Punct(q)) if q.as_char() == '-'
@@ -874,10 +908,21 @@ fn t6_turbofish_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
             TokenTree::Punct(p) if p.as_char() == '^' => return false,
             TokenTree::Punct(p) if p.as_char() == '/' => return false,
             TokenTree::Punct(p) if p.as_char() == '~' => return false,
+            // Same compound rule as the call scan (codex R20-F2).
+            TokenTree::Punct(p)
+                if matches!(p.as_char(), '=' | '!' | '+' | '-' | '*' | '&')
+                    && matches!(level.get(i + 1), Some(TokenTree::Punct(q)) if q.as_char() == '=') =>
+            {
+                return false;
+            }
             TokenTree::Punct(p) if p.as_char() == ':' => {
                 let pair = p.spacing() == proc_macro2::Spacing::Joint
                     && matches!(level.get(i + 1), Some(TokenTree::Punct(q)) if q.as_char() == ':');
                 if !pair {
+                    return false;
+                }
+                // Same run rule as the call scan (codex R20-F2).
+                if matches!(level.get(i + 2), Some(TokenTree::Punct(q)) if q.as_char() == ':') {
                     return false;
                 }
                 i += 1; // consume the partner colon
@@ -931,10 +976,11 @@ fn t6_float_chain_rooted(level: &[proc_macro2::TokenTree], k: usize) -> bool {
 ///   or a chain of trailing-dot floats rooted at one; a
 ///   range's second dot never qualifies, wherever the chain
 ///   bottoms out). Turbofish args must be denylist-free
-///   (`;@|#.?%^/~`, no lone `:` — joint `::` pairs
-///   skipped), balanced, plus parens for calls. Raw `r#…`
-///   spellings included — same names. Siblings only — a
-///   triple split across a group boundary never matches.
+///   (no lone `:`, `=>`, compounds, or `::` runs; joint
+///   `::` pairs skipped), balanced, plus parens for calls.
+///   Raw `r#…` spellings included — same names. Siblings
+///   only — a triple split across a group boundary never
+///   matches.
 ///   Whitespace, comments, and line breaks between the
 ///   tokens are invisible (claude R4-M2). Reported with
 ///   the historical substring labels (`.unwrap(` etc.).
@@ -2073,6 +2119,73 @@ fn t6_matcher_r12_token_rules_hold() {
     // `~` in a path continuation: same rule — loud.
     let v = t6_violations(
         "pub fn p() {\n    let _ = crate::expect::<a ~ b>::Assoc;\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Fat arrow in turbofish (codex R20-F1): `=>` is never a
+    // real closer (match arms need blocks) — macro data,
+    // silent. Contrast `->`, which must be skipped.
+    let v = t6_violations(
+        "macro_rules! route {\n    ($record:ident . $name:ident :: < $key:ident => $target:tt > $label:tt) => {\n        pub const QUEUE: &str = stringify!($key);\n    };\n}\n\nroute!(record.expect::<work => (worker)>(\"ready\"));\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Fat arrow in a path continuation: same rule — loud.
+    // (Shaped so the `::Assoc` follower would falsely skip
+    // without the rejection: an early close + `::` follower
+    // skips, so only the `=>` rejection keeps it loud.)
+    let v = t6_violations(
+        "pub fn p() {\n    let _ = crate::expect::<a => ::Assoc>;\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Compound `==` in turbofish (codex R20-F2): comparisons
+    // need const blocks — macro data, silent.
+    let v = t6_violations(
+        "macro_rules! set {\n    ($record:ident . $name:ident :: < $a:ident == $b:ident > $data:tt) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nset!(record.expect::<a == b>(\"x\"));\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // The other five compounds: same rule, same silence.
+    for op in ["!=", "+=", "-=", "*=", "&="] {
+        let text = format!(
+            "macro_rules! set {{\n    ($record:ident . $name:ident :: < $a:ident {op} $b:ident > $data:tt) => {{\n        pub const PAIR: u8 = 1;\n    }};\n}}\nset!(record.expect::<a {op} b>(\"x\"));\n"
+        );
+        let v = t6_violations(&text, "synth.rs");
+        assert!(v.is_empty(), "{op}: {v:?}");
+    }
+    // Compound in a path continuation: same rule — loud.
+    let v = t6_violations(
+        "pub fn p() {\n    let _ = crate::expect::<a == b>::Assoc;\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Colon run in turbofish (codex R20-F2): `::::` never
+    // separates — macro data, silent.
+    let v = t6_violations(
+        "macro_rules! m {\n    ($($t:tt)*) => {};\n}\nm!(v.expect::<a::::b>(x));\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Colon run in a path continuation: same rule — loud.
+    let v = t6_violations(
+        "pub fn p() {\n    let _ = crate::expect::<a::::b>::Assoc;\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Regression anchors: unary minus, bare-`>` comparison.
+    let v = t6_violations(
+        "pub fn p(v: Option<u8>) -> u8 {\n    v.expect::<-1>(v)\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    let v = t6_violations(
+        "pub fn p(v: Option<u8>) -> bool {\n    v.expect::<u8>() > Some(1)\n}\n",
         "synth.rs",
     );
     assert_eq!(v.len(), 1, "{v:?}");
