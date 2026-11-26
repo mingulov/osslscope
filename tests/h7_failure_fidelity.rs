@@ -738,7 +738,7 @@ fn t6_call_follows(level: &[proc_macro2::TokenTree], j: usize) -> bool {
 
 /// True when `level[j..]` is balanced turbofish args plus the
 /// paren call: `<…>` (nesting counted over sibling puncts;
-/// `->` arrows don't count as closers; a `;` precludes
+/// `->` arrows don't count as closers; `;`/`@` preclude
 /// generic args) followed by `(`. Anything unbalanced or
 /// uncalled returns false.
 fn t6_turbofish_call(level: &[proc_macro2::TokenTree], j: usize) -> bool {
@@ -771,7 +771,11 @@ fn t6_turbofish_call(level: &[proc_macro2::TokenTree], j: usize) -> bool {
             }
             // A semicolon precludes generic args (codex R17-F2):
             // `::<0; 1>` is macro data, never turbofish.
+            // So does `@` (codex R18-F2): patterns need const
+            // blocks (opaque groups), so ungrouped `@` never
+            // appears in real generic args.
             TokenTree::Punct(p) if p.as_char() == ';' => return false,
+            TokenTree::Punct(p) if p.as_char() == '@' => return false,
             _ => {}
         }
         i += 1;
@@ -803,10 +807,11 @@ fn t6_path_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
 /// True when `level[j..]` opens turbofish whose close is
 /// followed by another path segment: `expect::<u8>::Some`
 /// still continues the path (codex R16-F3). Balance-scans
-/// `<>` (`->` arrows don't count as closers; `;` precludes
-/// generic args, same rule as the call scan); unbalanced
-/// turbofish, or turbofish followed by anything but a joint
-/// `::` segment (e.g. the paren call), returns false.
+/// `<>` (`->` arrows don't count as closers; `;`/`@`
+/// preclude generic args, same rules as the call scan);
+/// unbalanced turbofish, or turbofish followed by anything
+/// but a joint `::` segment (e.g. the paren call), returns
+/// false.
 fn t6_turbofish_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
     use proc_macro2::TokenTree;
     if !matches!(level.get(j), Some(TokenTree::Punct(p)) if p.as_char() == '<') {
@@ -829,15 +834,39 @@ fn t6_turbofish_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
                     }
                 }
             }
-            // Same `;` rule as the call scan (codex R17-F2):
-            // consistency between the two scanners; the loud
-            // direction (flag) on rejected code.
+            // Same `;`/`@` rules as the call scan (codex
+            // R17-F2/R18-F2): consistency between the two
+            // scanners; the loud direction (flag) on rejected
+            // code.
             TokenTree::Punct(p) if p.as_char() == ';' => return false,
+            TokenTree::Punct(p) if p.as_char() == '@' => return false,
             _ => {}
         }
         i += 1;
     }
     false
+}
+
+/// True when the float at `level[k]` (k >= 1) hangs off
+/// tuple-field access: walking back through consecutive
+/// trailing-dot floats reaches a standalone `.` (codex
+/// R18-F1 — `0..1. 2.` chains bottom out at a range dot,
+/// never field access). A root dot at level start counts,
+/// mirroring the method gate (fail-closed; no compiling
+/// expression starts with `.`).
+fn t6_float_chain_rooted(level: &[proc_macro2::TokenTree], k: usize) -> bool {
+    use proc_macro2::TokenTree;
+    if k == 0 {
+        return false;
+    }
+    let mut j = k - 1;
+    while j > 0
+        && matches!(level.get(j), Some(TokenTree::Literal(l)) if l.to_string().ends_with('.'))
+    {
+        j -= 1;
+    }
+    matches!(level.get(j), Some(TokenTree::Punct(p)) if p.as_char() == '.')
+        && (j == 0 || !matches!(level.get(j - 1), Some(TokenTree::Punct(p)) if p.as_char() == '.'))
 }
 
 /// T6 matcher over one file's text: reports `rel:line: pat:
@@ -856,13 +885,13 @@ fn t6_turbofish_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
 ///   braced import, or a glob continues the path instead,
 ///   including through turbofish args), or
 ///   float-literal-ending-in-dot + `unwrap`/`expect` +
-///   call, hanging off a STANDALONE field-access dot or a
-///   chained trailing-dot float (tuple-field access
-///   swallowed the dot at lex time; a range's second dot
-///   never qualifies). Turbofish args must be `;`-free and
-///   balanced, plus parens for calls. Raw `r#…` spellings
-///   included — same names. Siblings only — a triple split
-///   across a group boundary never matches.
+///   call, hanging off tuple-field access (a standalone dot
+///   or a chain of trailing-dot floats rooted at one; a
+///   range's second dot never qualifies, wherever the chain
+///   bottoms out). Turbofish args must be `;`- and `@`-free
+///   and balanced, plus parens for calls. Raw `r#…`
+///   spellings included — same names. Siblings only — a
+///   triple split across a group boundary never matches.
 ///   Whitespace, comments, and line breaks between the
 ///   tokens are invisible (claude R4-M2). Reported with
 ///   the historical substring labels (`.unwrap(` etc.).
@@ -1067,18 +1096,13 @@ fn t6_violations(text: &str, rel: &str) -> Vec<String> {
             if let (Some(TokenTree::Literal(lit)), Some(TokenTree::Ident(name))) =
                 (level.get(k), level.get(k + 1))
             {
-                // Tuple-field context (codex R15-F2/R16-F2/R17-F1):
-                // the float must hang off a STANDALONE
-                // field-access dot — a range's second dot
-                // (`0..1.`) is not field access — or off another
-                // trailing-dot float (chained tuple selectors:
-                // `x.0. 0.`). Below k = 2 no receiver can
-                // precede (macro data or E0599), never a
-                // compiling call.
-                let field_dot = k >= 2
-                    && (matches!(level.get(k - 1), Some(TokenTree::Punct(p)) if p.as_char() == '.')
-                        && !matches!(level.get(k - 2), Some(TokenTree::Punct(p)) if p.as_char() == '.')
-                        || matches!(level.get(k - 1), Some(TokenTree::Literal(l)) if l.to_string().ends_with('.')));
+                // Tuple-field context (codex R15-F2/R16-F2/R17-F1/
+                // R18-F1): the float must hang off tuple-field
+                // access — a standalone dot, or a chain of
+                // trailing-dot floats rooted at one
+                // (`x.0. 0.`); range-seeded chains (`0..1. 2.`)
+                // and receiver-less floats never qualify.
+                let field_dot = t6_float_chain_rooted(&level, k);
                 if lit.to_string().ends_with('.')
                     && field_dot
                     && (t6_ident_is(name, "unwrap") || t6_ident_is(name, "expect"))
@@ -1806,6 +1830,47 @@ fn t6_matcher_r12_token_rules_hold() {
     // scans (consistency) — flags loud on rejected code.
     let v = t6_violations(
         "pub fn p() {\n    let _ = crate::expect::<0; 1>::Assoc;\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Range-seeded chain (codex R18-F1): the float chain
+    // bottoms out at a range dot, not field access — silent.
+    let v = t6_violations(
+        "macro_rules! limit {\n    ($lo:literal .. $hi:literal $scale:literal $tag:ident $label:tt) => {\n        pub const BOUNDS: (u8, f64, f64) = ($lo, $hi, $scale);\n    };\n}\n\nlimit! { 0..1. 2. expect(\"allowed\") }\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Inclusive-range seed: the walk ends at `=`, not a dot.
+    let v = t6_violations(
+        "pub fn p() {\n    m!(0..=1. 2. expect(\"x\"));\n}\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Dot-less seed: the walk ends at an ident, not a dot.
+    let v = t6_violations(
+        "pub fn p() {\n    m!(x 1. 2. expect(\"x\"));\n}\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Level-start root dot: allowed, mirroring the method
+    // gate (fail-closed soup noise; no compiling expression
+    // starts with `.`).
+    let v = t6_violations("pub fn p() {\n    m!(. 1. 2. unwrap());\n}\n", "synth.rs");
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // At-sign turbofish data (codex R18-F2): ungrouped `@`
+    // precludes generic args (patterns need const blocks) —
+    // macro data, silent.
+    let v = t6_violations(
+        "macro_rules! set {\n    ($record:ident . $name:ident :: < $lo:literal @ $hi:literal > $data:tt) => {\n        pub const BOUNDS: (u8, u8) = ($lo, $hi);\n    };\n}\n\nset!(record.expect::<0 @ 1>(\"healthy\"));\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // At-sign in a path continuation: same `@` rule in both
+    // scans (consistency) — flags loud on rejected code.
+    let v = t6_violations(
+        "pub fn p() {\n    let _ = crate::expect::<0 @ 1>::Assoc;\n}\n",
         "synth.rs",
     );
     assert_eq!(v.len(), 1, "{v:?}");
