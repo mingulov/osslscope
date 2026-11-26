@@ -634,11 +634,20 @@ fn h7_close_flow_never_questions_nor_discards() {
 // --- T6: CLI-surface panic audit (token-based, D120) ------------------------
 // Every CLI error-path print goes through the panic-free sink
 // helper; production code in the CLI-surface files carries no
-// `eprintln!`, `panic!`, `expect(`, or `unwrap(`. (`println!` to
-// stdout is out of scope: stdout-EPIPE while piping artifacts is a
-// documented residual with Unix-philosophy questions, not a
-// diagnostic path. Engine-internal `eprintln!` warnings outside
-// these files are likewise out of scope — reviewed, not converted.)
+// `eprintln!`, `eprint!`, `panic!`, `expect(`, or `unwrap(`,
+// in method, macro, or path (`Option::unwrap`) form.
+// (`println!` to stdout is out of scope: stdout-EPIPE while
+// piping artifacts is a documented residual with
+// Unix-philosophy questions, not a diagnostic path.
+// Engine-internal `eprintln!` warnings outside these files are
+// likewise out of scope — reviewed, not converted.)
+// Scope is WRITTEN call sites (claude R5): macro-built calls
+// (`call!(v, unwrap)` expanding to `$v.$m()`) and renamed
+// imports (`use std::panic as boom`) need macro expansion or
+// name resolution — neither tokens nor syn provide them. If
+// those ever need coverage, clippy restriction lints run
+// after expansion (`unwrap_used`, `expect_used`, `panic`,
+// `print_stderr` denied on these modules — post-stop).
 //
 // After three rounds of hand-lexer desync classes (N1→C1→F1→
 // M1/M2/LRM, codex R12 + claude R4), the matcher works
@@ -702,10 +711,13 @@ fn t6_ident_is(ident: &proc_macro2::Ident, name: &str) -> bool {
 /// skipping top-level `#[cfg(test)] mod` bodies by span.
 /// Rules:
 /// - Patterns are sibling token triples at any nesting
-///   level: `.` + `unwrap`/`expect` + paren group, or
-///   `panic`/`eprintln` + `!` + group (raw `r#…` spellings
-///   included — same names). Siblings only — a triple
-///   split across a group boundary never matches.
+///   level: `.` + `unwrap`/`expect` + paren group (the dot
+///   must be standalone — a range's second dot never starts
+///   a triple), `panic`/`eprintln`/`eprint` + `!` + group,
+///   or `::` + `unwrap`/`expect` with or without a call
+///   (path and fn-pointer forms). Raw `r#…` spellings
+///   included — same names. Siblings only — a triple split
+///   across a group boundary never matches.
 ///   Whitespace, comments, and line breaks between the
 ///   tokens are invisible (claude R4-M2). Reported with
 ///   the historical substring labels (`.unwrap(` etc.).
@@ -715,9 +727,11 @@ fn t6_ident_is(ident: &proc_macro2::Ident, name: &str) -> bool {
 ///   governance). Inner `#![…]` attrs never govern. The
 ///   brace group's span is the skip — no opener/closer
 ///   heuristics, no column or depth gates, no trivia
-///   sensitivity. A pattern occurrence inside a skip span
-///   (by token position, not by line) is silent; code on
-///   the closer's own line still flags (span-precise).
+///   sensitivity. Spans are half-open: the closer's own end
+///   position is outside, so an invocation glued to `}`
+///   flags. A pattern occurrence inside a skip span (by
+///   token position, not by line) is silent; code on the
+///   closer's own line still flags (span-precise).
 /// - Structure inside groups (macro input, fn bodies) is
 ///   scanned for patterns but never opens a skip
 ///   (fail-closed, codex R10-F3/R12). `mod name;` opens
@@ -799,7 +813,14 @@ fn t6_violations(text: &str, rel: &str) -> Vec<String> {
                 Some(TokenTree::Group(args)),
             ) = triple
             {
+                // Standalone dot (codex R13-F2): the second dot
+                // of a range (`..unwrap()`) must not start a
+                // triple — the previous sibling decides, not
+                // spacing (spaced ranges lex Alone too).
+                let standalone = k == 0
+                    || !matches!(level.get(k - 1), Some(TokenTree::Punct(p)) if p.as_char() == '.');
                 if dot.as_char() == '.'
+                    && standalone
                     && (t6_ident_is(name, "unwrap") || t6_ident_is(name, "expect"))
                     && args.delimiter() == Delimiter::Parenthesis
                 {
@@ -818,14 +839,43 @@ fn t6_violations(text: &str, rel: &str) -> Vec<String> {
                 Some(TokenTree::Group(_)),
             ) = triple
             {
-                if (t6_ident_is(name, "panic") || t6_ident_is(name, "eprintln"))
+                if (t6_ident_is(name, "panic")
+                    || t6_ident_is(name, "eprintln")
+                    || t6_ident_is(name, "eprint"))
                     && bang.as_char() == '!'
                 {
                     let s = name.span().start();
                     let pat = if t6_ident_is(name, "panic") {
                         "panic!"
-                    } else {
+                    } else if t6_ident_is(name, "eprintln") {
                         "eprintln!"
+                    } else {
+                        "eprint!"
+                    };
+                    hits.push(((s.line, s.column), pat));
+                }
+            }
+            // Path calls (claude R5-U1): `Option::unwrap(v)`
+            // and the fn-pointer form `Option::unwrap` (no
+            // call follows) panic the same way — flag with or
+            // without a group. Residual: a path call to a
+            // same-named free function over-flags (no corpus
+            // instance; excluding it needs name resolution).
+            if let (
+                Some(TokenTree::Punct(c1)),
+                Some(TokenTree::Punct(c2)),
+                Some(TokenTree::Ident(name)),
+            ) = triple
+            {
+                if c1.as_char() == ':'
+                    && c2.as_char() == ':'
+                    && (t6_ident_is(name, "unwrap") || t6_ident_is(name, "expect"))
+                {
+                    let s = name.span().start();
+                    let pat = if t6_ident_is(name, "unwrap") {
+                        ".unwrap("
+                    } else {
+                        ".expect("
                     };
                     hits.push(((s.line, s.column), pat));
                 }
@@ -839,9 +889,12 @@ fn t6_violations(text: &str, rel: &str) -> Vec<String> {
     hits.sort();
     let mut violations = Vec::new();
     for ((line, col), pat) in hits {
+        // Half-open spans (codex R13-F1): `span_close().end()`
+        // is exclusive (one past `}`), so an invocation glued
+        // to the closer (`}panic!()`) sits outside the skip.
         let inside = skips
             .iter()
-            .any(|(s, e)| *s <= (line, col) && (line, col) <= *e);
+            .any(|(s, e)| *s <= (line, col) && (line, col) < *e);
         if !inside {
             let code = lines
                 .get(line - 1)
@@ -1254,6 +1307,75 @@ fn t6_matcher_r12_token_rules_hold() {
     let v = t6_violations("pub fn p() {\nr#eprintln!(\"oops\");\n}\n", "synth.rs");
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(v[0].contains(":2:") && v[0].contains("eprintln!"), "{v:?}");
+    // Adjacent-after-close (codex R13-F1): `span_close().end()`
+    // is exclusive — an invocation glued to `}` sits outside
+    // the skip and flags. (The `abort!` inside the macro
+    // definition is not a pattern name — stays silent.)
+    let v = t6_violations(
+        "use core::panic as abort;\n\nmacro_rules! panic {\n    () => {\n        pub fn production() {\n            abort!(\"boom\");\n        }\n    };\n}\n\n#[cfg(test)]\nmod tests {}panic!();\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":12:") && v[0].contains("panic!"), "{v:?}");
+    // Range dot (codex R13-F2): the second dot of `..` never
+    // starts a triple — the freestanding call stays silent.
+    let v = t6_violations(
+        "fn unwrap() -> u8 {\n    1\n}\n\npub fn production() -> std::ops::RangeTo<u8> {\n    .. /* end bound */ unwrap()\n}\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Range no-overcorrection: a REAL method call after a
+    // range (`0..x.unwrap()` parses as `0..(x.unwrap())`)
+    // still flags — only the range's own dot is excluded.
+    let v = t6_violations(
+        "pub fn p(x: Option<u8>) -> u8 {\nlet _r = 0..x.unwrap();\n0\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Path calls (claude R5-U1): `Option::unwrap(v)` panics
+    // like the method — flags (reported at the name).
+    let v = t6_violations(
+        "pub(crate) fn probe_ufcs(v: Option<u8>) -> u8 {\n    Option::unwrap(v)\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:") && v[0].contains(".unwrap("), "{v:?}");
+    let v = t6_violations(
+        "pub(crate) fn probe_ufcsr(r: Result<u8, String>) -> u8 {\n    Result::expect(r, \"boom\")\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:") && v[0].contains(".expect("), "{v:?}");
+    // Fn-pointer form: no call follows, still the panic fn.
+    let v = t6_violations(
+        "pub(crate) fn probe_fnptr(v: Vec<Option<u8>>) -> Vec<u8> {\n    v.into_iter().map(Option::unwrap).collect()\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Qualified path: turbofish receiver doesn't hide it.
+    let v = t6_violations(
+        "pub fn p(v: Option<u8>) -> u8 {\n    <Option<u8>>::unwrap(v)\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Path no-overreach: `unwrap_or_clone` is one ident, not
+    // `unwrap` (locks the live corpus instance silent).
+    let v = t6_violations(
+        "pub fn p(x: std::sync::Arc<u8>) -> u8 {\n    std::sync::Arc::unwrap_or_clone(x)\n}\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // `eprint!` (claude R5): the same stderr diagnostic path
+    // as `eprintln!` — flags (corpus census: zero hits).
+    let v = t6_violations("pub fn p() {\neprint!(\"boom\\n\");\n}\n", "synth.rs");
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:") && v[0].contains("eprint!"), "{v:?}");
+    let v = t6_violations("pub fn p() {\nr#eprint!(\"boom\");\n}\n", "synth.rs");
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
 }
 
 #[test]
