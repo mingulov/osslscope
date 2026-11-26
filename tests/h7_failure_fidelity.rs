@@ -875,85 +875,55 @@ fn t6_path_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
 
 /// True when `level[j..]` opens turbofish whose close is
 /// followed by another path segment: `expect::<u8>::Some`
-/// still continues the path (codex R16-F3). Balance-scans
-/// `<>` (`->` arrows don't count as closers; denylisted
-/// puncts, `=>`, compounds, and `::` runs preclude
-/// generic args, same rules as the call scan — but NO
-/// `<=`/`<<=` rules: balanced `<>` + `::` is the
-/// compilable-macro-data shape, codex R22); unbalanced
-/// turbofish, or turbofish followed by anything but a joint
-/// `::` segment (e.g. the paren call), returns false.
+/// still continues the path (codex R16-F3). Requires an
+/// anchored, balanced angle suffix plus a joint `::`
+/// continuation — pure balance-counting with NO content
+/// rejections (codex R23: every rejected token was
+/// exhibited in compilable macro data, so any rejection
+/// here flags valid macro data as a terminal path).
+/// Joint `=>` and `->` count as balancing units (skipped,
+/// never closers — `->` since R16, `=>` since R23).
+/// Unbalanced turbofish, or turbofish followed by
+/// anything but a joint `::` segment (e.g. the paren
+/// call), returns false.
 fn t6_turbofish_continues(level: &[proc_macro2::TokenTree], j: usize) -> bool {
     use proc_macro2::TokenTree;
     if !matches!(level.get(j), Some(TokenTree::Punct(p)) if p.as_char() == '<') {
         return false;
     }
-    // NO `<=` / `<<=` rules here (codex R22) — DELIBERATE
-    // asymmetry with the call scan: a balanced `<>`
-    // followed by `::` is the compilable-macro-data shape
-    // (exhibited fixture), and rejecting would flag valid
-    // macro data as a terminal path. The call side keeps
-    // its rules (rejected `<>` + `(` is never a continued
-    // path). Verdict polarity forces the split: a
-    // rejection silences calls but LOUDENS continuations.
+    // NO content rejections here (codex R23) — DELIBERATE
+    // asymmetry with the call scan, applied uniformly
+    // (R22 established it for `<=`; R23 extends it to
+    // every rejected token on exhibited fixtures): a
+    // balanced `<>` followed by `::` is the
+    // compilable-macro-data shape, and rejecting would
+    // flag valid macro data as a terminal path. The call
+    // side keeps all its rules (rejected `<>` + `(` is
+    // never a continued path). Verdict polarity forces
+    // the split: a rejection silences calls but LOUDENS
+    // continuations.
     let mut depth = 1u32;
     let mut i = j + 1;
     while let Some(tok) = level.get(i) {
         match tok {
             TokenTree::Punct(p) if p.as_char() == '<' => depth += 1,
             TokenTree::Punct(p) if p.as_char() == '>' => {
-                // Fat arrow (codex R20-F1): `=>` never closes —
-                // match arms need blocks. Contrast `->`, which
-                // must be skipped (valid `fn() -> T` args).
-                if matches!(
+                // `=>` and `->` are balancing units (codex
+                // R23): skipped, never closers. (`->` since
+                // R16 — valid `fn() -> T` args; `=>` since
+                // R23 — match arms need blocks, so a `>`
+                // right after `=` opens nothing real.)
+                // Spacing-blind, like the old `->` rule.
+                let unit = matches!(
                     level.get(i - 1),
-                    Some(TokenTree::Punct(q)) if q.as_char() == '='
-                ) {
-                    return false;
-                }
-                let arrow = matches!(
-                    level.get(i - 1),
-                    Some(TokenTree::Punct(q)) if q.as_char() == '-'
+                    Some(TokenTree::Punct(q)) if q.as_char() == '=' || q.as_char() == '-'
                 );
-                if !arrow {
+                if !unit {
                     depth -= 1;
                     if depth == 0 {
                         return t6_path_continues(level, i + 1);
                     }
                 }
-            }
-            // Same impossible-token rules as the call scan
-            // (codex R17-F2/R18-F2, Tier-1 R20-F1..F4/R21-F1):
-            // consistency between the two scanners; the loud
-            // direction (flag) on rejected code.
-            TokenTree::Punct(p) if p.as_char() == ';' => return false,
-            TokenTree::Punct(p) if p.as_char() == '@' => return false,
-            TokenTree::Punct(p) if p.as_char() == '|' => return false,
-            TokenTree::Punct(p) if p.as_char() == '#' => return false,
-            TokenTree::Punct(p) if p.as_char() == '.' => return false,
-            TokenTree::Punct(p) if p.as_char() == '?' => return false,
-            TokenTree::Punct(p) if p.as_char() == '%' => return false,
-            TokenTree::Punct(p) if p.as_char() == '^' => return false,
-            TokenTree::Punct(p) if p.as_char() == '/' => return false,
-            TokenTree::Punct(p) if p.as_char() == '~' => return false,
-            // Same compound rule as the call scan (codex R20-F2).
-            TokenTree::Punct(p)
-                if matches!(p.as_char(), '=' | '!' | '+' | '-' | '*' | '&')
-                    && matches!(level.get(i + 1), Some(TokenTree::Punct(q)) if q.as_char() == '=') =>
-            {
-                return false;
-            }
-            TokenTree::Punct(p) if p.as_char() == ':' => {
-                let pair = p.spacing() == proc_macro2::Spacing::Joint
-                    && matches!(level.get(i + 1), Some(TokenTree::Punct(q)) if q.as_char() == ':');
-                if !pair {
-                    return false;
-                }
-                // Same run rule as the call scan (codex R20-F2).
-                if matches!(level.get(i + 2), Some(TokenTree::Punct(q)) if q.as_char() == ':') {
-                    return false;
-                }
-                i += 1; // consume the partner colon
             }
             _ => {}
         }
@@ -1003,13 +973,15 @@ fn t6_float_chain_rooted(level: &[proc_macro2::TokenTree], k: usize) -> bool {
 ///   call, hanging off tuple-field access (a standalone dot
 ///   or a chain of trailing-dot floats rooted at one; a
 ///   range's second dot never qualifies, wherever the chain
-///   bottoms out). Turbofish args must be denylist-free
-///   (no `;@|#.?%^/~`, lone `:`, `=>`, compounds, or
-///   `::` runs — plus no `<=`/`<<=` openers on the
-///   call side only (codex R22: the continues side
-///   balance-throughs them, macro-data shape); joint
-///   `::` pairs skipped), balanced, plus parens for
-///   calls.
+///   bottoms out). Turbofish CALLS need denylist-free
+///   args (no `;@|#.?%^/~`, lone `:`, `=>`, compounds,
+///   `::` runs, or `<=`/`<<=` openers; joint `::` pairs
+///   skipped), balanced, plus parens. Turbofish
+///   CONTINUATIONS need only a balanced angle suffix
+///   plus a joint `::` segment — NO content rejections
+///   (codex R23: balanced `<>` + `::` is the exhibited
+///   macro-data shape); joint `=>`/`->` are balancing
+///   units, never closers.
 ///   Raw `r#…` spellings included — same names. Siblings
 ///   only — a triple split across a group boundary never
 ///   matches.
@@ -1947,14 +1919,16 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // Semicolon in a path continuation: same `;` rule in both
-    // scans (consistency) — flags loud on rejected code.
+    // Semicolon in a path continuation (codex R23):
+    // balanced `<>` + `::` is compilable macro data —
+    // silent. (Replaces the R17 loud pin: the call side
+    // keeps rejecting `;`, the continues side no longer
+    // does — exhibited compilable fixture.)
     let v = t6_violations(
-        "pub fn p() {\n    let _ = crate::expect::<0; 1>::Assoc;\n}\n",
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident ; $b:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a ; b>::Assoc);\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":2:"), "{v:?}");
+    assert!(v.is_empty(), "{v:?}");
     // Range-seeded chain (codex R18-F1): the float chain
     // bottoms out at a range dot, not field access — silent.
     let v = t6_violations(
@@ -1988,14 +1962,15 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // At-sign in a path continuation: same `@` rule in both
-    // scans (consistency) — flags loud on rejected code.
+    // At-sign in a path continuation (codex R23):
+    // balanced `<>` + `::` is compilable macro data —
+    // silent. (Replaces the R18 loud pin: exhibited
+    // compilable fixture; the call side still rejects.)
     let v = t6_violations(
-        "pub fn p() {\n    let _ = crate::expect::<0 @ 1>::Assoc;\n}\n",
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident @ $b:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a @ b>::Assoc);\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":2:"), "{v:?}");
+    assert!(v.is_empty(), "{v:?}");
     // Bare pipe in turbofish (Tier-1 R20-F1): bounds use `+`,
     // closures/patterns need groups — macro data, silent.
     let v = t6_violations(
@@ -2003,13 +1978,14 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // Pipe in a path continuation: same rule — loud.
+    // Pipe in a path continuation (codex R23): balanced
+    // `<>` + `::` is compilable macro data — silent.
+    // (Replaces the R20 loud pin: exhibited fixture.)
     let v = t6_violations(
-        "pub fn p() {\n    let _ = crate::expect::<a | b>::Assoc;\n}\n",
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident | $b:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a | b>::Assoc);\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":2:"), "{v:?}");
+    assert!(v.is_empty(), "{v:?}");
     // Bare hash in turbofish (Tier-1 R20-F2): attrs never in
     // args — macro data, silent.
     let v = t6_violations(
@@ -2017,13 +1993,14 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // Hash in a path continuation: same rule — loud.
+    // Hash in a path continuation (codex R23): balanced
+    // `<>` + `::` is compilable macro data — silent.
+    // (Replaces the R20 loud pin: exhibited fixture.)
     let v = t6_violations(
-        "pub fn p() {\n    let _ = crate::expect::<a # b>::Assoc;\n}\n",
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident # $b:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a # b>::Assoc);\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":2:"), "{v:?}");
+    assert!(v.is_empty(), "{v:?}");
     // Dotted key in turbofish (Tier-1 R20-F3): `a.b` is not a
     // type — macro data, silent.
     let v = t6_violations(
@@ -2038,13 +2015,14 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // Dot in a path continuation: same rule — loud.
+    // Dot in a path continuation (codex R23): balanced
+    // `<>` + `::` is compilable macro data — silent.
+    // (Replaces the R20 loud pin: exhibited fixture.)
     let v = t6_violations(
-        "pub fn p() {\n    let _ = crate::expect::<a.b>::Assoc;\n}\n",
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident . $b:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a . b>::Assoc);\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":2:"), "{v:?}");
+    assert!(v.is_empty(), "{v:?}");
     // Lone colon in turbofish (Tier-1 R20-F4): `a : b` is not
     // a path — macro data, silent.
     let v = t6_violations(
@@ -2052,13 +2030,15 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // Lone colon in a path continuation: same rule — loud.
+    // Lone colon in a path continuation (codex R23):
+    // balanced `<>` + `::` is compilable macro data —
+    // silent. (Replaces the R20 loud pin: exhibited
+    // fixture, rustfmt-canonical `<a: b>` spacing.)
     let v = t6_violations(
-        "pub fn p() {\n    let _ = crate::expect::<a : b>::Assoc;\n}\n",
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident: $b:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a: b>::Assoc);\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":2:"), "{v:?}");
+    assert!(v.is_empty(), "{v:?}");
     // Regression anchors: paths, fragments, and dyn bindings
     // inside turbofish keep flagging.
     let v = t6_violations(
@@ -2092,13 +2072,14 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // `?` in a path continuation: same rule — loud.
+    // `?` in a path continuation (codex R23): balanced
+    // `<>` + `::` is compilable macro data — silent.
+    // (Replaces the R21 loud pin: exhibited fixture.)
     let v = t6_violations(
-        "pub fn p() {\n    let _ = crate::expect::<a ? b>::Assoc;\n}\n",
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident ? $b:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a ? b>::Assoc);\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":2:"), "{v:?}");
+    assert!(v.is_empty(), "{v:?}");
     // Bare `%` in turbofish (Tier-1 R21-F1): binops need
     // const blocks — macro data, silent.
     let v = t6_violations(
@@ -2106,13 +2087,14 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // `%` in a path continuation: same rule — loud.
+    // `%` in a path continuation (codex R23): balanced
+    // `<>` + `::` is compilable macro data — silent.
+    // (Replaces the R21 loud pin: exhibited fixture.)
     let v = t6_violations(
-        "pub fn p() {\n    let _ = crate::expect::<a % b>::Assoc;\n}\n",
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident % $b:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a % b>::Assoc);\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":2:"), "{v:?}");
+    assert!(v.is_empty(), "{v:?}");
     // Bare `^` in turbofish (Tier-1 R21-F1): binops need
     // const blocks — macro data, silent.
     let v = t6_violations(
@@ -2120,13 +2102,14 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // `^` in a path continuation: same rule — loud.
+    // `^` in a path continuation (codex R23): balanced
+    // `<>` + `::` is compilable macro data — silent.
+    // (Replaces the R21 loud pin: exhibited fixture.)
     let v = t6_violations(
-        "pub fn p() {\n    let _ = crate::expect::<a ^ b>::Assoc;\n}\n",
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident ^ $b:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a ^ b>::Assoc);\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":2:"), "{v:?}");
+    assert!(v.is_empty(), "{v:?}");
     // Bare `/` in turbofish (Tier-1 R21-F1): binops need
     // const blocks — macro data, silent.
     let v = t6_violations(
@@ -2134,13 +2117,14 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // `/` in a path continuation: same rule — loud.
+    // `/` in a path continuation (codex R23): balanced
+    // `<>` + `::` is compilable macro data — silent.
+    // (Replaces the R21 loud pin: exhibited fixture.)
     let v = t6_violations(
-        "pub fn p() {\n    let _ = crate::expect::<a / b>::Assoc;\n}\n",
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident / $b:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a / b>::Assoc);\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":2:"), "{v:?}");
+    assert!(v.is_empty(), "{v:?}");
     // Bare `~` in turbofish (Tier-1 R21-F1): no unary `~`,
     // `~const` declaration-only — macro data, silent.
     let v = t6_violations(
@@ -2148,13 +2132,14 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // `~` in a path continuation: same rule — loud.
+    // `~` in a path continuation (codex R23): balanced
+    // `<>` + `::` is compilable macro data — silent.
+    // (Replaces the R21 loud pin: exhibited fixture.)
     let v = t6_violations(
-        "pub fn p() {\n    let _ = crate::expect::<a ~ b>::Assoc;\n}\n",
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident ~ $b:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a ~ b>::Assoc);\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":2:"), "{v:?}");
+    assert!(v.is_empty(), "{v:?}");
     // Fat arrow in turbofish (codex R20-F1): `=>` is never a
     // real closer (match arms need blocks) — macro data,
     // silent. Contrast `->`, which must be skipped.
@@ -2163,16 +2148,25 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // Fat arrow in a path continuation: same rule — loud.
-    // (Shaped so the `::Assoc` follower would falsely skip
-    // without the rejection: an early close + `::` follower
-    // skips, so only the `=>` rejection keeps it loud.)
+    // Unbalanced fat arrow in a path continuation: loud.
+    // (The `=>` unit-skip leaves one angle pair whose
+    // close has no `::` follower — unbalanced, so the
+    // path is terminal. Preserved through codex R23.)
     let v = t6_violations(
         "pub fn p() {\n    let _ = crate::expect::<a => ::Assoc>;\n}\n",
         "synth.rs",
     );
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(v[0].contains(":2:"), "{v:?}");
+    // Balanced fat arrow in a path continuation (codex
+    // R23): the actual closing `>` follows `(worker)`,
+    // then `::Assoc` — balanced + continued macro data,
+    // silent. Codex bytes (compiles, const-only).
+    let v = t6_violations(
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident => $target:tt > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<work => (worker)>::Assoc);\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
     // Compound `==` in turbofish (codex R20-F2): comparisons
     // need const blocks — macro data, silent.
     let v = t6_violations(
@@ -2188,13 +2182,24 @@ fn t6_matcher_r12_token_rules_hold() {
         let v = t6_violations(&text, "synth.rs");
         assert!(v.is_empty(), "{op}: {v:?}");
     }
-    // Compound in a path continuation: same rule — loud.
+    // Compound in a path continuation (codex R23):
+    // balanced `<>` + `::` is compilable macro data —
+    // silent. Verbatim fixture (compiles lib+test,
+    // fmt-stable, const-only). Replaces the R20 loud pin.
     let v = t6_violations(
-        "pub fn p() {\n    let _ = crate::expect::<a == b>::Assoc;\n}\n",
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident == $b:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a == b>::Assoc);\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":2:"), "{v:?}");
+    assert!(v.is_empty(), "{v:?}");
+    // The other five compounds in continuations: same
+    // rule, same silence (codex R23 exhibited all six).
+    for op in ["!=", "+=", "-=", "*=", "&="] {
+        let text = format!(
+            "macro_rules! marker {{\n    ($scope:ident :: $key:ident :: < $a:ident {op} $b:ident > :: $tag:ident) => {{\n        pub const PAIR: u8 = 1;\n    }};\n}}\nmarker!(crate::expect::<a {op} b>::Assoc);\n"
+        );
+        let v = t6_violations(&text, "synth.rs");
+        assert!(v.is_empty(), "{op}: {v:?}");
+    }
     // Colon run in turbofish (codex R20-F2): `::::` never
     // separates — macro data, silent.
     let v = t6_violations(
@@ -2202,13 +2207,16 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
-    // Colon run in a path continuation: same rule — loud.
+    // Colon run in a path continuation (codex R23):
+    // balanced `<>` + `::` is compilable macro data —
+    // silent. Codex bytes (matcher `:: ::` matches
+    // invocation `::::`; compiles, const-only). Replaces
+    // the R20 loud pin.
     let v = t6_violations(
-        "pub fn p() {\n    let _ = crate::expect::<a::::b>::Assoc;\n}\n",
+        "macro_rules! marker {\n    ($scope:ident :: $key:ident :: < $a:ident :: :: $b:ident > :: $tag:ident) => {\n        pub const PAIR: u8 = 1;\n    };\n}\nmarker!(crate::expect::<a ::::b>::Assoc);\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":2:"), "{v:?}");
+    assert!(v.is_empty(), "{v:?}");
     // Regression anchors: unary minus, bare-`>` comparison.
     let v = t6_violations(
         "pub fn p(v: Option<u8>) -> u8 {\n    v.expect::<-1>(v)\n}\n",
