@@ -261,6 +261,7 @@ dependencies = [
  "libc",
  "ossl-bpf-sys",
  "osslscope-ebpf-common",
+ "proc-macro2",
  "serde",
  "serde_json",
  "sha2",

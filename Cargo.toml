@@ -36,6 +36,9 @@ toml = { version = "=0.8.23", default-features = false, features = ["parse"] }
 aya-obj = "=0.3.0"
 # T02: protocol tests decode the discovery wire ABI directly.
 osslscope-ebpf-common = { path = "crates/ebpf-common" }
+# H7-T6 differential: the audit's hand lexer is checked against
+# proc-macro2 tokenization (span-locations for line numbers).
+proc-macro2 = { version = "1", features = ["span-locations"] }
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }

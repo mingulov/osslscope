@@ -669,23 +669,33 @@ fn raw_closer_end(ch: &[char], i: usize, hashes: u32) -> Option<usize> {
     if h == hashes { Some(k) } else { None }
 }
 
-/// If `ch[i..]` opens a raw or byte string, return `(end,
-/// raw_cont, str_cont)`: `end` is the index just past the
-/// same-line closer (or EOL); `raw_cont` is `Some(hashes)`
-/// when a multi-line `r#*"` runs past EOL; `str_cont` is true
-/// when a `b"…"` runs past EOL (a `\` continuation — the
-/// caller carries it like a regular string). `None` when
-/// `ch[i]` starts no string.
+/// If `ch[i..]` opens a string literal with a prefix
+/// (`r…`/`r#*…#*`, `b…`/`br#*…#*`, `c…`/`cr#*…#*`),
+/// return `(end, raw_cont, str_cont)`: `end` is the index
+/// just past the same-line closer (or EOL); `raw_cont` is
+/// `Some(hashes)` when a multi-line raw runs past EOL;
+/// `str_cont` is true when a cooked `b…`/`c…` runs past
+/// EOL (a continuation — the caller carries it like a
+/// regular string). `None` when `ch[i]` starts no string
+/// (plain ident like `return`/`break`/`const`, or doubled
+/// markers like `bc`/`cb` which are never prefixes).
 fn skip_raw(ch: &[char], i: usize) -> Option<(usize, Option<u32>, bool)> {
     let n = ch.len();
     let mut j = i;
-    if ch[j] == 'b' {
+    // At most one kind marker (b/c); a second marker letter
+    // means ident (`bc…`, `cb…`, `bb…`, `cc…`).
+    if ch[j] == 'b' || ch[j] == 'c' {
         j += 1;
+        if j < n && (ch[j] == 'b' || ch[j] == 'c') {
+            return None;
+        }
     }
-    let has_r = j < n && ch[j] == 'r';
-    if has_r {
+    // Optional raw `r` (`r`, `br`, `cr`).
+    let mut has_r = false;
+    if j < n && ch[j] == 'r' {
+        has_r = true;
         j += 1;
-    } else if ch[i] != 'b' {
+    } else if ch[i] != 'b' && ch[i] != 'c' {
         return None;
     }
     let mut hashes = 0u32;
@@ -718,6 +728,20 @@ fn skip_raw(ch: &[char], i: usize) -> Option<(usize, Option<u32>, bool)> {
     } else {
         Some((n, None, true))
     }
+}
+
+/// Consume an already-tokenized literal suffix: ident
+/// characters following a just-closed literal are emitted
+/// unexamined — re-examining them as raw openers (e.g. the
+/// `r` in `r#"a"#r"b"`) desyncs the scanner. Suffix content
+/// is inert (no spaces, quotes, delimiters, or dots), so
+/// emitting cannot forge a boundary or pattern.
+fn skip_suffix(ch: &[char], mut i: usize, out: &mut String) -> usize {
+    while i < ch.len() && (ch[i].is_alphanumeric() || ch[i] == '_' || !ch[i].is_ascii()) {
+        out.push(ch[i]);
+        i += 1;
+    }
+    i
 }
 
 /// If `ch[i]` opens a char literal, return the index just
@@ -832,18 +856,20 @@ fn strip_block_scan(
             }
             continue;
         }
-        // Raw/byte strings open only at a token start (claude
+        // Prefixed strings open only at a token start (claude
         // R2-N1): after alnum/`_` (numeric suffix like `1r`),
         // a quote (literal suffix like `"a"r`), or a tick
         // (char suffix / lifetime like `'c'r`), the letter is
-        // emitted as code. Real prefixes always follow an
-        // operator, delimiter, or whitespace.
+        // emitted as code. Real prefixes (`r`, `b`, `br`,
+        // `c`, `cr` — the last two are C strings (claude
+        // R3-C1)) always follow an operator, delimiter, or
+        // whitespace.
         let at_token_start = i == 0
             || !(ch[i - 1].is_alphanumeric()
                 || ch[i - 1] == '_'
                 || ch[i - 1] == '"'
                 || ch[i - 1] == '\'');
-        if (c == 'r' || c == 'b')
+        if (c == 'r' || c == 'b' || c == 'c')
             && at_token_start
             && let Some((end, raw_cont, str_cont)) = skip_raw(&ch, i)
         {
@@ -854,6 +880,9 @@ fn strip_block_scan(
             i = end;
             *raw = raw_cont;
             *in_str = str_cont;
+            if raw_cont.is_none() && !str_cont {
+                i = skip_suffix(&ch, i, &mut out);
+            }
             continue;
         }
         if c == '\''
@@ -863,7 +892,7 @@ fn strip_block_scan(
                 prefix_skipped = true;
                 prefix_stringy = true;
             }
-            i = end;
+            i = skip_suffix(&ch, end, &mut out);
             continue;
         }
         if c == '"' {
@@ -887,6 +916,9 @@ fn strip_block_scan(
             }
             *in_str = !closed;
             i = k.min(n);
+            if closed {
+                i = skip_suffix(&ch, i, &mut out);
+            }
             continue;
         }
         if c == '/' && i + 1 < n && ch[i + 1] == '/' {
@@ -1136,6 +1168,149 @@ fn t6_matcher_r10_rules_hold() {
     );
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(v[0].contains(":4:"), "{v:?}");
+    // Raw C strings (claude R3-C1): `cr` opens raw (no
+    // escapes, stable Rust, no macro needed) — the
+    // production unwrap flags.
+    let v = t6_violations(
+        "pub fn p(x: Option<u8>) -> u8 {\nlet _s = cr\"\\\";\nlet v = x.unwrap();\nlet _q = '\"';\nv\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":3:"), "{v:?}");
+    // Hashed raw C string: same, with `#` armor.
+    let v = t6_violations(
+        "pub fn p(x: Option<u8>) -> u8 {\nlet _s = cr#\"\\\"#;\nlet v = x.unwrap();\nlet _q = '\"';\nv\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":3:"), "{v:?}");
+    // Cooked C string control: escapes apply; flags too
+    // (locks the non-raw path).
+    let v = t6_violations(
+        "pub fn p(x: Option<u8>) -> u8 {\nlet _s = c\"\\\\\";\nlet v = x.unwrap();\nlet _q = '\"';\nv\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":3:"), "{v:?}");
+}
+
+/// T6 lexer differential (claude R2): the hand scanner's
+/// code-vs-literal classification must agree with
+/// proc-macro2 tokenization on every T6 line, delimiter by
+/// delimiter. Any lexing desync (missed raw/continuation/
+/// char boundary) moves delimiters between code and literal
+/// content, which fails loudly here instead of hiding
+/// production violations silently. This pins LEXING parity;
+/// matcher rules (open/close/attr/depth) are pinned by the
+/// t6_matcher_* tests. Literals contribute nothing on either
+/// side (leaves there, skipped here); comments are absent
+/// there and removed here.
+#[test]
+fn t6_lexer_matches_proc_macro2() {
+    use proc_macro2::{Delimiter, TokenTree};
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
+
+    fn is_doc_group(g: &proc_macro2::Group) -> bool {
+        // Desugared `///`/`//!` docs surface as `#[doc …]`
+        // groups, which the scanner (correctly) strips as
+        // comments — skip them so both sides agree. A
+        // written `#[doc …]` is indistinguishable here, so
+        // the file loop below guards against one landing.
+        if g.delimiter() != Delimiter::Bracket {
+            return false;
+        }
+        let mut inner = g.stream().into_iter();
+        matches!(inner.next(), Some(TokenTree::Ident(id)) if id == "doc")
+    }
+
+    fn pm_delims(
+        stream: proc_macro2::TokenStream,
+        out: &mut BTreeMap<usize, BTreeMap<char, usize>>,
+    ) {
+        for tt in stream {
+            match tt {
+                TokenTree::Group(g) => {
+                    if is_doc_group(&g) {
+                        continue;
+                    }
+                    match g.delimiter() {
+                        Delimiter::Parenthesis => {
+                            bump(out, g.span_open().start().line, '(');
+                            bump(out, g.span_close().start().line, ')');
+                        }
+                        Delimiter::Brace => {
+                            bump(out, g.span_open().start().line, '{');
+                            bump(out, g.span_close().start().line, '}');
+                        }
+                        Delimiter::Bracket => {
+                            bump(out, g.span_open().start().line, '[');
+                            bump(out, g.span_close().start().line, ']');
+                        }
+                        Delimiter::None => {}
+                    }
+                    pm_delims(g.stream(), out);
+                }
+                TokenTree::Punct(p) => {
+                    let c = p.as_char();
+                    if "()[]{}".contains(c) {
+                        bump(out, p.span().start().line, c);
+                    }
+                }
+                TokenTree::Ident(_) | TokenTree::Literal(_) => {}
+            }
+        }
+    }
+
+    fn bump(out: &mut BTreeMap<usize, BTreeMap<char, usize>>, line: usize, c: char) {
+        *out.entry(line).or_default().entry(c).or_insert(0) += 1;
+    }
+
+    fn has_written_doc_attr(text: &str) -> bool {
+        // `#[doc` + non-ident char (so `#[document…]` stays OK).
+        text.match_indices("#[doc").any(|(i, _)| {
+            text[i + "#[doc".len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        })
+    }
+
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for rel in T6_FILES {
+        let text = std::fs::read_to_string(root.join(rel)).unwrap();
+        // Written `#[doc …]` is indistinguishable from desugared
+        // `///` in the stream but scanned as code — fail loudly
+        // if one ever lands instead of silently diverging.
+        assert!(
+            !has_written_doc_attr(&text),
+            "{rel}: written #[doc …] needs differential handling"
+        );
+        let stream = proc_macro2::TokenStream::from_str(&text)
+            .unwrap_or_else(|e| panic!("{rel} lexes cleanly: {e}"));
+        let mut pm: BTreeMap<usize, BTreeMap<char, usize>> = BTreeMap::new();
+        pm_delims(stream, &mut pm);
+        let mut mine: BTreeMap<usize, BTreeMap<char, usize>> = BTreeMap::new();
+        let mut block_depth = 0u32;
+        let mut in_raw = None;
+        let mut in_str = false;
+        for (i, line) in text.lines().enumerate() {
+            let (scan, _, _) = strip_block_scan(line, &mut block_depth, &mut in_raw, &mut in_str);
+            for c in scan.chars().filter(|c| "()[]{}".contains(*c)) {
+                bump(&mut mine, i + 1, c);
+            }
+        }
+        let mut lines: Vec<usize> = pm.keys().chain(mine.keys()).copied().collect();
+        lines.sort_unstable();
+        lines.dedup();
+        for ln in lines {
+            assert_eq!(
+                pm.get(&ln),
+                mine.get(&ln),
+                "{rel}:{ln}: proc-macro2 vs scanner delimiter mismatch"
+            );
+        }
+    }
 }
 
 /// T6 matcher over one file's text: skips test-module
