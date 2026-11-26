@@ -1192,18 +1192,39 @@ fn t6_matcher_r10_rules_hold() {
     );
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(v[0].contains(":3:"), "{v:?}");
+    // Delimiter-neutral desync (Tier-1 R10-F1): a scanner
+    // that misreads L2's raw `cr"\"` as cooked enters
+    // `in_str`, closes at L3's open quote, and emits the
+    // literal interior as code — the per-line delimiter
+    // multisets still agree (interior parens swap sides
+    // with the group parens) and L4's comment quote
+    // resolves the desync delimiter-free, so the
+    // proc-macro2 differential below stays green while
+    // `.unwrap(` hides. This class is locked HERE, at
+    // matcher level: the production unwrap must flag.
+    let v = t6_violations(
+        "pub fn p() {\nlet _s = cr\"\\\";\nv.unwrap(\"x(y)z\");\n// \" resolve\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":3:"), "{v:?}");
 }
 
 /// T6 lexer differential (claude R2): the hand scanner's
-/// code-vs-literal classification must agree with
+/// code-vs-literal classification is cross-checked against
 /// proc-macro2 tokenization on every T6 line, delimiter by
-/// delimiter. Any lexing desync (missed raw/continuation/
-/// char boundary) moves delimiters between code and literal
+/// delimiter. Most lexing desyncs (missed raw/continuation/
+/// char boundary) move delimiters between code and literal
 /// content, which fails loudly here instead of hiding
-/// production violations silently. This pins LEXING parity;
-/// matcher rules (open/close/attr/depth) are pinned by the
-/// t6_matcher_* tests. Literals contribute nothing on either
-/// side (leaves there, skipped here); comments are absent
+/// production violations silently. This is a TRIPWIRE, not
+/// a parity proof: a delimiter-NEUTRAL desync (Tier-1
+/// R10-F1 — interior and boundary delimiters swap sides
+/// with the per-line multiset preserved) passes this test
+/// while hiding production. That class is locked by the Q
+/// pin in t6_matcher_r10_rules_hold; matcher rules
+/// (open/close/attr/depth) are pinned by the t6_matcher_*
+/// tests. Literals contribute nothing on either side
+/// (leaves there, skipped here); comments are absent
 /// there and removed here.
 #[test]
 fn t6_lexer_matches_proc_macro2() {
