@@ -221,9 +221,10 @@ Honest limits of this release; all planned for later work:
 - Unprivileged first runs see limited evidence (other users' processes
   need privileges to inspect); bare `doctor` now ends with concrete
   next actions, privileged runs where the docs say so.
-- Short-lived external processes have a 50–200 ms observation floor
-  (guest-witnessed: immediately-exiting callers cannot have their
-  first call counted); results stay PARTIAL rather than invented.
+- Short-lived external processes have a ~50 ms observation floor
+  (guest-witnessed: one ~50 ms process left no record; sub-second
+  externals may never appear); results stay PARTIAL rather than
+  invented.
 - No pre-armed library mode: you cannot enroll a library by
   path/hash/build-id for instant attach (descoped to the redesign
   track after the guest witness).

@@ -5,7 +5,7 @@ The v0.8.0 observer starts with passive discovery, optionally observes
 public provider interfaces, and counts learned physical callback entries for
 one selected process. The supported lane (x86-64, 6.9+ feature-probed
 kernel, BTF, cgroup v2, stock OpenSSL 3.5.x) is in the
-[README support matrix](../README.md#support-matrix-070-lane); start with the
+[README support matrix](../README.md#support-matrix-080-lane); start with the
 [quickstart](quickstart.md). Installed/platform qualification is separate
 from source behavior; the latest versioned qualification record
 file is [v0.4.0](release-v0.4.0.md) (0.5.0/0.6.0/0.7.0/0.8.0 status lives in

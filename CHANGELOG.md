@@ -10,11 +10,11 @@
   Unknown-only evidence, and no definite algorithm/provider
   count or CBOM asset is claimed from normal runs.
 - Fork-aware discovery (R0): the fork classifier checks
-  `AWSLC_` before compat `BoringSSL_*` symbols, so real
+  `AWSLC_` before compat `BORINGSSL_*` symbols, so real
   AWS-LC (which exports both) no longer mislabels as
   BoringSSL; plus a `bcm_`-only classifier cell.
 - Guided first runs (D48): bare `doctor` human output ends
-  with concrete next actions (owned `run --`, foreign
+  with concrete next actions (owned `report run --`, foreign
   `--pid`), so an unprivileged first run is a guided
   starting point; the owned-workload route is advertised
   truthfully and pinned to parse to Spawn.
@@ -31,12 +31,12 @@
   writer fixes (socket/char-device paths, FIFO-only private
   fd); port/display validation; redaction hole closed.
 - Known limits carried (see README): short-lived external
-  processes have a 50–200 ms observation floor and there is
-  no pre-armed library mode (guest-witnessed, descoped to
-  the redesign track); latency/rate numbers stay
-  characterization-only (C023 OPEN); service trace serving
-  stays deferred; fetch/load/query evidence never means
-  execution.
+  processes have a ~50 ms observation floor (guest-witnessed;
+  sub-second externals may never appear) and there is
+  no pre-armed library mode (descoped to the redesign
+  track); latency/rate numbers stay characterization-only
+  (C023 OPEN); service trace serving stays deferred;
+  fetch/load/query evidence never means execution.
 
 ## 0.7.0 (2026-11-24)
 
