@@ -631,7 +631,7 @@ fn h7_close_flow_never_questions_nor_discards() {
     );
 }
 
-// --- T6: CLI-surface panic audit -----------------------------------------
+// --- T6: CLI-surface panic audit (token-based, D120) ------------------------
 // Every CLI error-path print goes through the panic-free sink
 // helper; production code in the CLI-surface files carries no
 // `eprintln!`, `panic!`, `expect(`, or `unwrap(`. (`println!` to
@@ -639,6 +639,18 @@ fn h7_close_flow_never_questions_nor_discards() {
 // documented residual with Unix-philosophy questions, not a
 // diagnostic path. Engine-internal `eprintln!` warnings outside
 // these files are likewise out of scope — reviewed, not converted.)
+//
+// After three rounds of hand-lexer desync classes (N1→C1→F1→
+// M1/M2/LRM, codex R12 + claude R4), the matcher works
+// directly on the proc-macro2 token stream — the same lexer
+// rustc's front-end agrees with — so there is no second
+// lexer to desync and no differential to keep. Patterns are
+// sibling token triples (`.` + `unwrap`/`expect` + paren
+// group; `panic`/`eprintln` + `!` + group), matched at every
+// nesting level; skips are top-level `#[cfg(test)] mod`
+// brace spans. Threat model: files that lex (an unlexable
+// file cannot compile, so it cannot ship); a lex failure is
+// a loud test error, never a silent pass.
 
 const T6_FILES: &[&str] = &[
     "src/report.rs",
@@ -650,439 +662,237 @@ const T6_FILES: &[&str] = &[
     "src/aliases.rs",
 ];
 
-const T6_PATTERNS: &[&str] = &["eprintln!", "panic!", ".expect(", ".unwrap("];
-
-/// If `ch[i]` is `"` followed by `hashes` `#`, return the
-/// index just past them; else `None`. A longer `#` run still
-/// closes at the first `"` + `hashes` `#` (surplus stays
-/// code — the rustc rule).
-fn raw_closer_end(ch: &[char], i: usize, hashes: u32) -> Option<usize> {
-    if ch.get(i) != Some(&'"') {
-        return None;
+/// True when `bracket` is exactly `[cfg(test)]` — the only
+/// attribute that opens a T6 skip. Whitespace inside is
+/// invisible to the tokenizer (`#[cfg (test)]` skips too, a
+/// deliberate fix over the old exact-string gate); anything
+/// else in the brackets (cfg-expressions, other attrs) does
+/// not govern, and the module stays scanned (fail-closed).
+fn t6_is_cfg_test_attr(bracket: &proc_macro2::Group) -> bool {
+    use proc_macro2::{Delimiter, TokenTree};
+    if bracket.delimiter() != Delimiter::Bracket {
+        return false;
     }
-    let mut k = i + 1;
-    let mut h = 0;
-    while k < ch.len() && ch[k] == '#' && h < hashes {
-        h += 1;
-        k += 1;
+    let mut inner = bracket.stream().into_iter();
+    let (Some(TokenTree::Ident(cfg)), Some(TokenTree::Group(parens)), None) =
+        (inner.next(), inner.next(), inner.next())
+    else {
+        return false;
+    };
+    if cfg != "cfg" || parens.delimiter() != Delimiter::Parenthesis {
+        return false;
     }
-    if h == hashes { Some(k) } else { None }
+    let mut args = parens.stream().into_iter();
+    matches!(
+        (args.next(), args.next()),
+        (Some(TokenTree::Ident(t)), None) if t == "test"
+    )
 }
 
-/// If `ch[i..]` opens a string literal with a prefix
-/// (`r…`/`r#*…#*`, `b…`/`br#*…#*`, `c…`/`cr#*…#*`),
-/// return `(end, raw_cont, str_cont)`: `end` is the index
-/// just past the same-line closer (or EOL); `raw_cont` is
-/// `Some(hashes)` when a multi-line raw runs past EOL;
-/// `str_cont` is true when a cooked `b…`/`c…` runs past
-/// EOL (a continuation — the caller carries it like a
-/// regular string). `None` when `ch[i]` starts no string
-/// (plain ident like `return`/`break`/`const`, or doubled
-/// markers like `bc`/`cb` which are never prefixes).
-fn skip_raw(ch: &[char], i: usize) -> Option<(usize, Option<u32>, bool)> {
-    let n = ch.len();
-    let mut j = i;
-    // At most one kind marker (b/c); a second marker letter
-    // means ident (`bc…`, `cb…`, `bb…`, `cc…`).
-    if ch[j] == 'b' || ch[j] == 'c' {
-        j += 1;
-        if j < n && (ch[j] == 'b' || ch[j] == 'c') {
-            return None;
-        }
-    }
-    // Optional raw `r` (`r`, `br`, `cr`).
-    let mut has_r = false;
-    if j < n && ch[j] == 'r' {
-        has_r = true;
-        j += 1;
-    } else if ch[i] != 'b' && ch[i] != 'c' {
-        return None;
-    }
-    let mut hashes = 0u32;
-    if has_r {
-        while j < n && ch[j] == '#' {
-            hashes += 1;
-            j += 1;
-        }
-    }
-    if j >= n || ch[j] != '"' {
-        return None;
-    }
-    j += 1;
-    while j < n {
-        if has_r {
-            if let Some(k) = raw_closer_end(ch, j, hashes) {
-                return Some((k, None, false));
+/// T6 matcher over one file's text: reports `rel:line: pat:
+/// code` violations for panic patterns in production code,
+/// skipping top-level `#[cfg(test)] mod` bodies by span.
+/// Rules:
+/// - Patterns are sibling token triples at any nesting
+///   level: `.` + `unwrap`/`expect` + paren group, or
+///   `panic`/`eprintln` + `!` + group. Siblings only — a
+///   triple split across a group boundary never matches.
+///   Whitespace, comments, and line breaks between the
+///   tokens are invisible (claude R4-M2). Reported with
+///   the historical substring labels (`.unwrap(` etc.).
+/// - Skip: a top-level `#` + `[cfg(test)]` + `mod` + name +
+///   brace group (stacked attrs ride, exactly like rustc
+///   attachment; any other top-level token spends
+///   governance). Inner `#![…]` attrs never govern. The
+///   brace group's span is the skip — no opener/closer
+///   heuristics, no column or depth gates, no trivia
+///   sensitivity. A pattern occurrence inside a skip span
+///   (by token position, not by line) is silent; code on
+///   the closer's own line still flags (span-precise).
+/// - Structure inside groups (macro input, fn bodies) is
+///   scanned for patterns but never opens a skip
+///   (fail-closed, codex R10-F3/R12). `mod name;` opens
+///   nothing. Nested (non-top-level) `#[cfg(test)] mod`
+///   is NOT skipped (hand-matcher parity, pinned).
+fn t6_violations(text: &str, rel: &str) -> Vec<String> {
+    use proc_macro2::{Delimiter, TokenTree};
+    use std::str::FromStr;
+    let lines: Vec<&str> = text.lines().collect();
+    let stream = proc_macro2::TokenStream::from_str(text)
+        .unwrap_or_else(|e| panic!("{rel}: T6 input must lex: {e}"));
+    // Pass 1: top-level `#[cfg(test)] mod name { … }` spans.
+    let top: Vec<TokenTree> = stream.into_iter().collect();
+    let mut skips: Vec<((usize, usize), (usize, usize))> = Vec::new();
+    let mut pending_cfg = false;
+    let mut i = 0;
+    while i < top.len() {
+        match &top[i] {
+            TokenTree::Punct(p) if p.as_char() == '#' => {
+                match (top.get(i + 1), top.get(i + 2)) {
+                    // `#![…]` inner attribute: governance
+                    // resets (hand-matcher parity).
+                    (Some(TokenTree::Punct(q)), Some(TokenTree::Group(_)))
+                        if q.as_char() == '!' =>
+                    {
+                        pending_cfg = false;
+                        i += 3;
+                    }
+                    (Some(TokenTree::Group(g)), _) if t6_is_cfg_test_attr(g) => {
+                        pending_cfg = true;
+                        i += 2;
+                    }
+                    // Any other `#[…]`: rides through stacked,
+                    // pending unchanged (codex R10-F2 parity).
+                    (Some(TokenTree::Group(g)), _) if g.delimiter() == Delimiter::Bracket => {
+                        i += 2;
+                    }
+                    _ => {
+                        pending_cfg = false;
+                        i += 1;
+                    }
+                }
             }
-            j += 1;
-        } else if ch[j] == '\\' {
-            j += 2;
-        } else if ch[j] == '"' {
-            return Some((j + 1, None, false));
-        } else {
-            j += 1;
+            TokenTree::Ident(id) if id == "mod" && pending_cfg => {
+                match (top.get(i + 1), top.get(i + 2)) {
+                    (Some(TokenTree::Ident(_)), Some(TokenTree::Group(g)))
+                        if g.delimiter() == Delimiter::Brace =>
+                    {
+                        let s = g.span_open().start();
+                        let e = g.span_close().end();
+                        skips.push(((s.line, s.column), (e.line, e.column)));
+                        pending_cfg = false;
+                        i += 3;
+                    }
+                    // `mod name;` or anything else: no body, no
+                    // skip; governance spent (hand parity).
+                    _ => {
+                        pending_cfg = false;
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                pending_cfg = false;
+                i += 1;
+            }
         }
     }
-    if has_r {
-        Some((n, Some(hashes), false))
-    } else {
-        Some((n, None, true))
-    }
-}
-
-/// Consume an already-tokenized literal suffix: ident
-/// characters following a just-closed literal are emitted
-/// unexamined — re-examining them as raw openers (e.g. the
-/// `r` in `r#"a"#r"b"`) desyncs the scanner. Suffix content
-/// is inert (no spaces, quotes, delimiters, or dots), so
-/// emitting cannot forge a boundary or pattern.
-fn skip_suffix(ch: &[char], mut i: usize, out: &mut String) -> usize {
-    while i < ch.len() && (ch[i].is_alphanumeric() || ch[i] == '_' || !ch[i].is_ascii()) {
-        out.push(ch[i]);
-        i += 1;
-    }
-    i
-}
-
-/// If `ch[i]` opens a char literal, return the index just
-/// past its closer; lifetimes return `None` (scan as text).
-fn skip_char(ch: &[char], i: usize) -> Option<usize> {
-    let n = ch.len();
-    if i + 2 < n && ch[i + 1] != '\\' && ch[i + 2] == '\'' {
-        return Some(i + 3);
-    }
-    if i + 1 < n && ch[i + 1] == '\\' {
-        // No length cap (claude R1-F3): a `\` can only start a
-        // char literal (lifetimes cannot contain one), so the
-        // scan runs to the closer however long the `\u{…}`
-        // body is. Absent a closer the line is uncompilable
-        // and the `None` below is best-effort.
-        let mut k = i + 3;
-        while k < n && ch[k] != '\'' {
+    // Pass 2: pattern triples among siblings at every level.
+    let mut hits: Vec<((usize, usize), &'static str)> = Vec::new();
+    let mut levels: Vec<Vec<TokenTree>> = vec![top];
+    while let Some(level) = levels.pop() {
+        let mut k = 0;
+        while k < level.len() {
+            let triple = (level.get(k), level.get(k + 1), level.get(k + 2));
+            if let (
+                Some(TokenTree::Punct(dot)),
+                Some(TokenTree::Ident(name)),
+                Some(TokenTree::Group(args)),
+            ) = triple
+            {
+                if dot.as_char() == '.'
+                    && (name == "unwrap" || name == "expect")
+                    && args.delimiter() == Delimiter::Parenthesis
+                {
+                    let s = dot.span().start();
+                    let pat = if name == "unwrap" {
+                        ".unwrap("
+                    } else {
+                        ".expect("
+                    };
+                    hits.push(((s.line, s.column), pat));
+                }
+            }
+            if let (
+                Some(TokenTree::Ident(name)),
+                Some(TokenTree::Punct(bang)),
+                Some(TokenTree::Group(_)),
+            ) = triple
+            {
+                if (name == "panic" || name == "eprintln") && bang.as_char() == '!' {
+                    let s = name.span().start();
+                    let pat = if name == "panic" {
+                        "panic!"
+                    } else {
+                        "eprintln!"
+                    };
+                    hits.push(((s.line, s.column), pat));
+                }
+            }
+            if let Some(TokenTree::Group(g)) = level.get(k) {
+                levels.push(g.stream().into_iter().collect());
+            }
             k += 1;
         }
-        if k < n && ch[k] == '\'' {
-            return Some(k + 1);
+    }
+    hits.sort();
+    let mut violations = Vec::new();
+    for ((line, col), pat) in hits {
+        let inside = skips
+            .iter()
+            .any(|(s, e)| *s <= (line, col) && (line, col) <= *e);
+        if !inside {
+            let code = lines
+                .get(line - 1)
+                .map(|l| normalize(l))
+                .unwrap_or_default();
+            violations.push(format!("{rel}:{line}: {pat}: {code}"));
         }
     }
-    None
+    violations
 }
 
-/// Code scan for the T6 matcher: removes `/* ... */` spans
-/// (nesting per Rust) and `//` tails so documentation cannot
-/// impersonate a module (codex R7-2); string, raw-string,
-/// byte-string, and char literals are skipped so `"/*"`
-/// cannot open a span. Multi-line state crosses lines:
-/// `raw` carries an open `r#*"` (Tier-1 R2 residual),
-/// `in_str` a `\`-continued regular or byte string (codex
-/// R8 blocking finding — e.g. the live continuation at
-/// doctor.rs:5535).
-/// Returns `(scan, src_col0, str_prefix)`: `src_col0` holds
-/// only when the scan's first character is the source line's
-/// first character; `str_prefix` holds when a string, char,
-/// or raw literal (or a continuation residue) was skipped
-/// before the first emission. Block-comment spans demote
-/// `src_col0` but never set `str_prefix`: comments are
-/// transparent, so `/*c*/}` is a real closer (codex
-/// R10-F1), while a `}` glued to a literal is inner-scope
-/// punctuation (or invalid code) — never a module boundary.
-/// Openers require `src_col0` (strict: an opener
-/// false-positive would under-flag); closers require only
-/// `!str_prefix` (a missed closer would under-flag, while
-/// an early one merely over-flags).
-fn strip_block_scan(
-    line: &str,
-    depth: &mut u32,
-    raw: &mut Option<u32>,
-    in_str: &mut bool,
-) -> (String, bool, bool) {
-    let ch: Vec<char> = line.chars().collect();
-    let n = ch.len();
-    let mut out = String::with_capacity(line.len());
-    let mut prefix_skipped = false;
-    let mut prefix_stringy = false;
-    let mut i = 0;
-    if *in_str {
-        while i < n {
-            if ch[i] == '\\' {
-                i += 2;
-                continue;
-            }
-            if ch[i] == '"' {
-                i += 1;
-                *in_str = false;
-                break;
-            }
-            i += 1;
-        }
-        if i > 0 {
-            prefix_skipped = true;
-            prefix_stringy = true;
-        }
-        if *in_str {
-            return (out, !prefix_skipped, prefix_stringy);
-        }
-    } else if let Some(hashes) = *raw {
-        while i < n {
-            if let Some(end) = raw_closer_end(&ch, i, hashes) {
-                i = end;
-                *raw = None;
-                break;
-            }
-            i += 1;
-        }
-        if i > 0 {
-            prefix_skipped = true;
-            prefix_stringy = true;
-        }
-        if raw.is_some() {
-            return (out, !prefix_skipped, prefix_stringy);
-        }
-    }
-    while i < n {
-        let c = ch[i];
-        if *depth > 0 {
-            if out.is_empty() {
-                prefix_skipped = true;
-            }
-            if c == '/' && i + 1 < n && ch[i + 1] == '*' {
-                *depth += 1;
-                i += 2;
-            } else if c == '*' && i + 1 < n && ch[i + 1] == '/' {
-                *depth -= 1;
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        // Prefixed strings open only at a token start (claude
-        // R2-N1): after alnum/`_` (numeric suffix like `1r`),
-        // a quote (literal suffix like `"a"r`), or a tick
-        // (char suffix / lifetime like `'c'r`), the letter is
-        // emitted as code. Real prefixes (`r`, `b`, `br`,
-        // `c`, `cr` — the last two are C strings (claude
-        // R3-C1)) always follow an operator, delimiter, or
-        // whitespace.
-        let at_token_start = i == 0
-            || !(ch[i - 1].is_alphanumeric()
-                || ch[i - 1] == '_'
-                || ch[i - 1] == '"'
-                || ch[i - 1] == '\'');
-        if (c == 'r' || c == 'b' || c == 'c')
-            && at_token_start
-            && let Some((end, raw_cont, str_cont)) = skip_raw(&ch, i)
-        {
-            if out.is_empty() {
-                prefix_skipped = true;
-                prefix_stringy = true;
-            }
-            i = end;
-            *raw = raw_cont;
-            *in_str = str_cont;
-            if raw_cont.is_none() && !str_cont {
-                i = skip_suffix(&ch, i, &mut out);
-            }
-            continue;
-        }
-        if c == '\''
-            && let Some(end) = skip_char(&ch, i)
-        {
-            if out.is_empty() {
-                prefix_skipped = true;
-                prefix_stringy = true;
-            }
-            i = skip_suffix(&ch, end, &mut out);
-            continue;
-        }
-        if c == '"' {
-            if out.is_empty() {
-                prefix_skipped = true;
-                prefix_stringy = true;
-            }
-            let mut k = i + 1;
-            let mut closed = false;
-            while k < n {
-                if ch[k] == '\\' {
-                    k += 2;
-                    continue;
-                }
-                if ch[k] == '"' {
-                    k += 1;
-                    closed = true;
-                    break;
-                }
-                k += 1;
-            }
-            *in_str = !closed;
-            i = k.min(n);
-            if closed {
-                i = skip_suffix(&ch, i, &mut out);
-            }
-            continue;
-        }
-        if c == '/' && i + 1 < n && ch[i + 1] == '/' {
-            break;
-        }
-        if c == '/' && i + 1 < n && ch[i + 1] == '*' {
-            if out.is_empty() {
-                prefix_skipped = true;
-            }
-            *depth += 1;
-            i += 2;
-            continue;
-        }
-        out.push(c);
-        i += 1;
-    }
-    (out, !prefix_skipped, prefix_stringy)
-}
+// (Hand lexer retired, D120: `raw_closer_end`, `skip_raw`,
+// `skip_suffix`, `skip_char`, and `strip_block_scan` stood
+// here. proc-macro2 is the single lexer now; every shape
+// they learned across R7–R11 lives on as a matcher pin.)
 
-/// T6 scanner cross-line pins (Tier-1 R4 note (d)): the
-/// evasion shapes behind codex R8 + Tier-1 R2/R4, locked as
-/// direct unit cases so a scanner edit cannot silently
-/// reopen them. Each case mirrors a tree-level probe that
-/// tripped (or, pre-fix, missed) end to end.
-#[test]
-fn t6_scanner_cross_line_states_hold() {
-    // P1 (codex R8): chained `\` continuation carrying a
-    // phantom block opener — the closer must survive.
-    let mut depth = 0u32;
-    let mut raw = None;
-    let mut in_str = false;
-    let (o, _, _) = strip_block_scan("let h = \"a\\", &mut depth, &mut raw, &mut in_str);
-    assert!(in_str && o == "let h = ");
-    let (o, _, _) = strip_block_scan("mid\\", &mut depth, &mut raw, &mut in_str);
-    assert!(in_str && o.is_empty());
-    let (o, _, _) = strip_block_scan("/* tail\";", &mut depth, &mut raw, &mut in_str);
-    assert!(!in_str && o == ";");
-    let (o, _, _) = strip_block_scan("}", &mut depth, &mut raw, &mut in_str);
-    assert!(o == "}" && depth == 0 && raw.is_none() && !in_str);
-    // P3 (Tier-1 R4): a continuation line containing `}`
-    // must not leak it as code (the string still closes).
-    let mut depth = 0u32;
-    let mut raw = None;
-    let mut in_str = false;
-    let (o, _, _) = strip_block_scan("let h = \"a\\", &mut depth, &mut raw, &mut in_str);
-    assert!(in_str && o == "let h = ");
-    let (o, _, _) = strip_block_scan("}\";", &mut depth, &mut raw, &mut in_str);
-    assert!(!in_str && o == ";");
-    // P4 (Tier-1 R4): byte-string continuation, plain and
-    // with escapes.
-    let mut depth = 0u32;
-    let mut raw = None;
-    let mut in_str = false;
-    let (o, _, _) = strip_block_scan("let h = b\"ab\\", &mut depth, &mut raw, &mut in_str);
-    assert!(in_str && o == "let h = ");
-    let (o, _, _) = strip_block_scan("xy\";", &mut depth, &mut raw, &mut in_str);
-    assert!(!in_str && o == ";");
-    let v: Vec<char> = "b\"a\\x41\\\\".chars().collect();
-    assert_eq!(skip_raw(&v, 0), Some((v.len(), None, true)));
-    // R2 (Tier-1 R2 f-prime): multi-line raw spanning the
-    // closer — block tokens inside stay raw text.
-    let mut depth = 0u32;
-    let mut raw = None;
-    let mut in_str = false;
-    let (o, _, _) = strip_block_scan("let f = r#\"l1", &mut depth, &mut raw, &mut in_str);
-    assert!(raw == Some(1) && !o.is_empty());
-    let (o, _, _) = strip_block_scan("/* poison", &mut depth, &mut raw, &mut in_str);
-    assert!(raw == Some(1) && depth == 0 && o.is_empty());
-    let (o, _, _) = strip_block_scan("tail\"#;", &mut depth, &mut raw, &mut in_str);
-    assert!(raw.is_none() && o == ";");
-    // R3 (Tier-1 R2): escaped quote ends past the closer.
-    let v: Vec<char> = "'\\''".chars().collect();
-    assert_eq!(skip_char(&v, 0), Some(4));
-    // Handoff: string close then raw open on one line.
-    let mut depth = 0u32;
-    let mut raw = None;
-    let mut in_str = true;
-    let (o, _, _) = strip_block_scan("x\"; let u = r#\"nl", &mut depth, &mut raw, &mut in_str);
-    assert!(!in_str && raw == Some(1) && o == "; let u = ");
-    // Source column (codex R9-F1): the flag tracks the scan's
-    // first character back to source column 0.
-    let mut depth = 0u32;
-    let mut raw = None;
-    let mut in_str = false;
-    let (o, c0, _) = strip_block_scan("mod tests {", &mut depth, &mut raw, &mut in_str);
-    assert!(c0 && o == "mod tests {");
-    let (o, c0, _) = strip_block_scan("/*c*/mod tests {", &mut depth, &mut raw, &mut in_str);
-    assert!(!c0 && o == "mod tests {");
-    let (o, c0, _) = strip_block_scan("}", &mut depth, &mut raw, &mut in_str);
-    assert!(c0 && o == "}");
-    let mut depth = 0u32;
-    let mut raw = None;
-    let mut in_str = true;
-    let (o, c0, _) = strip_block_scan("x\"}", &mut depth, &mut raw, &mut in_str);
-    assert!(!c0 && o == "}");
-    // Stringy prefix (codex R10-F1): block-only prefixes stay
-    // transparent while literal-glued tokens do not.
-    let mut depth = 0u32;
-    let mut raw = None;
-    let mut in_str = false;
-    let (o, c0, sp) = strip_block_scan("/*c*/}", &mut depth, &mut raw, &mut in_str);
-    assert!(!c0 && !sp && o == "}");
-    let mut depth = 0u32;
-    let mut raw = None;
-    let mut in_str = true;
-    let (o, c0, sp) = strip_block_scan("x\"}", &mut depth, &mut raw, &mut in_str);
-    assert!(!c0 && sp && o == "}");
-    // Token-start raw (claude R2-N1): suffix letters emit as
-    // code; only a real prefix opens.
-    let mut depth = 0u32;
-    let mut raw = None;
-    let mut in_str = false;
-    let (o, c0, sp) = strip_block_scan("1r\"x\"", &mut depth, &mut raw, &mut in_str);
-    assert!(c0 && !sp && !in_str && o == "1r");
-    let (o, c0, sp) = strip_block_scan("\"a\"r\"x\"", &mut depth, &mut raw, &mut in_str);
-    assert!(!c0 && sp && !in_str && o == "r");
-}
+// (Scanner unit pins retired with the hand lexer, D120:
+// P1/P3/P4/R2/R3/handoff/c0/stringy/token-start cases are
+// re-expressed as end-to-end matcher pins below — a token
+// matcher has no cross-line states to unit-test.)
 
-/// T6 matcher-level pins (codex R9-F2 + claude R1): evasion
-/// shapes end to end through `t6_violations` over synthetic
-/// sources — the opener/closer/pattern layer the scanner
-/// pins cannot reach. Each mirrors a tree-level probe that
-/// tripped (or, pre-fix, missed).
+/// T6 matcher-level pins (codex R9-F2 + claude R1, kept
+/// through the D120 token rewrite): evasion shapes end to
+/// end through `t6_violations` over synthetic sources. Same
+/// inputs and verdicts as the hand-lexer era; only the
+/// mechanism comments changed.
 #[test]
 fn t6_matcher_flags_and_skips_hold() {
-    // F1-forward (codex R9): mid-line `mod tests {` promoted
-    // by a consumed string-closer + block prefix must NOT
-    // open — the production unwrap is flagged. Attr-adjacent
-    // shape (Tier-1 R7): `"a\` scans empty so `prev` stays
-    // the attribute — every opener conjunct except `src_col0`
-    // holds, isolating the gate (differentially verified:
-    // pre-fix misses, post-fix flags :5:).
+    // F1-forward (codex R9): a literal between the attribute
+    // and `mod` spends governance — no skip opens and the
+    // production unwrap flags. (The input stays balanced so
+    // it lexes; the old hand matcher never required that.)
     let v = t6_violations(
-        "#[cfg(test)]\n\"a\\\nsecond\"/*c*/mod tests {\npub fn p() -> u8 {\nSome(1).unwrap()\n}\n",
+        "#[cfg(test)]\n\"a\\\nsecond\"/*c*/mod tests {\npub fn p() -> u8 {\nSome(1).unwrap()\n}\n}\n",
         "synth.rs",
     );
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(v[0].contains(":5:") && v[0].contains(".unwrap("), "{v:?}");
-    // F1-reverse (codex R9): a promoted mid-line `}` must NOT
-    // close early — the test unwrap stays skipped. (The
-    // macro's own braces stay indented: any SOURCE column-0
-    // `}` still closes by design — the H5 brace rule without
-    // parsing.)
+    // F1-reverse (codex R9): macro token soup inside the
+    // skipped brace span stays skipped — group spans, not
+    // brace counting, delimit the skip.
     let v = t6_violations(
         "#[cfg(test)]\nmod tests {\n    macro_rules! m {\n        ({ \"a\\\nx\"}\"y\") => {};\n    }\n    fn t() {\n        Some(1).unwrap()\n    }\n}\n",
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
     // F2-char (codex R9 / claude R1-F1): a quote inside a
-    // char literal must not hide the call.
+    // char literal is one token — the call flags.
     let v = t6_violations(
         "pub fn p(s: &str) -> usize {\ns.find('\"').unwrap()\n}\n",
         "synth.rs",
     );
     assert_eq!(v.len(), 1, "{v:?}");
-    // F1-raw (claude R1-F1): backslash before a raw closer
-    // must not extend the string.
+    // F1-raw (claude R1-F1): backslash inside a raw string
+    // is content — the call flags.
     let v = t6_violations(
         "pub fn p(s: &str) -> &str {\ns.strip_prefix(r\"C:\\\").unwrap()\n}\n",
         "synth.rs",
     );
     assert_eq!(v.len(), 1, "{v:?}");
     // F1-block (claude R1-F1): a quote inside a block comment
-    // must not open a string.
+    // is trivia — the call flags.
     let v = t6_violations(
         "pub fn p() -> u8 {\nlet v = /* \" */ Some(1).unwrap();\nv\n}\n",
         "synth.rs",
@@ -1107,13 +917,15 @@ fn t6_matcher_flags_and_skips_hold() {
     assert!(v[0].contains(":2:"), "{v:?}");
 }
 
-/// T6 matcher pins, round 2 (codex R10 + claude R2):
-/// delimiter depth, attribute lists, transparent closers,
-/// and literal-suffix token starts, end to end.
+/// T6 matcher pins, round 2 (codex R10 + claude R2,
+/// kept through the D120 token rewrite): attribute lists,
+/// group-opaque skips, literal-suffix shapes, and C
+/// strings, end to end.
 #[test]
 fn t6_matcher_r10_rules_hold() {
-    // Transparent closer (codex R10-F1): a block-prefixed
-    // `}` still closes — the production unwrap flags.
+    // Transparent closer (codex R10-F1): the brace span ends
+    // at `}` regardless of the comment prefix — production
+    // after it flags.
     let v = t6_violations(
         "#[cfg(test)]\nmod tests {\nfn t() {}\n/*c*/}\npub fn p() -> u8 {\nSome(1).unwrap()\n}\n",
         "synth.rs",
@@ -1141,8 +953,8 @@ fn t6_matcher_r10_rules_hold() {
     );
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(v[0].contains(":5:"), "{v:?}");
-    // Macro-dropped attribute (codex R10-F3): attr+mod at
-    // depth 1+ is opaque — both unwraps flag.
+    // Macro-dropped attribute (codex R10-F3): attr+mod
+    // inside a group never govern — both unwraps flag.
     let v = t6_violations(
         "macro_rules! expose {\n(#[$meta:meta] $item:item) => {\n$item\n};\n}\nexpose! {\n#[cfg(test)]\nmod fixture {\npub fn prod(v: Option<u8>) -> u8 {\nv.unwrap()\n}\n}\n}\npub fn real() -> u8 {\nSome(1).unwrap()\n}\n",
         "synth.rs",
@@ -1150,7 +962,8 @@ fn t6_matcher_r10_rules_hold() {
     assert_eq!(v.len(), 2, "{v:?}");
     assert!(v[0].contains(":10:") && v[1].contains(":15:"), "{v:?}");
     // Suffix letters (claude R2-N1): `1r`, `"a"r`, `'c'r`
-    // never open raw strings — the production unwrap flags.
+    // are ordinary tokens to proc-macro2 (all three lex —
+    // probed) — the production unwrap flags.
     for prefix in ["1r", "\"a\"r", "'c'r"] {
         let text = format!(
             "macro_rules! sink {{\n($($t:tt)*) => {{}};\n}}\nsink! {{ {prefix}\"\\\"x\" }}\npub fn p() -> u8 {{\nSome(1).unwrap()\n}}\n"
@@ -1159,18 +972,17 @@ fn t6_matcher_r10_rules_hold() {
         assert_eq!(v.len(), 1, "{prefix}: {v:?}");
         assert!(v[0].contains(":6:"), "{prefix}: {v:?}");
     }
-    // Prefixed opener stays conservative: `/*c*/mod` with an
-    // attribute does NOT skip (over-flags, fail-closed).
-    // Loosening this needs fresh macro-text analysis.
+    // Prefixed opener (D120 deliberate inversion): `/*c*/mod`
+    // with the attribute now SKIPS — comments are trivia to
+    // the tokenizer, and the module IS cfg(test). The old
+    // over-flag was a column heuristic, not a rule.
     let v = t6_violations(
         "#[cfg(test)]\n/*c*/mod tests {\nfn t() {\nSome(1).unwrap()\n}\n}\n",
         "synth.rs",
     );
-    assert_eq!(v.len(), 1, "{v:?}");
-    assert!(v[0].contains(":4:"), "{v:?}");
-    // Raw C strings (claude R3-C1): `cr` opens raw (no
-    // escapes, stable Rust, no macro needed) — the
-    // production unwrap flags.
+    assert!(v.is_empty(), "{v:?}");
+    // Raw C strings (claude R3-C1): `cr"\"` is one literal
+    // token — the production unwrap flags.
     let v = t6_violations(
         "pub fn p(x: Option<u8>) -> u8 {\nlet _s = cr\"\\\";\nlet v = x.unwrap();\nlet _q = '\"';\nv\n}\n",
         "synth.rs",
@@ -1184,7 +996,7 @@ fn t6_matcher_r10_rules_hold() {
     );
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(v[0].contains(":3:"), "{v:?}");
-    // Cooked C string control: escapes apply; flags too
+    // Cooked C string control: one literal token — flags too
     // (locks the non-raw path).
     let v = t6_violations(
         "pub fn p(x: Option<u8>) -> u8 {\nlet _s = c\"\\\\\";\nlet v = x.unwrap();\nlet _q = '\"';\nv\n}\n",
@@ -1192,16 +1004,10 @@ fn t6_matcher_r10_rules_hold() {
     );
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(v[0].contains(":3:"), "{v:?}");
-    // Delimiter-neutral desync (Tier-1 R10-F1): a scanner
-    // that misreads L2's raw `cr"\"` as cooked enters
-    // `in_str`, closes at L3's open quote, and emits the
-    // literal interior as code — the per-line delimiter
-    // multisets still agree (interior parens swap sides
-    // with the group parens) and L4's comment quote
-    // resolves the desync delimiter-free, so the
-    // proc-macro2 differential below stays green while
-    // `.unwrap(` hides. This class is locked HERE, at
-    // matcher level: the production unwrap must flag.
+    // Tier-1 R10-F1 (Q): the delimiter-neutral shape that
+    // broke the parity claim — under tokens it is just
+    // another must-flag: the literal interior never yields
+    // a `.`+`unwrap`+group triple, the real call does.
     let v = t6_violations(
         "pub fn p() {\nlet _s = cr\"\\\";\nv.unwrap(\"x(y)z\");\n// \" resolve\n}\n",
         "synth.rs",
@@ -1210,214 +1016,211 @@ fn t6_matcher_r10_rules_hold() {
     assert!(v[0].contains(":3:"), "{v:?}");
 }
 
-/// T6 lexer differential (claude R2): the hand scanner's
-/// code-vs-literal classification is cross-checked against
-/// proc-macro2 tokenization on every T6 line, delimiter by
-/// delimiter. Most lexing desyncs (missed raw/continuation/
-/// char boundary) move delimiters between code and literal
-/// content, which fails loudly here instead of hiding
-/// production violations silently. This is a TRIPWIRE, not
-/// a parity proof: a delimiter-NEUTRAL desync (Tier-1
-/// R10-F1 — interior and boundary delimiters swap sides
-/// with the per-line multiset preserved) passes this test
-/// while hiding production. That class is locked by the Q
-/// pin in t6_matcher_r10_rules_hold; matcher rules
-/// (open/close/attr/depth) are pinned by the t6_matcher_*
-/// tests. Literals contribute nothing on either side
-/// (leaves there, skipped here); comments are absent
-/// there and removed here.
+// (Lexer differential retired with the hand lexer, D120:
+// with proc-macro2 as the single lexer there is nothing to
+// cross-check — a desync class cannot exist.)
+
+/// T6 matcher pins, round 3 (codex R12 + claude R4,
+/// D120): every shape that broke the hand lexer, locked
+/// against the token matcher — plus rule-shape locks and
+/// the deliberate divergences from hand behavior.
 #[test]
-fn t6_lexer_matches_proc_macro2() {
-    use proc_macro2::{Delimiter, TokenTree};
-    use std::collections::BTreeMap;
-    use std::str::FromStr;
-
-    fn is_doc_group(g: &proc_macro2::Group) -> bool {
-        // Desugared `///`/`//!` docs surface as `#[doc …]`
-        // groups, which the scanner (correctly) strips as
-        // comments — skip them so both sides agree. A
-        // written `#[doc …]` is indistinguishable here, so
-        // the file loop below guards against one landing.
-        if g.delimiter() != Delimiter::Bracket {
-            return false;
-        }
-        let mut inner = g.stream().into_iter();
-        matches!(inner.next(), Some(TokenTree::Ident(id)) if id == "doc")
-    }
-
-    fn pm_delims(
-        stream: proc_macro2::TokenStream,
-        out: &mut BTreeMap<usize, BTreeMap<char, usize>>,
-    ) {
-        for tt in stream {
-            match tt {
-                TokenTree::Group(g) => {
-                    if is_doc_group(&g) {
-                        continue;
-                    }
-                    match g.delimiter() {
-                        Delimiter::Parenthesis => {
-                            bump(out, g.span_open().start().line, '(');
-                            bump(out, g.span_close().start().line, ')');
-                        }
-                        Delimiter::Brace => {
-                            bump(out, g.span_open().start().line, '{');
-                            bump(out, g.span_close().start().line, '}');
-                        }
-                        Delimiter::Bracket => {
-                            bump(out, g.span_open().start().line, '[');
-                            bump(out, g.span_close().start().line, ']');
-                        }
-                        Delimiter::None => {}
-                    }
-                    pm_delims(g.stream(), out);
-                }
-                TokenTree::Punct(p) => {
-                    let c = p.as_char();
-                    if "()[]{}".contains(c) {
-                        bump(out, p.span().start().line, c);
-                    }
-                }
-                TokenTree::Ident(_) | TokenTree::Literal(_) => {}
-            }
-        }
-    }
-
-    fn bump(out: &mut BTreeMap<usize, BTreeMap<char, usize>>, line: usize, c: char) {
-        *out.entry(line).or_default().entry(c).or_insert(0) += 1;
-    }
-
-    fn has_written_doc_attr(text: &str) -> bool {
-        // `#[doc` + non-ident char (so `#[document…]` stays OK).
-        text.match_indices("#[doc").any(|(i, _)| {
-            text[i + "#[doc".len()..]
-                .chars()
-                .next()
-                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
-        })
-    }
-
-    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for rel in T6_FILES {
-        let text = std::fs::read_to_string(root.join(rel)).unwrap();
-        // Written `#[doc …]` is indistinguishable from desugared
-        // `///` in the stream but scanned as code — fail loudly
-        // if one ever lands instead of silently diverging.
-        assert!(
-            !has_written_doc_attr(&text),
-            "{rel}: written #[doc …] needs differential handling"
-        );
-        let stream = proc_macro2::TokenStream::from_str(&text)
-            .unwrap_or_else(|e| panic!("{rel} lexes cleanly: {e}"));
-        let mut pm: BTreeMap<usize, BTreeMap<char, usize>> = BTreeMap::new();
-        pm_delims(stream, &mut pm);
-        let mut mine: BTreeMap<usize, BTreeMap<char, usize>> = BTreeMap::new();
-        let mut block_depth = 0u32;
-        let mut in_raw = None;
-        let mut in_str = false;
-        for (i, line) in text.lines().enumerate() {
-            let (scan, _, _) = strip_block_scan(line, &mut block_depth, &mut in_raw, &mut in_str);
-            for c in scan.chars().filter(|c| "()[]{}".contains(*c)) {
-                bump(&mut mine, i + 1, c);
-            }
-        }
-        let mut lines: Vec<usize> = pm.keys().chain(mine.keys()).copied().collect();
-        lines.sort_unstable();
-        lines.dedup();
-        for ln in lines {
-            assert_eq!(
-                pm.get(&ln),
-                mine.get(&ln),
-                "{rel}:{ln}: proc-macro2 vs scanner delimiter mismatch"
-            );
-        }
-    }
-}
-
-/// T6 matcher over one file's text: skips test-module
-/// bodies (H5 mechanism: rustfmt keeps test modules
-/// top-level) and reports `rel:line: pat: code` violations
-/// for panic patterns in production code. Rules:
-/// - Opener: `mod <name> {` governed by `#[cfg(test)]`
-///   (name-independent — a shipped `mod tests` must NOT skip
-///   (claude R1-F2)), at SOURCE column 0 (a mid-line token
-///   promoted by a consumed prefix must NOT open (codex
-///   R9-F1)), at delimiter depth 0 (an attr+mod inside macro
-///   input is opaque — decline the skip (codex R10-F3)),
-///   without its `}` on the same line (empty modules open
-///   nothing; one-line content stays scanned, fail-closed
-///   (codex R7-1)). Documentation cannot impersonate a
-///   module (block scan, codex R7-2). Attribute governance
-///   is forward-tracked over stacked attrs, trailing
-///   trivia, blanks, and comment lines (codex R10-F2); any
-///   code line resets it, exactly like rustc attachment.
-/// - Closer: a scan-leading `}` whose prefix (if any) holds
-///   only block comments — transparent comments don't hide
-///   a real closer (codex R10-F1), while a `}` glued to a
-///   literal is inner-scope punctuation (codex R9-F1
-///   reverse stays fixed). Asymmetry is deliberate:
-///   opener false-positives would under-flag (strict),
-///   closer false-positives merely over-flag while a
-///   missed closer would under-flag.
-/// - Patterns match the stateful scan, not the line (codex
-///   R9-F2 / claude R1-F1): the stateless stripper misreads
-///   quotes in chars, raws, blocks, and continuations.
-/// - Delimiter depth counts scan `()[]{}` (literals and
-///   comments already removed); strings never forge it.
-///
-/// No other known residual for rustfmt-formatted code
-/// outside macro token trees (which are scanned, never
-/// skipped — fail-closed).
-fn t6_violations(text: &str, rel: &str) -> Vec<String> {
-    let mut violations = Vec::new();
-    let mut in_tests = false;
-    let mut attrs_seen_cfg = false;
-    let mut block_depth = 0u32;
-    let mut in_raw = None;
-    let mut in_str = false;
-    let mut depth: i32 = 0;
-    for (i, line) in text.lines().enumerate() {
-        let (scan, src_col0, str_prefix) =
-            strip_block_scan(line, &mut block_depth, &mut in_raw, &mut in_str);
-        let closed_inline = scan.find('{').is_some_and(|o| scan[o..].contains('}'));
-        let is_opener = scan.starts_with("mod ")
-            && scan.contains('{')
-            && attrs_seen_cfg
-            && src_col0
-            && depth == 0
-            && !closed_inline;
-        if !in_tests && is_opener {
-            in_tests = true;
-        } else if in_tests {
-            if scan.starts_with('}') && !str_prefix {
-                in_tests = false;
-            }
-        } else {
-            for pat in T6_PATTERNS {
-                if scan.contains(pat) {
-                    violations.push(format!("{rel}:{}: {pat}: {}", i + 1, normalize(line)));
-                }
-            }
-        }
-        if scan.trim().is_empty() {
-            // Blank or comment-only: attribute attachment rides
-            // through, exactly like rustc.
-        } else if scan.starts_with("#[") {
-            if scan.trim() == "#[cfg(test)]" {
-                attrs_seen_cfg = true;
-            }
-        } else {
-            attrs_seen_cfg = false;
-        }
-        for c in scan.chars() {
-            match c {
-                '{' | '(' | '[' => depth += 1,
-                '}' | ')' | ']' => depth -= 1,
-                _ => {}
-            }
-        }
-    }
-    violations
+fn t6_matcher_r12_token_rules_hold() {
+    // M1 (claude R4 = codex R12 ASCII variant): multiline
+    // raw close with a suffix `r` — the old continuation
+    // path skipped suffix handling and hid the call with a
+    // green differential. Tokens have no suffix path.
+    let v = t6_violations(
+        "macro_rules! sink {\n    ($($t:tt)*) => {};\n}\n\n#[allow(dead_code)]\npub(crate) fn probe_mrs(v: Option<&str>) -> usize {\n    sink! {\n    r#\"a\n\"#r\"\\\"x\"\n    \"}\" }\n    let n = v.unwrap().len() + \"()()()\".len();\n    // \" resolve\n    n + 1\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":11:") && v[0].contains(".unwrap("), "{v:?}");
+    // M2 (claude R4): whitespace between the method and its
+    // parens inside a macro body — text matching missed
+    // with no lexer bug at all. Triples ignore trivia.
+    let v = t6_violations(
+        "macro_rules! emit {\n    ($($t:tt)*) => { $($t)* };\n}\n\nemit! {\n    #[allow(dead_code)]\n    pub(crate) fn probe_ws(v: Option<u8>) -> u8 { v.unwrap () }\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":7:"), "{v:?}");
+    // LRM (codex R12 finding 1): U+200E between a string and
+    // `r#` — the old suffix walk consumed it as ident content
+    // and hid the call (a regression: old flagged, tip
+    // missed). The shape compiles, so it is in-threat-model.
+    let lrm = char::from_u32(0x200e).unwrap().to_string();
+    let text = format!(
+        "macro_rules! t6_review_sink {{\n    ($($t:tt)*) => {{}};\n}}\n\npub fn t6_review_r12(v: Result<u8, &'static str>) -> u8 {{\n    t6_review_sink! {{ \"label\"{lrm}r#\"\"}}\"\\\"# }}\n    let result = v.expect(\"reason (key) here\");\n    // \" restore\n    result\n}}\n"
+    );
+    let v = t6_violations(&text, "synth.rs");
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":7:") && v[0].contains(".expect("), "{v:?}");
+    // Attribute leak (codex R12 syn trio): the cfg attr sits
+    // inside the macro group; the group-closing line must not
+    // launder governance to the top-level `mod`.
+    let v = t6_violations(
+        "macro_rules! t6_review_sink {\n    ($($t:tt)*) => {};\n}\n\nt6_review_sink! {\n#[cfg(test)]\n#[allow(dead_code)]}\nmod t6_review_prod {\n    pub fn t6_review_r12(value: Option<u8>) -> u8 {\n        value.unwrap()\n    }\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":10:"), "{v:?}");
+    // Comment-prefixed closer (codex R12 syn trio): the brace
+    // span ends at `}` — production after it flags.
+    let v = t6_violations(
+        "#[cfg(test)]\n#[rustfmt::skip]\nmod t6_review_tests {\n    #[test]\n    fn verifies() {}\n/* note */ }\n\npub fn t6_review_r12(value: Option<u8>) -> u8 {\n    value.unwrap()\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":9:"), "{v:?}");
+    // Comment between method and parens (codex R12 syn trio):
+    // trivia inside the triple cannot hide the call.
+    let v = t6_violations(
+        "pub fn t6_review_r12(value: Option<u8>) -> u8 {\n    value.unwrap /* reason */ ()\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Line comment splitting the triple: reported at the
+    // `.`'s line (lexable; compilability is irrelevant for
+    // synth pins — the corpus is compiled separately).
+    let v = t6_violations(
+        "pub fn t6_review_r12(value: Option<u8>) -> u8 {\n    value.unwrap // reason\n        ()\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Combining-mark suffix (claude R4 nit): the old ident
+    // predicates disagreed on non-ASCII; the single lexer
+    // has no predicates to disagree.
+    let comb = char::from_u32(0x301).unwrap().to_string();
+    let text = format!(
+        "macro_rules! sink {{\n    ($($t:tt)*) => {{}};\n}}\nsink! {{ 1x{comb}r\"\\\"x\" }}\n\n#[allow(dead_code)]\npub(crate) fn probe_n1(x: Option<u8>) -> u8 {{\n    x.unwrap()\n}}\n\nsink! {{ 1x{comb}r\"\\\"x\" }}\n"
+    );
+    let v = t6_violations(&text, "synth.rs");
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":8:"), "{v:?}");
+    // cfg-expression: not exactly `cfg(test)` — the module
+    // stays scanned (fail-closed and loud, preserved).
+    let v = t6_violations(
+        "#[cfg(all(test, unix))]\nmod tests {\nfn t() {\nSome(1).unwrap()\n}\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":4:"), "{v:?}");
+    // Spaced cfg (D120 deliberate fix): `#[cfg (test)]` IS a
+    // test module — skips (the old exact-string gate
+    // false-positived).
+    let v = t6_violations(
+        "#[cfg (test)]\nmod tests {\nfn t() {\nSome(1).unwrap()\n}\n}\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Same-line attr+mod (D120 deliberate fix): tokens have
+    // no lines — skips (the old line gate false-positived).
+    let v = t6_violations(
+        "#[cfg(test)] mod tests {\nfn t() {\nSome(1).unwrap()\n}\n}\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Spaced bang (D120 deliberate fix): `panic !(…)` calls
+    // panic — flags (the old substring missed it).
+    let v = t6_violations("pub fn p() {\npanic !(\"boom\");\n}\n", "synth.rs");
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:") && v[0].contains("panic!"), "{v:?}");
+    // Trailing code on the closer's line: span-precise
+    // skipping flags it (the old closer line was never
+    // scanned — a hole, now closed).
+    let v = t6_violations(
+        "#[cfg(test)]\nmod tests {\nfn t() {}\n} pub fn p() -> u8 { Some(1).unwrap() }\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":4:"), "{v:?}");
+    // `mod name;` opens nothing: no brace group, no skip.
+    let v = t6_violations(
+        "#[cfg(test)]\nmod foo;\npub fn p() -> u8 {\nSome(1).unwrap()\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":4:"), "{v:?}");
+    // Pattern text inside a string is content, not a call.
+    let v = t6_violations(
+        "pub fn p() {\nlet _s = \"call .unwrap( here\";\n}\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Pattern text inside comments (line, block, doc) is
+    // trivia, not a call.
+    let v = t6_violations(
+        "pub fn p() {\n// .unwrap( in comment\n/* .expect( */\n/// panic! docs\n}\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Field without parens: no group, no call.
+    let v = t6_violations("pub fn p(v: V) -> F {\nv.unwrap\n}\n", "synth.rs");
+    assert!(v.is_empty(), "{v:?}");
+    // Free function without a dot: no receiver, no method.
+    let v = t6_violations("pub fn p() {\nlet _x = unwrap(1);\n}\n", "synth.rs");
+    assert!(v.is_empty(), "{v:?}");
+    // `println!` stays out of scope (documented residual).
+    let v = t6_violations("pub fn p() {\nprintln!(\"hi\");\n}\n", "synth.rs");
+    assert!(v.is_empty(), "{v:?}");
+    // Braced panic: any group flavor after `!` is a call.
+    let v = t6_violations("pub fn p() {\npanic!{\"boom\"}\n}\n", "synth.rs");
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:"), "{v:?}");
+    // Macro-pattern controls: `eprintln!`, `panic!`, and
+    // `.expect(` each flag (the suite historically pinned
+    // only `.unwrap(`).
+    let v = t6_violations(
+        "pub fn p(v: Result<u8, &str>) -> u8 {\neprintln!(\"oops\");\nif v.is_err() {\npanic!(\"boom\");\n}\nv.expect(\"reason\")\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 3, "{v:?}");
+    assert!(v[0].contains(":2:") && v[0].contains("eprintln!"), "{v:?}");
+    assert!(v[1].contains(":4:") && v[1].contains("panic!"), "{v:?}");
+    assert!(v[2].contains(":6:") && v[2].contains(".expect("), "{v:?}");
+    // Nested test module: top-level-only skip (hand-matcher
+    // parity, deliberately not expanded) — flags.
+    let v = t6_violations(
+        "mod outer {\n#[cfg(test)]\nmod inner {\nfn t() {\nSome(1).unwrap()\n}\n}\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":5:"), "{v:?}");
+    // Inner `#![…]` attribute: never governs — flags.
+    let v = t6_violations(
+        "#![doc = \"x\"]\npub fn p() -> u8 {\nSome(1).unwrap()\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":3:"), "{v:?}");
+    // Continuation-adjacent call (P1/P3 re-expressed): a
+    // multiline cooked string with comment-looking tail —
+    // the call after it flags.
+    let v = t6_violations(
+        "pub fn p() -> u8 {\nlet h = \"a\\\nmid\\\n/* tail\";\nSome(1).unwrap()\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":5:"), "{v:?}");
+    // Multiline-raw-adjacent call (R2 re-expressed): block
+    // tokens inside the raw are content — the call flags.
+    let v = t6_violations(
+        "pub fn p() -> u8 {\nlet f = r#\"l1\n/* poison\ntail\"#;\nSome(1).unwrap()\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":5:"), "{v:?}");
+    // Sibling lock: a triple split across a group boundary
+    // never matches — the `.` here lives inside the macro
+    // group while `unwrap()` sits outside.
+    let v = t6_violations(
+        "macro_rules! m {\n($t:tt) => {};\n}\nm!(.);\nfn p(v: V) {\nunwrap()\n}\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
 }
 
 #[test]
