@@ -689,14 +689,23 @@ fn t6_is_cfg_test_attr(bracket: &proc_macro2::Group) -> bool {
     )
 }
 
+/// True when `ident` names `name`, counting the raw
+/// form `r#name` (same identifier — Tier-1 R12-F1: raw
+/// panic calls compile, execute, and must flag).
+fn t6_ident_is(ident: &proc_macro2::Ident, name: &str) -> bool {
+    let s = ident.to_string();
+    s.strip_prefix("r#").unwrap_or(&s) == name
+}
+
 /// T6 matcher over one file's text: reports `rel:line: pat:
 /// code` violations for panic patterns in production code,
 /// skipping top-level `#[cfg(test)] mod` bodies by span.
 /// Rules:
 /// - Patterns are sibling token triples at any nesting
 ///   level: `.` + `unwrap`/`expect` + paren group, or
-///   `panic`/`eprintln` + `!` + group. Siblings only — a
-///   triple split across a group boundary never matches.
+///   `panic`/`eprintln` + `!` + group (raw `r#…` spellings
+///   included — same names). Siblings only — a triple
+///   split across a group boundary never matches.
 ///   Whitespace, comments, and line breaks between the
 ///   tokens are invisible (claude R4-M2). Reported with
 ///   the historical substring labels (`.unwrap(` etc.).
@@ -791,11 +800,11 @@ fn t6_violations(text: &str, rel: &str) -> Vec<String> {
             ) = triple
             {
                 if dot.as_char() == '.'
-                    && (name == "unwrap" || name == "expect")
+                    && (t6_ident_is(name, "unwrap") || t6_ident_is(name, "expect"))
                     && args.delimiter() == Delimiter::Parenthesis
                 {
                     let s = dot.span().start();
-                    let pat = if name == "unwrap" {
+                    let pat = if t6_ident_is(name, "unwrap") {
                         ".unwrap("
                     } else {
                         ".expect("
@@ -809,9 +818,11 @@ fn t6_violations(text: &str, rel: &str) -> Vec<String> {
                 Some(TokenTree::Group(_)),
             ) = triple
             {
-                if (name == "panic" || name == "eprintln") && bang.as_char() == '!' {
+                if (t6_ident_is(name, "panic") || t6_ident_is(name, "eprintln"))
+                    && bang.as_char() == '!'
+                {
                     let s = name.span().start();
-                    let pat = if name == "panic" {
+                    let pat = if t6_ident_is(name, "panic") {
                         "panic!"
                     } else {
                         "eprintln!"
@@ -1221,6 +1232,28 @@ fn t6_matcher_r12_token_rules_hold() {
         "synth.rs",
     );
     assert!(v.is_empty(), "{v:?}");
+    // Raw identifiers (Tier-1 R12-F1): `r#unwrap` etc. are
+    // the same names — they compile, execute, and must flag
+    // (the `r#panic!`/`r#eprintln!` half was a token-rewrite
+    // regression: the old substring matched them).
+    let v = t6_violations(
+        "pub fn p(v: Option<u8>) -> u8 {\nlet _ = v.r#unwrap();\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:") && v[0].contains(".unwrap("), "{v:?}");
+    let v = t6_violations(
+        "pub fn p(v: Result<u8, &str>) -> u8 {\nlet _ = v.r#expect(\"x\");\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:") && v[0].contains(".expect("), "{v:?}");
+    let v = t6_violations("pub fn p() {\nr#panic!(\"boom\");\n}\n", "synth.rs");
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:") && v[0].contains("panic!"), "{v:?}");
+    let v = t6_violations("pub fn p() {\nr#eprintln!(\"oops\");\n}\n", "synth.rs");
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":2:") && v[0].contains("eprintln!"), "{v:?}");
 }
 
 #[test]
