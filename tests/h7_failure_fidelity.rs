@@ -714,23 +714,43 @@ fn t6_ident_is(ident: &proc_macro2::Ident, name: &str) -> bool {
     s.strip_prefix("r#").unwrap_or(&s) == name
 }
 
+/// True when a method call follows at `level[j]`: the paren
+/// argument group, or a joint `::` opening turbofish
+/// (claude R7-TF1 — `v.unwrap::<>(…)`; rustfmt strips it in
+/// normal code but macro bodies are opaque to rustfmt). A
+/// turbofish is the only valid thing after a method name
+/// besides the argument list, so anything else matching
+/// here is fail-closed noise on rejected code.
+fn t6_call_follows(level: &[proc_macro2::TokenTree], j: usize) -> bool {
+    use proc_macro2::{Delimiter, TokenTree};
+    match (level.get(j), level.get(j + 1)) {
+        (Some(TokenTree::Group(g)), _) => g.delimiter() == Delimiter::Parenthesis,
+        (Some(TokenTree::Punct(a)), Some(TokenTree::Punct(b))) => {
+            a.as_char() == ':' && b.as_char() == ':' && a.spacing() == proc_macro2::Spacing::Joint
+        }
+        _ => false,
+    }
+}
+
 /// T6 matcher over one file's text: reports `rel:line: pat:
 /// code` violations for panic patterns in production code,
 /// skipping top-level `#[cfg(test)] mod` bodies by span.
 /// Rules:
 /// - Patterns are sibling token triples at any nesting
-///   level: `.` + `unwrap`/`expect` + paren group (the dot
-///   must be standalone — a range's second dot never starts
-///   a triple), `panic`/`eprintln`/`eprint` + `!` + group,
-///   `::` + `unwrap`/`expect` with or without a call (path
-///   and fn-pointer forms; the separator must be a joint
-///   pair with no preceding colon, and the name must be
-///   terminal — a following `::Ident` makes it a namespace
-///   segment), or float-literal-ending-in-dot +
-///   `unwrap`/`expect` + paren group (tuple-field access
-///   swallowed the dot at lex time). Raw `r#…` spellings
-///   included — same names. Siblings only — a triple split
-///   across a group boundary never matches.
+///   level: `.` + `unwrap`/`expect` + call (paren group or
+///   turbofish; the dot must be standalone — a range's
+///   second dot never starts a triple),
+///   `panic`/`eprintln`/`eprint` + `!` + group, `::` +
+///   `unwrap`/`expect` with or without a call (path and
+///   fn-pointer forms; the separator must be a joint pair
+///   with no preceding colon, and the name must be
+///   terminal — a following `::` leading to a segment, a
+///   braced import, or a glob continues the path instead),
+///   or float-literal-ending-in-dot + `unwrap`/`expect` +
+///   call, hanging off a field-access dot (tuple-field
+///   access swallowed the dot at lex time). Raw `r#…`
+///   spellings included — same names. Siblings only — a
+///   triple split across a group boundary never matches.
 ///   Whitespace, comments, and line breaks between the
 ///   tokens are invisible (claude R4-M2). Reported with
 ///   the historical substring labels (`.unwrap(` etc.).
@@ -820,11 +840,8 @@ fn t6_violations(text: &str, rel: &str) -> Vec<String> {
         let mut k = 0;
         while k < level.len() {
             let triple = (level.get(k), level.get(k + 1), level.get(k + 2));
-            if let (
-                Some(TokenTree::Punct(dot)),
-                Some(TokenTree::Ident(name)),
-                Some(TokenTree::Group(args)),
-            ) = triple
+            if let (Some(TokenTree::Punct(dot)), Some(TokenTree::Ident(name))) =
+                (level.get(k), level.get(k + 1))
             {
                 // Standalone dot (codex R13-F2): the second dot
                 // of a range (`..unwrap()`) must not start a
@@ -835,7 +852,7 @@ fn t6_violations(text: &str, rel: &str) -> Vec<String> {
                 if dot.as_char() == '.'
                     && standalone
                     && (t6_ident_is(name, "unwrap") || t6_ident_is(name, "expect"))
-                    && args.delimiter() == Delimiter::Parenthesis
+                    && t6_call_follows(&level, k + 2)
                 {
                     let s = dot.span().start();
                     let pat = if t6_ident_is(name, "unwrap") {
@@ -874,11 +891,12 @@ fn t6_violations(text: &str, rel: &str) -> Vec<String> {
             // without a group. Residual: a path call to a
             // same-named free function over-flags (no corpus
             // instance; excluding it needs name resolution).
-            // Refinements (codex R14): the separator must be
-            // a joint pair (rustc rejects `: :`), with no
+            // Refinements (codex R14/R15): the separator must
+            // be a joint pair (rustc rejects `: :`), with no
             // preceding colon (so `:::` can't supply a suffix
             // pair), and the name must be terminal — a joint
-            // `::Ident` after it makes it a namespace segment
+            // `::` leading to another segment, a braced
+            // import, or a glob continues the path instead
             // (turbofish `::<>` preserves the call).
             if let (
                 Some(TokenTree::Punct(c1)),
@@ -891,16 +909,25 @@ fn t6_violations(text: &str, rel: &str) -> Vec<String> {
                     && c2.as_char() == ':'
                     && (k == 0
                         || !matches!(level.get(k - 1), Some(TokenTree::Punct(p)) if p.as_char() == ':'));
-                let continued = matches!(
-                    (level.get(k + 3), level.get(k + 4), level.get(k + 5)),
-                    (
-                        Some(TokenTree::Punct(a)),
-                        Some(TokenTree::Punct(b)),
-                        Some(TokenTree::Ident(_)),
-                    ) if a.as_char() == ':'
-                        && a.spacing() == proc_macro2::Spacing::Joint
-                        && b.as_char() == ':'
+                // Path continuations (codex R14/R15): a joint
+                // `::` after the name continues the path when it
+                // leads to another segment, a braced import, or
+                // a glob — but turbofish (`::<>`) preserves the
+                // call.
+                let joint_cont = matches!(
+                    (level.get(k + 3), level.get(k + 4)),
+                    (Some(TokenTree::Punct(a)), Some(TokenTree::Punct(b)))
+                        if a.as_char() == ':'
+                            && a.spacing() == proc_macro2::Spacing::Joint
+                            && b.as_char() == ':'
                 );
+                let continued = joint_cont
+                    && match level.get(k + 5) {
+                        Some(TokenTree::Ident(_)) => true,
+                        Some(TokenTree::Group(g)) => g.delimiter() == Delimiter::Brace,
+                        Some(TokenTree::Punct(p)) => p.as_char() == '*',
+                        _ => false,
+                    };
                 if joint_pair
                     && !continued
                     && (t6_ident_is(name, "unwrap") || t6_ident_is(name, "expect"))
@@ -919,19 +946,23 @@ fn t6_violations(text: &str, rel: &str) -> Vec<String> {
             // as one float literal in pm AND rustc (the parser
             // splits it back into field access), swallowing the
             // dot — match the literal directly, reported at the
-            // name. It can't over-flag: rustc only accepts
-            // trailing-dot-float + identifier as field access,
-            // and anything else is fail-closed noise on
-            // rejected code.
-            if let (
-                Some(TokenTree::Literal(lit)),
-                Some(TokenTree::Ident(name)),
-                Some(TokenTree::Group(args)),
-            ) = triple
+            // name, but only hanging off a field-access dot
+            // (codex R15-F2): a level-start float is macro
+            // data, and rustc only accepts the dotted form as
+            // field access otherwise.
+            if let (Some(TokenTree::Literal(lit)), Some(TokenTree::Ident(name))) =
+                (level.get(k), level.get(k + 1))
             {
+                // Tuple-field context (codex R15-F2): the float
+                // must hang off a field-access dot — at level
+                // start it is macro data or E0599, never a
+                // compiling call.
+                let field_dot = k > 0
+                    && matches!(level.get(k - 1), Some(TokenTree::Punct(p)) if p.as_char() == '.');
                 if lit.to_string().ends_with('.')
+                    && field_dot
                     && (t6_ident_is(name, "unwrap") || t6_ident_is(name, "expect"))
-                    && args.delimiter() == Delimiter::Parenthesis
+                    && t6_call_follows(&level, k + 2)
                 {
                     let s = name.span().start();
                     let pat = if t6_ident_is(name, "unwrap") {
@@ -1503,6 +1534,55 @@ fn t6_matcher_r12_token_rules_hold() {
     // `assert!` stays out (claude R6): deliberate invariant
     // checks, a different contract — locked silent.
     let v = t6_violations("pub fn p(x: bool) {\n    assert!(x);\n}\n", "synth.rs");
+    assert!(v.is_empty(), "{v:?}");
+    // Braced import (codex R15-F1): `expect::{…}` continues
+    // the path — silent.
+    let v = t6_violations(
+        "pub mod expect {\n    pub struct Spec;\n    pub struct Error;\n}\n\npub use crate::expect::{Error, Spec};\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Glob import (codex R15-F1): `expect::*` continues the
+    // path — silent.
+    let v = t6_violations(
+        "pub mod expect {\n    pub struct Spec;\n}\n\npub use crate::expect::*;\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Float in macro data (codex R15-F2): level-start float
+    // has no field-access dot — silent.
+    let v = t6_violations(
+        "macro_rules! rule {\n    ($value:literal $name:ident $payload:tt) => {\n        pub const EXPECTED: f64 = $value;\n    };\n}\n\nrule! { 1. expect(\"allowed\") }\n",
+        "synth.rs",
+    );
+    assert!(v.is_empty(), "{v:?}");
+    // Empty turbofish in macros (claude R7-TF1): rustfmt
+    // strips `::<>` in normal code but macro bodies are
+    // opaque to it — the call hides there without the rule.
+    let v = t6_violations(
+        "macro_rules! emit {\n    ($($t:tt)*) => { $($t)* };\n}\nemit! {\n    pub(crate) fn probe_tfm(v: Option<u8>) -> u8 { v.unwrap::<>() }\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":5:"), "{v:?}");
+    let v = t6_violations(
+        "macro_rules! emit {\n    ($($t:tt)*) => { $($t)* };\n}\nemit! {\n    pub(crate) fn probe_tfe(r: Result<u8, String>) -> u8 { r.expect::<>(\"m\") }\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":5:"), "{v:?}");
+    let v = t6_violations(
+        "macro_rules! emit {\n    ($($t:tt)*) => { $($t)* };\n}\nemit! {\n    pub(crate) fn probe_tfflt(x: (u8, Option<u8>)) -> u8 { x.1. unwrap::<>() }\n}\n",
+        "synth.rs",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains(":5:"), "{v:?}");
+    // Spaced turbofish colons: `: :` is not a path separator
+    // (mirrors the UFCS joint gate) — silent on rejected code.
+    let v = t6_violations(
+        "pub fn p(v: Option<u8>) -> u8 {\n    v.unwrap: :<>(v)\n}\n",
+        "synth.rs",
+    );
     assert!(v.is_empty(), "{v:?}");
 }
 
