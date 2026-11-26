@@ -976,8 +976,9 @@ fn t6_float_chain_rooted(level: &[proc_macro2::TokenTree], k: usize) -> bool {
 ///   or a chain of trailing-dot floats rooted at one; a
 ///   range's second dot never qualifies, wherever the chain
 ///   bottoms out). Turbofish args must be denylist-free
-///   (no lone `:`, `=>`, compounds, or `::` runs; joint
-///   `::` pairs skipped), balanced, plus parens for calls.
+///   (no `;@|#.?%^/~`, lone `:`, `=>`, compounds, or
+///   `::` runs; joint `::` pairs skipped), balanced,
+///   plus parens for calls.
 ///   Raw `r#…` spellings included — same names. Siblings
 ///   only — a triple split across a group boundary never
 ///   matches.
